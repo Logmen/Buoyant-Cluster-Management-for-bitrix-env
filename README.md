@@ -4,6 +4,50 @@
 
 ---
 
+## Скачивание и установка релиза
+
+Готовые релизы — на странице [**Releases**](https://github.com/Logmen/Buoyant-Cluster-Management-for-bitrix-env/releases).
+Каждый релиз — архив `bcm-X.Y.Z.tar.gz` с GPG-подписью (`.asc`) и контрольной суммой (`.sha256`).
+Установка запускается с **управляющей машины** (любой Linux с SSH-доступом к будущим узлам кластера).
+
+### 1. Скачать релиз
+
+```bash
+# через GitHub CLI (берёт последний релиз)
+gh release download --repo Logmen/Buoyant-Cluster-Management-for-bitrix-env --pattern 'bcm-*'
+
+# …или curl (подставьте нужную версию вместо v1.0.1)
+ver=v1.0.1; base=https://github.com/Logmen/Buoyant-Cluster-Management-for-bitrix-env/releases/download/$ver
+curl -LO $base/bcm-${ver#v}.tar.gz
+curl -LO $base/bcm-${ver#v}.tar.gz.asc
+curl -LO $base/bcm-${ver#v}.tar.gz.sha256
+```
+
+### 2. Проверить целостность и подпись (рекомендуется)
+
+```bash
+sha256sum -c bcm-*.tar.gz.sha256
+
+# импортировать доверенный публичный ключ релизов и проверить подпись
+curl -LO https://raw.githubusercontent.com/Logmen/Buoyant-Cluster-Management-for-bitrix-env/main/bcm/keys/bcm-release-pub.asc
+gpg --import bcm-release-pub.asc
+gpg --verify bcm-*.tar.gz.asc bcm-*.tar.gz      # ожидаем "Good signature"
+```
+
+### 3. Распаковать и установить
+
+```bash
+tar -xzf bcm-*.tar.gz
+cd bcm-*/                       # каталог bcm-X.Y.Z
+sudo bash install.sh           # интерактивно (или --answers-file, см. «Установка кластера»)
+```
+
+> Обновление уже развёрнутого кластера до нового релиза — командой `bcm --update`
+> на любой web-ноде (скачивает релиз, проверяет GPG-подпись, раскатывает на все ноды).
+> Подробнее — раздел [«Обновление BCM»](#обновление-bcm-по-релизам-github).
+
+---
+
 ## Архитектура кластера
 
 ```
