@@ -14,6 +14,16 @@
 # по preempt) проходят без потери наработок: перехватчик сперва вбирает чужие изменения,
 # затем пушит уже объединённое состояние — старое дерево не затирает свежее.
 #
+# ПРЕДОХРАНИТЕЛИ ОТ КАТАСТРОФИЧЕСКОГО WIPE (после инцидента июнь 2026, когда churn
+# обновлятора Bitrix под живым lsyncd+`--delete` обрезал дерево кода на ОБЕИХ нодах):
+#   1) single-режим (mode=single) ЗАМОРАЖИВАЕТ lsyncd — promote по VRRP становится
+#      no-op до unpin (тёплые ноды = неизменная known-good копия на время рисков).
+#   2) sanity-гейт: деградировавшее дерево (есть bitrix/modules, нет ядра) НЕ
+#      становится источником — не затрёт здоровый приёмник.
+#   3) `--max-delete=${MAX_DELETE}` в каждом sync: один проход не удалит больше
+#      порога → «источник потерял тысячи файлов» отклоняется, приёмник цел.
+#   4) /bitrix/updates исключён — временный churn обновлятора не синкается.
+#
 # Параметры — из /etc/bitrix-cluster/lsyncd-role.env (раскатывает install.sh).
 # Действия: promote | demote | status.
 #   status → "SOURCE", если локальный lsyncd active, иначе текущий active_node-хинт.
@@ -34,12 +44,21 @@ SSH_KEY="${SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
 LSYNCD_CONF="${LSYNCD_CONF:-/etc/lsyncd/lsyncd.conf}"
 CLUSTER_CONF="${CLUSTER_CONF:-/etc/bitrix-cluster/cluster.conf}"
 LOG_FILE="${LOG_FILE:-/var/log/bcm/lsyncd-role.log}"
+# Предохранитель: максимум файлов, которые ОДИН проход rsync вправе удалить на
+# приёмнике. Нормальное обновление убирает десятки устаревших файлов; «источник
+# потерял тысячи файлов» (обрезанное/недосинканное дерево, churn обновлятора)
+# → проход отклоняется (rsync rc=25), приёмник СОХРАНЯЕТСЯ. Перекрытие — env
+# LSYNCD_MAX_DELETE. Большие легитимные удаления — через контролируемую
+# реконсиляцию в single-режиме, а не «вживую».
+MAX_DELETE="${LSYNCD_MAX_DELETE:-1000}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o LogLevel=ERROR)
 
 # Что НЕ синхронизируем (единый список с menu/06_lsyncd.sh): /upload — в S3;
-# кэш/tmp/backup — локальны per-node.
+# кэш/tmp/backup — локальны per-node; /bitrix/updates — временные каталоги
+# обновлятора Bitrix (создаются/удаляются пачками → бессмысленный churn и гонка
+# «cannot open dir» при синке; именно эта churn под --delete покалечила дерево).
 EXCLUDES=(
     "--exclude=/upload/"
     "--exclude=/bitrix/cache/"
@@ -47,6 +66,7 @@ EXCLUDES=(
     "--exclude=/bitrix/stack_cache/"
     "--exclude=/bitrix/html_pages/"
     "--exclude=/bitrix/tmp/"
+    "--exclude=/bitrix/updates/"
     "--exclude=/bitrix/backup/"
     "--exclude=*.tmp"
     "--exclude=.git/"
@@ -72,6 +92,32 @@ _other_peers() {
 _reachable() {
     local ip="$1"
     timeout 8 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "root@${ip}" "exit 0" 2>/dev/null
+}
+
+# ──── Режим кластера из cluster.conf (секция [cluster] mode=) ─────────────────
+# Секция-aware: в conf есть и [ssl] mode= — простой grep ^mode брал бы не ту.
+_conf_get_cluster_mode() {
+    awk '
+        /^\[/{ inc = ($0 ~ /^\[cluster\]/) }
+        inc && /^[[:space:]]*mode[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, ""); gsub(/[[:space:]]/, ""); print; exit
+        }
+    ' "$CLUSTER_CONF" 2>/dev/null
+}
+
+# ──── Деградировано ли локальное дерево портала ──────────────────────────────
+# true, если каталог модулей присутствует, но ядро (prolog_before.php) отсутствует —
+# признак обрезанного/недосинканного дерева. Пустой/свежий www (нет bitrix/modules)
+# деградацией НЕ считается — защищать нечего, это нормальный первичный деплой.
+_source_degraded() {
+    [[ -d "${SITE_PATH}/bitrix/modules" \
+       && ! -f "${SITE_PATH}/bitrix/modules/main/include/prolog_before.php" ]]
+}
+
+# Гарантированно остановить локальный lsyncd (без пуша)
+_freeze_local() {
+    systemctl stop lsyncd 2>/dev/null || true
+    systemctl reset-failed lsyncd 2>/dev/null || true
 }
 
 # ──── /etc/sysconfig/lsyncd → наш конфиг (иначе unit грузит дефолтный пример) ──
@@ -107,12 +153,14 @@ sync {
         compress = true,
         rsh      = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i ${SSH_KEY}",
         _extra = {
+            "--max-delete=${MAX_DELETE}",
             "--exclude=/upload/",
             "--exclude=/bitrix/cache/",
             "--exclude=/bitrix/managed_cache/",
             "--exclude=/bitrix/stack_cache/",
             "--exclude=/bitrix/html_pages/",
             "--exclude=/bitrix/tmp/",
+            "--exclude=/bitrix/updates/",
             "--exclude=/bitrix/backup/",
             "--exclude=*.tmp",
             "--exclude=.git/",
@@ -168,8 +216,25 @@ _set_active_node() {
 
 # ──── PROMOTE: стать источником lsyncd ───────────────────────────────────────
 promote() {
+    # 0a) Режим единой ноды: lsyncd ОБЯЗАН быть заморожен. Рискованные операции
+    # на active (деплой/обновление портала) НЕ должны зеркалиться с --delete на
+    # тёплые ноды — они держатся как известно-целая копия. Авто-promote по VRRP
+    # подавляется до bcm_cluster_unpin.
+    if [[ "$(_conf_get_cluster_mode)" == "single" ]]; then
+        log "PROMOTE пропущен: режим единой ноды (mode=single) — lsyncd заморожен до unpin."
+        _freeze_local
+        return 0
+    fi
     log "PROMOTE: становлюсь источником lsyncd."
     _catchup_from_peers          # 1) вобрать свежее с пиров (без удаления)
+    # 1a) Sanity-гейт: если ПОСЛЕ catch-up дерево всё ещё деградировано (есть
+    # bitrix/modules, но нет ядра) — НЕ становиться источником: пуш с --delete
+    # затёр бы здоровый приёмник. Лучше остаться без синка и поднять тревогу.
+    if _source_degraded; then
+        log "ОТКАЗ promote: локальное дерево портала деградировано (нет ${SITE_PATH}/bitrix/modules/main/include/prolog_before.php при наличии bitrix/modules). lsyncd НЕ запущен — приёмник защищён от затирания. Нужно ручное восстановление кода."
+        _freeze_local
+        return 1
+    fi
     _set_sysconfig               # 2) sysconfig → наш конфиг
     _gen_lsyncd_conf             # 3) конфиг: я → остальные web
     if systemctl restart lsyncd 2>>"$LOG_FILE"; then

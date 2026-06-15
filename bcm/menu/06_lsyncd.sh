@@ -129,6 +129,19 @@ _ls_initial_sync() {
         bcm_any_key; return
     fi
 
+    # Sanity-гейт источника: дерево деградировало (есть bitrix/modules, но нет
+    # ядра) → пуш с --delete затёр бы приёмники. Не даём начать сверку с битого
+    # источника (тот же предохранитель, что в lsyncd_role.sh::promote).
+    local src_degraded
+    src_degraded=$(bcm_ssh_exec_timeout "$src_ip" 5 \
+        "if [ -d '${site_path}/bitrix/modules' ] && [ ! -f '${site_path}/bitrix/modules/main/include/prolog_before.php' ]; then echo yes; else echo no; fi" \
+        2>/dev/null | tr -d '[:space:]')
+    if [[ "$src_degraded" == "yes" ]]; then
+        bcm_error "Источник ${src_node} деградирован: есть bitrix/modules, но нет ядра (modules/main/include/prolog_before.php)."
+        bcm_error "Начальная синхронизация ОТМЕНЕНА — иначе --delete затёр бы код на остальных web. Восстановите дерево на источнике."
+        bcm_any_key; return
+    fi
+
     # Синхронизировать на остальные web-узлы
     for node in "${BCM_NODES_WEB[@]}"; do
         [[ -z "$node" ]] && continue
@@ -146,13 +159,17 @@ _ls_initial_sync() {
         # rsync выполняется с src-узла на dst через SSH-ключ кластера
         local ssh_key="${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
         local result
-        # Только код: исключаем /upload (в S3) и локальные кэш/tmp.
-        # --delete уважает excludes (исключённое на target не удаляется).
+        # Только код: исключаем /upload (в S3), локальные кэш/tmp и временный
+        # churn обновлятора (/bitrix/updates). --delete уважает excludes.
+        # Это КОНТРОЛИРУЕМАЯ операторская реконсиляция (с подтверждением и sanity-
+        # проверкой источника выше) — здесь --max-delete НЕ ставим намеренно:
+        # легитимная сверка может удалить много устаревших файлов на target.
         result=$(bcm_ssh_exec_timeout "$src_ip" 300 \
             "rsync -avz --delete \
              --exclude=/upload/ --exclude=/bitrix/cache/ --exclude=/bitrix/managed_cache/ \
              --exclude=/bitrix/stack_cache/ --exclude=/bitrix/html_pages/ \
-             --exclude=/bitrix/tmp/ --exclude=/bitrix/backup/ --exclude='*.tmp' --exclude=.git/ \
+             --exclude=/bitrix/tmp/ --exclude=/bitrix/updates/ --exclude=/bitrix/backup/ \
+             --exclude='*.tmp' --exclude=.git/ \
              -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i ${ssh_key}' \
              '${site_path}/' \
              'root@${dst_ip}:${site_path}/' 2>&1 | tail -5 && echo RSYNC_OK || echo RSYNC_FAIL" \
@@ -233,15 +250,20 @@ sync {
         rsh      = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i ${ssh_key}",
         -- Синкаем только КОД. Исключаем общие/локальные мутабельные данные:
         --   /upload — пользовательские файлы (хранятся в S3/MinIO, общие для нод);
-        --   кэш и tmp — локальные на каждой ноде, синкать нельзя.
+        --   кэш и tmp — локальные на каждой ноде, синкать нельзя;
+        --   /bitrix/updates — временный churn обновлятора Bitrix (не синкать).
         -- rsync --delete уважает excludes (не удаляет исключённое на target).
+        -- --max-delete=1000 — предохранитель: один проход не сносит >1000 файлов
+        -- (обрезанное дерево/churn под --delete не уничтожит приёмник; rc=25).
         _extra = {
+            "--max-delete=1000",
             "--exclude=/upload/",
             "--exclude=/bitrix/cache/",
             "--exclude=/bitrix/managed_cache/",
             "--exclude=/bitrix/stack_cache/",
             "--exclude=/bitrix/html_pages/",
             "--exclude=/bitrix/tmp/",
+            "--exclude=/bitrix/updates/",
             "--exclude=/bitrix/backup/",
             "--exclude=*.tmp",
             "--exclude=.git/",

@@ -6,13 +6,17 @@
 # Зачем: при первичной установке или переносе сайта/портала удобно временно
 # закрепить всю нагрузку на ОДНОЙ web-ноде, чтобы трафик и БД-запросы не
 # «гуляли» между нодами (round-robin, чтения с разных реплик), пока заливаются
-# данные. Остальные ноды остаются тёплыми (службы работают, lsyncd синхронит).
+# данные. Остальные ноды остаются тёплыми (службы работают), но lsyncd ЗАМОРОЖЕН:
+# рискованные операции на active не зеркалятся на спящие ноды с --delete.
 #
 # Что делает режим single:
 #   • HAProxy (на всех lb): все web-сервера, кроме активного → state maint
 #     (drain). Весь HTTP идёт на активную ноду. Возврат → state ready.
 #   • ProxySQL (на всех web): правило ^SELECT (rule_id=4) → HG_WRITE, т.е. и
 #     чтения уходят на writer. Возврат → обратно на HG_READ.
+#   • lsyncd: ОСТАНОВЛЕН на всех web (заморозка). Тёплые ноды держатся как
+#     известно-целая копия кода; auto-promote по VRRP подавляется (mode=single).
+#     unpin поднимает источник на active_node с предварительным catch-up.
 #   • Состояние пишется в cluster.conf: [cluster] mode=single, active_node=<web>.
 #
 # Зависимости: bcm_utils.sh, bcm_config.sh, bcm_ssh.sh (должны быть подключены).
@@ -158,6 +162,45 @@ _bcm_proxysql_select_target() {
     return 0
 }
 
+# ──── lsyncd: заморозить (single) / разморозить (HA) ─────────────────────────
+# В режиме единой ноды lsyncd ОБЯЗАН быть остановлен на ВСЕХ web: рискованные
+# операции на active (деплой/обновление портала) НЕ должны зеркалиться с --delete
+# на тёплые ноды — они держатся как известно-целая копия. (Инцидент июнь 2026:
+# churn обновлятора Bitrix под живым lsyncd+--delete обрезал дерево кода на ОБЕИХ
+# нодах.) Авто-promote по VRRP подавляется проверкой mode=single в lsyncd_role.sh.
+_bcm_lsyncd_freeze() {
+    local web_nodes wn ip
+    web_nodes=$(bcm_get_nodes "web" 2>/dev/null) || web_nodes=""
+    [[ -z "$web_nodes" ]] && { bcm_log_warn "  lsyncd freeze: список web-нод пуст."; return 0; }
+    for wn in $web_nodes; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        if ! bcm_node_reachable "$ip" 4 2>/dev/null; then
+            bcm_log_warn "  lsyncd freeze: ${wn} (${ip}) недоступна — пропуск."
+            continue
+        fi
+        bcm_ssh_exec "$ip" "systemctl stop lsyncd 2>/dev/null; systemctl reset-failed lsyncd 2>/dev/null; true" >/dev/null 2>&1
+        bcm_log_info "  lsyncd остановлен на ${wn} (заморозка single-режима)."
+    done
+}
+
+# Разморозка: восстановить источник на active_node. lsyncd_role.sh promote сам
+# делает catch-up с пиров (rsync --update, без --delete) перед стартом. Прочие web
+# остаются приёмниками — их актуализирует стартовый rsync источника.
+_bcm_lsyncd_thaw() {
+    local active="$1" ip
+    [[ -z "$active" ]] && { bcm_log_warn "  lsyncd thaw: active_node неизвестна — синк не восстановлен."; return 0; }
+    ip=$(bcm_get_node_ip "web" "$active") || { bcm_log_warn "  lsyncd thaw: нет IP для ${active}."; return 0; }
+    if ! bcm_node_reachable "$ip" 4 2>/dev/null; then
+        bcm_log_warn "  lsyncd thaw: ${active} (${ip}) недоступна — синк не восстановлен (поднимется по VRRP-promote)."
+        return 0
+    fi
+    if bcm_ssh_exec "$ip" "/opt/bcm/bin/lib/lsyncd_role.sh promote" >/dev/null 2>&1; then
+        bcm_log_info "  lsyncd восстановлен: источник=${active}."
+    else
+        bcm_log_warn "  lsyncd thaw: promote на ${active} вернул ошибку — проверь lsyncd-role.log (возможно sanity-гейт: дерево деградировано)."
+    fi
+}
+
 # ──── Включить режим single ──────────────────────────────────────────────────
 # bcm_cluster_pin <active_web_node>
 bcm_cluster_pin() {
@@ -185,7 +228,10 @@ bcm_cluster_pin() {
     bcm_conf_set "cluster" "mode" "single"
     bcm_conf_set "cluster" "active_node" "$active_node"
     bcm_conf_sync 2>/dev/null || true
-    bcm_log_info "Режим единой ноды активирован (active=${active_node})."
+    # Заморозить lsyncd на всех web (после раздачи mode=single, чтобы конкурентный
+    # VRRP-promote уже видел single и не поднял синк). Тёплые ноды = known-good копия.
+    _bcm_lsyncd_freeze
+    bcm_log_info "Режим единой ноды активирован (active=${active_node}, lsyncd заморожен)."
     return 0
 }
 
@@ -206,7 +252,12 @@ bcm_cluster_unpin() {
 
     bcm_conf_set "cluster" "mode" "normal"
     bcm_conf_sync 2>/dev/null || true
-    bcm_log_info "Возврат в HA выполнен (^SELECT → HG ${hg_read})."
+    # Разморозить синк: поднять источник на active_node (promote сам сделает
+    # catch-up с пиров перед стартом). Делаем ПОСЛЕ раздачи mode=normal.
+    local active_node
+    active_node=$(bcm_conf_get "cluster" "active_node" 2>/dev/null || echo "")
+    _bcm_lsyncd_thaw "$active_node"
+    bcm_log_info "Возврат в HA выполнен (^SELECT → HG ${hg_read}, lsyncd разморожен)."
     return 0
 }
 
