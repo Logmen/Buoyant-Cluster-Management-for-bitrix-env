@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/bcm-logo.png" alt="BCM — Buoyant Cluster Management" width="480">
+</p>
+
 # Buoyant Cluster Management for bitrix-env (BCM)
 
 **BCM** (Buoyant Cluster Management) — TUI-инструмент для развёртывания и управления отказоустойчивым 6-слойным кластером 1С-Битрикс на базе `bitrix-env`.
