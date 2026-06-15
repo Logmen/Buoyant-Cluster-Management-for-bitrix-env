@@ -37,7 +37,7 @@ jobs:
 
       - name: Trusted release pubkey is committed
         run: |
-          if ! ls bcm/keys/*.asc bcm/keys/*.gpg >/dev/null 2>&1; then
+          if [ -z "$(find bcm/keys -maxdepth 1 -type f \( -name '*.asc' -o -name '*.gpg' \) 2>/dev/null)" ]; then
             echo "::error::в bcm/keys/ нет публичного ключа — операторы не смогут проверить подпись (см. bcm/keys/README.md)"
             exit 1
           fi
