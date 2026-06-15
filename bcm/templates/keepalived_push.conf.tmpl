@@ -1,0 +1,53 @@
+# =============================================================================
+# keepalived_push.conf.tmpl — VRRP-инстанс для плавающего PUSH_VIP (redis push).
+# Добавляется к /etc/keepalived/keepalived.conf web-узла отдельным блоком
+# (рядом с HA-Cron и session-redis инстансами). PUSH_VIP всегда «живёт» на
+# текущем master push-redis.
+# Подстановки BCM: __PUSH_VRID__, __NODE_IFACE__, __PRIORITY__,
+#   __VRRP_AUTH_PASS__, __PUSH_VIP__, __PUSH_PORT__, __NODE_IP__, __PEER_IP__
+# =============================================================================
+
+# Проверка: локальный push-redis отвечает на PING (reuse redis_session_check.sh)
+vrrp_script chk_redis_push___PUSH_VRID__ {
+    script "/opt/bcm/bin/lib/redis_session_check.sh __PUSH_PORT__"
+    interval 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_PUSH___PUSH_VRID__ {
+    # ⚠️ state ВСЕГДА BACKUP + nopreempt (как у session-redis): иначе возврат web01
+    # отобрал бы VIP у живого master'а web02 и СТЁР бы канальные данные push, накопленные
+    # за простой. nopreempt требует начального BACKUP; web01 берёт VIP на ПЕРВЫХ выборах
+    # за счёт priority, но назад не отбирает. См. keepalived_session.conf.tmpl.
+    state BACKUP
+    interface __NODE_IFACE__
+    virtual_router_id __PUSH_VRID__
+    priority __PRIORITY__
+    nopreempt
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_AUTH_PASS__
+    }
+
+    virtual_ipaddress {
+        __PUSH_VIP__/32
+    }
+
+    unicast_src_ip __NODE_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    track_script {
+        chk_redis_push___PUSH_VRID__
+    }
+
+    # Промоут/демоут push-redis в зависимости от роли VRRP.
+    # 4-й арг allkeys-lru — политика вытеснения push-redis на master.
+    notify_master "/opt/bcm/bin/lib/redis_session_notify.sh MASTER __PUSH_VIP__ __PUSH_PORT__ allkeys-lru push-server"
+    notify_backup "/opt/bcm/bin/lib/redis_session_notify.sh BACKUP __PUSH_VIP__ __PUSH_PORT__ allkeys-lru"
+    notify_fault  "/opt/bcm/bin/lib/redis_session_notify.sh FAULT  __PUSH_VIP__ __PUSH_PORT__ allkeys-lru"
+}

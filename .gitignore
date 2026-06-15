@@ -1,0 +1,36 @@
+# Секреты и ответы установки — НЕ коммитить
+install_answers.conf
+*_id_rsa
+*_id_rsa.pub
+temp_id_rsa
+id_rsa
+id_ed25519
+*.pem
+*.key
+
+# Приватные GPG-ключи подписи релизов — в bcm/keys/ кладётся ТОЛЬКО публичная часть
+*private*.asc
+*secret*.asc
+*.sec.asc
+*.private.gpg
+*.secret.gpg
+secring.*
+# Логи
+*.log
+/bcm/logs/
+/var/log/bcm/
+
+# Временные файлы
+*.tmp
+*.bak
+*~
+
+# Сырые дампы сессий ассистента (содержат пароли/IP лаборатории)
+tmp_session.txt
+*_session.txt
+
+# Личная памятка Claude Code (контекст архитектуры)
+CLAUDE.md
+
+# Локальное состояние Claude Code (настройки с секретами, персональная память)
+.claude/

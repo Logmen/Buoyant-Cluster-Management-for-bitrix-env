@@ -1,0 +1,43 @@
+name: release-validate
+
+# Релиз публикуется ЛОКАЛЬНО из scripts/release.sh (tarball подписывается GPG-ключом
+# мейнтейнера, который НЕ хранится на GitHub). Этот workflow — лишь страховочная
+# валидация тега: синтаксис скриптов и совпадение bcm/VERSION с тегом.
+# Артефакты/Release он НЕ создаёт (это делает release.sh через gh).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: VERSION matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          FILE_VER="$(tr -d '[:space:]' < bcm/VERSION)"
+          if [ "$FILE_VER" != "$VERSION" ]; then
+            echo "::error::bcm/VERSION ($FILE_VER) не совпадает с тегом $VERSION"
+            exit 1
+          fi
+
+      - name: Syntax check
+        run: |
+          bash -n install.sh scripts/release.sh
+          find bcm -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Trusted release pubkey is committed
+        run: |
+          if ! ls bcm/keys/*.asc bcm/keys/*.gpg >/dev/null 2>&1; then
+            echo "::error::в bcm/keys/ нет публичного ключа — операторы не смогут проверить подпись (см. bcm/keys/README.md)"
+            exit 1
+          fi

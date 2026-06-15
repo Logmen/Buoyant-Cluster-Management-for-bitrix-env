@@ -1,0 +1,37 @@
+# =============================================================================
+# redis-session.conf — выделенный Redis для хранения сессий Bitrix (BCM)
+# Отдельный инстанс от push-server redis (6379). Сгенерировано BCM.
+#
+# Особенности:
+#   - noeviction: сессии НЕ вытесняются под нагрузкой (в отличие от push redis
+#     с allkeys-lru);
+#   - слушает loopback + IP узла (для репликации и доступа через VIP);
+#   - доступ к порту ограничен firewall'ом до web-узлов (пароль не задаётся,
+#     т.к. session-handler Bitrix конфигурируется без auth).
+# Подстановки BCM: __NODE_IP__, __SESSION_PORT__, __SESSION_MAXMEM__
+# =============================================================================
+port __SESSION_PORT__
+# bind 0.0.0.0: redis должен слушать и на плавающем VIP (когда keepalived назначит
+# его этой ноде), а VIP в bind перечислить нельзя — он переезжает между нодами и
+# на backup-ноде отсутствует (redis бы не стартовал). Доступ к 6380 ограничен
+# firewall'ом до web-пиров (см. configure_session_redis), пароль не используется.
+bind 0.0.0.0
+protected-mode no
+daemonize no
+supervised systemd
+pidfile /run/redis-session/redis-session.pid
+dir /var/lib/redis-session
+logfile /var/log/redis/redis-session.log
+databases 16
+
+# Сессии переживают рестарт сервиса (лёгкий AOF), RDB-снапшоты выключены
+appendonly yes
+appendfilename "redis-session.aof"
+save ""
+
+maxmemory __SESSION_MAXMEM__
+maxmemory-policy noeviction
+
+# Роль (master/replica) управляется keepalived через redis_session_notify.sh:
+#   notify_master → REPLICAOF NO ONE
+#   notify_backup → REPLICAOF <VIP> <port>

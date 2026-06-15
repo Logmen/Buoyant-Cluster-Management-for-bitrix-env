@@ -1,0 +1,36 @@
+# =============================================================================
+# redis-push.conf — выделенный Redis для каналов Push&Pull (bx-push-server), BCM.
+# Отдельный инстанс от session-redis (6380) и от локального push-redis bitrix-env
+# (6379). ОБЩИЙ для всех web-нод через плавающий PUSH_VIP — чтобы сообщение,
+# опубликованное на любой ноде, доходило до подписчика на любой (active-active).
+# Сгенерировано BCM.
+#
+# Особенности:
+#   - allkeys-lru: push-каналы имеют TTL и вытесняемы под нагрузкой (в отличие от
+#     session-redis с noeviction);
+#   - без AOF/RDB: push-данные эфемерны (TTL), переживать рестарт не нужно;
+#   - слушает 0.0.0.0: redis обязан слушать на плавающем PUSH_VIP (VIP переезжает
+#     между нодами, в bind его не перечислить). Доступ к порту ограничен firewall'ом
+#     до web-пиров (см. configure_push_redis), пароль не используется.
+# Подстановки BCM: __NODE_IP__, __PUSH_PORT__, __PUSH_MAXMEM__
+# =============================================================================
+port __PUSH_PORT__
+bind 0.0.0.0
+protected-mode no
+daemonize no
+supervised systemd
+pidfile /run/redis-push/redis-push.pid
+dir /var/lib/redis-push
+logfile /var/log/redis/redis-push.log
+databases 16
+
+# Push эфемерен (каналы с TTL) — персистентность не нужна
+appendonly no
+save ""
+
+maxmemory __PUSH_MAXMEM__
+maxmemory-policy allkeys-lru
+
+# Роль (master/replica) управляется keepalived через redis_session_notify.sh:
+#   notify_master → REPLICAOF NO ONE + maxmemory-policy allkeys-lru
+#   notify_backup → REPLICAOF <PUSH_VIP> <port>

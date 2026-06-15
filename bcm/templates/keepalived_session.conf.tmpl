@@ -1,0 +1,54 @@
+# =============================================================================
+# keepalived_session.conf.tmpl — VRRP-инстанс для плавающего VIP redis-сессий
+# Добавляется к /etc/keepalived/keepalived.conf web-узла отдельным блоком
+# (рядом с инстансом HA Cron). VIP всегда «живёт» на текущем master redis.
+# Подстановки BCM: __SESSION_VRID__, __NODE_IFACE__,
+#   __PRIORITY__, __VRRP_AUTH_PASS__, __SESSION_VIP__, __SESSION_PORT__,
+#   __NODE_IP__, __PEER_IP__
+# =============================================================================
+
+# Проверка: локальный redis-session отвечает на PING
+vrrp_script chk_redis_session___SESSION_VRID__ {
+    script "/opt/bcm/bin/lib/redis_session_check.sh __SESSION_PORT__"
+    interval 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_SESSION___SESSION_VRID__ {
+    # ⚠️ state ВСЕГДА BACKUP + nopreempt: иначе при ВОЗВРАТЕ упавшего master'а
+    # (web01, prio 110) он перехватил бы VIP у живого master'а (web02), и его notify
+    # сделал бы REPLICAOF NO ONE на СТАРОМ (устаревшем) redis → web02 переключился бы
+    # в реплику и СТЁР свежие сессии, накопленные за простой web01 (ловили вживую).
+    # nopreempt требует начального state BACKUP; web01 всё равно выигрывает ПЕРВЫЕ
+    # выборы за счёт большего priority, но назад VIP уже не отбирает.
+    state BACKUP
+    interface __NODE_IFACE__
+    virtual_router_id __SESSION_VRID__
+    priority __PRIORITY__
+    nopreempt
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_AUTH_PASS__
+    }
+
+    virtual_ipaddress {
+        __SESSION_VIP__/32
+    }
+
+    unicast_src_ip __NODE_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    track_script {
+        chk_redis_session___SESSION_VRID__
+    }
+
+    # Промоут/демоут redis в зависимости от роли VRRP
+    notify_master "/opt/bcm/bin/lib/redis_session_notify.sh MASTER __SESSION_VIP__ __SESSION_PORT__"
+    notify_backup "/opt/bcm/bin/lib/redis_session_notify.sh BACKUP __SESSION_VIP__ __SESSION_PORT__"
+    notify_fault  "/opt/bcm/bin/lib/redis_session_notify.sh FAULT  __SESSION_VIP__ __SESSION_PORT__"
+}

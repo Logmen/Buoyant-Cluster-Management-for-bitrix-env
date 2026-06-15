@@ -1,0 +1,111 @@
+# =============================================================================
+# install_answers.conf.example — пример файла ответов для install.sh
+#
+# Использование:
+#   cp install_answers.conf.example install_answers.conf
+#   отредактируйте значения и НИКОГДА не коммитьте install_answers.conf
+#   (он уже в .gitignore — содержит пароли в открытом виде).
+#
+#   ./install.sh --answers-file install_answers.conf
+#
+# Пароли со спецсимволами ($, {}, бэктик, !, # и т.п.): файл разбирается БЕЗ source,
+# значения читаются литерально (не раскрываются bash). Для максимальной надёжности
+# пароли заключайте в ОДИНАРНЫЕ кавычки — 'p@ss$word!' — тогда нельзя использовать
+# только сам символ одинарной кавычки внутри пароля.
+# =============================================================================
+
+# Виртуальный IP (VIP) кластера
+VIP="10.0.0.230"
+
+# LB-ноды (минимум 2). Список имён и карта имя:IP
+LB_NODES="lb01,lb02"
+LB_IPS_LIST="lb01:10.0.0.231,lb02:10.0.0.232"
+
+# WEB-ноды (минимум 2) — «мозг» кластера, полное меню BCM
+WEB_NODES="web01,web02"
+WEB_IPS_LIST="web01:10.0.0.210,web02:10.0.0.211"
+
+# PXC-ноды (минимум 3, нечётное число для кворума Galera)
+PXC_NODES="db01,db02,db03"
+PXC_IPS_LIST="db01:10.0.0.220,db02:10.0.0.221,db03:10.0.0.222"
+PXC_WRITER="db01"
+
+# S3-ноды (MinIO, минимум 2)
+S3_NODES="s3-01,s3-02"
+S3_IPS_LIST="s3-01:10.0.0.240,s3-02:10.0.0.241"
+S3_PORT="9000"
+
+# Креды MinIO. Если S3_SECRET_KEY оставить пустым — будет сгенерирован случайный.
+S3_ACCESS_KEY="minioadmin"
+S3_SECRET_KEY="CHANGE_ME_STRONG_SECRET"
+
+# Домен virtual-host для S3 (модуль Bitrix «Облачные хранилища»). Модуль ходит на
+# bucket.<домен> (virtual-hosted-style), поэтому <домен> и bucket.<домен> прописываются
+# на web-нодах в /etc/hosts → S3-VIP, а MinIO поднимается с MINIO_DOMAIN=<домен>.
+# По умолчанию — не-маршрутизируемый s3.bitrix.lab (лаборатория). В проде укажите
+# свой домен; для публичной отдачи файлов клиентам нужен реальный DNS *.<домен> → S3-VIP.
+S3_VHOST_DOMAIN="s3.bitrix.lab"
+
+# ProxySQL
+PROXYSQL_PORT="6033"
+PROXYSQL_ADMIN_PORT="6032"
+PROXYSQL_ADMIN_PASS="CHANGE_ME_ADMIN_PASS"
+PROXYSQL_MONITOR_PASS="CHANGE_ME_MONITOR_PASS"
+
+# Пользователь БД Bitrix
+BITRIX_DB_USER="bitrix"
+BITRIX_DB_PASS="CHANGE_ME_DB_PASS"
+
+# Keepalived VRID для web-нод (HA Cron)
+WEB_VRID="56"
+
+# Redis-хранилище сессий (HA: master-replica + плавающий VIP).
+# Чтобы клиентские сессии не терялись при переключении web-нод.
+# Оставьте SESSION_VIP пустым, чтобы пропустить настройку.
+SESSION_VIP="10.0.0.235"
+SESSION_REDIS_PORT="6380"
+SESSION_VRID="57"
+SESSION_REDIS_MAXMEM="256mb"
+
+# Общий Redis для каналов Push&Pull (HA: master-replica + плавающий PUSH_VIP).
+# Делает push active-active: сообщение, опубликованное на любой web-ноде, доходит
+# до подписчика на любой. Отдельный инстанс/VIP (push-server не поддерживает выбор
+# db-индекса, поэтому не смешиваем с сессиями). Пусто PUSH_REDIS_VIP → пропустить.
+PUSH_REDIS_VIP="10.0.0.236"
+PUSH_REDIS_PORT="6381"
+PUSH_VRID="58"
+PUSH_REDIS_MAXMEM="512mb"
+
+# Общий Redis под кэш Bitrix (managed_cache + cache): HA master-replica + плавающий
+# CACHE_VIP. Делает кэш общим между web-нодами (консистентная инвалидация по тегам;
+# иначе файловый per-node кэш расходится). allkeys-lru, без AOF. Пусто → пропустить.
+CACHE_REDIS_VIP="10.0.0.237"
+CACHE_REDIS_PORT="6382"
+CACHE_VRID="59"
+CACHE_REDIS_MAXMEM="1024mb"
+
+# Домен портала. На web-нодах прописывается в /etc/hosts → 127.0.0.1, чтобы
+# серверные self-запросы Bitrix («Проверка системы»: site_check_exec и т.п.) шли на
+# локальную ноду, а не через VIP/LB на случайную (где временного файла нет → 404).
+# Пусто → шаг пропускается.
+PORTAL_DOMAIN="portal.example.com"
+
+# SSL/HTTPS. TLS терминируется на HAProxy (LB): один pem на оба LB в
+# /etc/haproxy/certs/, web-нодам сертификат не нужен. install ставит self-signed
+# заглушку; реальный серт — BCM меню 12 (свой pem или Let's Encrypt HTTP-01).
+# LE_EMAIL — e-mail учётки Let's Encrypt (пусто → LE настраивается позже из меню).
+# FORCE_HTTPS=1 — сразу включить редирект 80→443 на HAProxy (обычно включают из
+# меню 12 ПОСЛЕ установки реального серта). Редирект Bitrix/.htsecure не использовать!
+LE_EMAIL=""
+FORCE_HTTPS="0"
+
+# Резервное копирование (HA-aware): первая линия — MinIO кластера (бакет с
+# versioning + lifecycle-retention), offsite-копия настраивается позже (меню 13).
+# conf — все ноды (шифрованный tar), db — Synced-реплика PXC (xtrabackup),
+# files — источник lsyncd. Ключ шифрования генерируется install'ом сам.
+BACKUP_BUCKET="bitrix-backups"
+BACKUP_RETENTION_DAYS="14"
+
+# Общий пароль root для первичного подключения к узлам (раскатка SSH-ключа).
+# После установки доступ идёт по ключу; пароль можно сменить.
+ROOT_PASSWORD="CHANGE_ME_ROOT_PASS"

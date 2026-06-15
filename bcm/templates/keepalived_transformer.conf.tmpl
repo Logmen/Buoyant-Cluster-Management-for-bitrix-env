@@ -1,0 +1,55 @@
+# =============================================================================
+# keepalived_transformer.conf.tmpl — VRRP-инстанс для плавающего VIP генератора
+# документов (Transformer). Добавляется к /etc/keepalived/keepalived.conf web-узла
+# отдельным блоком (рядом с session/push/cache VIP).
+# ⚠️ Дизайн: rabbitmq+transformer работают на ОБЕИХ нодах ВСЕГДА; keepalived только
+# держит VIP (без start/stop сервисов — иначе VRRP флапал на медленных start/stop).
+# Портал/воркеры идут на `default`→VIP→RabbitMQ держателя. notify — только лог.
+# Подстановки BCM: __TR_VRID__, __NODE_IFACE__, __PRIORITY__,
+#   __VRRP_AUTH_PASS__, __TR_VIP__, __NODE_IP__, __PEER_IP__
+# =============================================================================
+
+# Health-check: на держателе VIP требует живой RabbitMQ (точка подключения через
+# VIP). transformer-worker НЕ проверяем (Restart=always; его forking-старт давал флап).
+vrrp_script chk_transformer___TR_VRID__ {
+    script "/opt/bcm/bin/lib/transformer_check.sh __TR_VIP__"
+    interval 5
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_TRANSFORMER___TR_VRID__ {
+    # ⚠️ state ВСЕГДА BACKUP + nopreempt: при always-on дизайне (rabbitmq на обеих)
+    # перехват VIP вернувшимся web01 без нужды дёргает клиентов RabbitMQ и теряет
+    # in-flight очередь держателя. nopreempt требует начального BACKUP; web01 берёт
+    # VIP на ПЕРВЫХ выборах за счёт priority. См. keepalived_session.conf.tmpl.
+    state BACKUP
+    interface __NODE_IFACE__
+    virtual_router_id __TR_VRID__
+    priority __PRIORITY__
+    nopreempt
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_AUTH_PASS__
+    }
+
+    virtual_ipaddress {
+        __TR_VIP__/32
+    }
+
+    unicast_src_ip __NODE_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    track_script {
+        chk_transformer___TR_VRID__
+    }
+
+    # Поднять/погасить rabbitmq+transformer по роли VRRP (active/standby)
+    notify_master "/opt/bcm/bin/lib/transformer_notify.sh MASTER"
+    notify_backup "/opt/bcm/bin/lib/transformer_notify.sh BACKUP"
+    notify_fault  "/opt/bcm/bin/lib/transformer_notify.sh FAULT"
+}

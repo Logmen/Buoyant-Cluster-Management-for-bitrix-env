@@ -1,0 +1,53 @@
+# =============================================================================
+# keepalived_cache.conf.tmpl — VRRP-инстанс для плавающего CACHE_VIP (redis кэш).
+# Добавляется к /etc/keepalived/keepalived.conf web-узла отдельным блоком
+# (рядом с HA-Cron, session- и push-redis инстансами). CACHE_VIP всегда «живёт»
+# на текущем master cache-redis.
+# Подстановки BCM: __CACHE_VRID__, __NODE_IFACE__, __PRIORITY__,
+#   __VRRP_AUTH_PASS__, __CACHE_VIP__, __CACHE_PORT__, __NODE_IP__, __PEER_IP__
+# =============================================================================
+
+# Проверка: локальный cache-redis отвечает на PING (reuse redis_session_check.sh)
+vrrp_script chk_redis_cache___CACHE_VRID__ {
+    script "/opt/bcm/bin/lib/redis_session_check.sh __CACHE_PORT__"
+    interval 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_CACHE___CACHE_VRID__ {
+    # ⚠️ state ВСЕГДА BACKUP + nopreempt (как у session-redis): возврат web01 не должен
+    # отбирать VIP у живого master'а web02 (иначе REPLICAOF NO ONE на устаревшем кэше
+    # затрёт свежий). Кэш переживёт сброс, но флап мастера бьёт по производительности.
+    # nopreempt требует начального BACKUP; первый выбор web01 берёт по priority.
+    state BACKUP
+    interface __NODE_IFACE__
+    virtual_router_id __CACHE_VRID__
+    priority __PRIORITY__
+    nopreempt
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_AUTH_PASS__
+    }
+
+    virtual_ipaddress {
+        __CACHE_VIP__/32
+    }
+
+    unicast_src_ip __NODE_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    track_script {
+        chk_redis_cache___CACHE_VRID__
+    }
+
+    # Промоут/демоут cache-redis в зависимости от роли VRRP.
+    # 4-й арг allkeys-lru — политика вытеснения cache-redis на master.
+    notify_master "/opt/bcm/bin/lib/redis_session_notify.sh MASTER __CACHE_VIP__ __CACHE_PORT__ allkeys-lru"
+    notify_backup "/opt/bcm/bin/lib/redis_session_notify.sh BACKUP __CACHE_VIP__ __CACHE_PORT__ allkeys-lru"
+    notify_fault  "/opt/bcm/bin/lib/redis_session_notify.sh FAULT  __CACHE_VIP__ __CACHE_PORT__ allkeys-lru"
+}

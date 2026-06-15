@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034,SC1091,SC2229,SC2015,SC2129,SC2001,SC2155,SC2181
+# =============================================================================
+# bcm — Bitrix Cluster Manager
+# Главная точка входа. Читает cluster.conf, определяет роль узла,
+# отображает TUI с живым статусом и маршрутизирует в нужное меню.
+#
+# Версии компонентов, IP-адреса, имена узлов — только из конфига и рантайма.
+# =============================================================================
+set -euo pipefail
+
+# ──── Пути ───────────────────────────────────────────────────────────────────
+BCM_BASE_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BCM_LIB_DIR="${BCM_BASE_DIR}/bin/lib"
+BCM_MENU_DIR="${BCM_BASE_DIR}/menu"
+BCM_CONF_FILE="${BCM_CONF_FILE:-/etc/bitrix-cluster/cluster.conf}"
+BCM_SSH_KEY="${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
+export BCM_BASE_DIR BCM_LIB_DIR BCM_MENU_DIR BCM_CONF_FILE BCM_SSH_KEY
+
+# ──── Загрузка библиотек ─────────────────────────────────────────────────────
+# shellcheck source=bin/lib/bcm_utils.sh
+source "${BCM_LIB_DIR}/bcm_utils.sh"
+# shellcheck source=bin/lib/bcm_config.sh
+source "${BCM_LIB_DIR}/bcm_config.sh"
+# shellcheck source=bin/lib/bcm_ssh.sh
+source "${BCM_LIB_DIR}/bcm_ssh.sh"
+# shellcheck source=bin/lib/bcm_runtime.sh
+source "${BCM_LIB_DIR}/bcm_runtime.sh"
+# shellcheck source=bin/lib/bcm_cluster_mode.sh
+source "${BCM_LIB_DIR}/bcm_cluster_mode.sh"
+# shellcheck source=bin/lib/bcm_update.sh
+source "${BCM_LIB_DIR}/bcm_update.sh"
+
+# ──── Параметры командной строки ─────────────────────────────────────────────
+BCM_STATUS_ONLY=0
+BCM_DEBUG=${BCM_DEBUG:-0}
+BCM_NO_CLEAR=0
+BCM_DO_UPDATE=0
+BCM_UPDATE_CHECK=0
+BCM_UPDATE_FORCE=0
+
+_parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status-only|-s)  BCM_STATUS_ONLY=1 ;;
+            --debug|-d)        BCM_DEBUG=1; export BCM_DEBUG ;;
+            --no-clear)        BCM_NO_CLEAR=1 ;;
+            --check-config)    _check_config_and_exit ;;
+            --update)          BCM_DO_UPDATE=1 ;;
+            --check-update)    BCM_DO_UPDATE=1; BCM_UPDATE_CHECK=1 ;;
+            --force)           BCM_UPDATE_FORCE=1 ;;
+            --version|-V)      echo "BCM $(bcm_get_app_version)"; exit 0 ;;
+            --help|-h)         _print_usage; exit 0 ;;
+            *) bcm_error "Неизвестный параметр: $1"; _print_usage; exit 1 ;;
+        esac
+        shift
+    done
+}
+
+_print_usage() {
+    echo "Использование: bcm [ОПЦИИ]"
+    echo "  --status-only, -s   Показать статус кластера и выйти"
+    echo "  --check-config      Проверить cluster.conf и выйти"
+    echo "  --check-update      Проверить наличие нового релиза и выйти"
+    echo "  --update            Обновить BCM до последнего релиза на всех нодах"
+    echo "    --force           (с --update) переустановить даже не-новее версию"
+    echo "  --version, -V       Показать версию BCM и выйти"
+    echo "  --debug, -d         Включить отладочный режим"
+    echo "  --help, -h          Эта справка"
+}
+
+_check_config_and_exit() {
+    if bcm_conf_exists; then
+        bcm_ok "Конфиг найден: ${BCM_CONF_FILE}"
+        bcm_load_topology && bcm_ok "Топология загружена." || bcm_error "Ошибка парсинга конфига."
+    else
+        bcm_error "Конфиг не найден: ${BCM_CONF_FILE}"
+        bcm_info "Запустите install.sh для настройки кластера."
+        exit 1
+    fi
+    exit 0
+}
+
+# ──── Отрисовка статус-таблицы ────────────────────────────────────────────────
+_draw_status_table() {
+    # scope: all | lb | web | pxc | s3 — какие слои показывать. Ограниченные роли
+    # (lb/pxc/s3) в интерактивном меню видят ТОЛЬКО свой слой (lb — ещё и VIP),
+    # «мозг» web и --status-only — весь кластер. По умолчанию all.
+    local scope="${1:-all}"
+    echo
+    bcm_cluster_mode_banner
+    bcm_color "WHITE" "  Узлы кластера:"
+    echo
+
+    bcm_table_header
+
+    # ── Слой LB ──────────────────────────────────────────────────────────────
+    local nodes_lb=("${BCM_NODES_LB[@]:-}")
+    if [[ ( "$scope" == "all" || "$scope" == "lb" ) && ${#nodes_lb[@]} -gt 0 ]]; then
+        for node in "${nodes_lb[@]}"; do
+            [[ -z "$node" ]] && continue
+            local ip="${BCM_NODE_IP[$node]:-?}"
+            local version status vipcron
+
+            if bcm_node_in_maintenance "$node"; then
+                version="—"
+                status="maint"
+                vipcron="—"
+            else
+                version=$(bcm_get_haproxy_version "$ip")
+                status=$(bcm_check_lb_health "$ip")
+                vipcron=$(bcm_get_lb_vrrp_role "$node")
+                [[ -z "$version" ]] && version="HAProxy (нет)"
+            fi
+            bcm_table_row "$node" "$ip" "$vipcron" "lb" "$version" "$status"
+        done
+        bcm_table_layer_sep
+    fi
+
+    # ── Слой WEB ─────────────────────────────────────────────────────────────
+    local nodes_web=("${BCM_NODES_WEB[@]:-}")
+    if [[ ( "$scope" == "all" || "$scope" == "web" ) && ${#nodes_web[@]} -gt 0 ]]; then
+        local cron_holder
+        cron_holder=$(bcm_get_cron_vrrp_holder 2>/dev/null || echo "")
+        for node in "${nodes_web[@]}"; do
+            [[ -z "$node" ]] && continue
+            local ip="${BCM_NODE_IP[$node]:-?}"
+            local version status vipcron
+
+            if bcm_node_in_maintenance "$node"; then
+                version="—"
+                status="maint"
+                vipcron="—"
+            else
+                version=$(bcm_get_benv_version "$ip")
+                status=$(bcm_check_web_health "$ip")
+                if [[ "$cron_holder" == "$node" ]]; then
+                    vipcron="MASTER"
+                else
+                    vipcron="BACKUP"
+                fi
+                [[ -z "$version" ]] && version="bitrix-env (нет)"
+            fi
+            bcm_table_row "$node" "$ip" "$vipcron" "web" "$version" "$status"
+        done
+        bcm_table_layer_sep
+    fi
+
+    # ── Слой S3 ───────────────────────────────────────────────────────────────
+    local nodes_s3=("${BCM_NODES_S3[@]:-}")
+    if [[ ( "$scope" == "all" || "$scope" == "s3" ) && ${#nodes_s3[@]} -gt 0 ]]; then
+        for node in "${nodes_s3[@]}"; do
+            [[ -z "$node" ]] && continue
+            local ip="${BCM_NODE_IP[$node]:-?}"
+            local version status
+
+            if bcm_node_in_maintenance "$node"; then
+                version="—"
+                status="maint"
+            else
+                version=$(bcm_get_minio_version "$ip")
+                status=$(bcm_check_s3_health "$ip")
+                [[ -z "$version" ]] && version="minio (нет)"
+            fi
+            bcm_table_row "$node" "$ip" "—" "s3" "$version" "$status"
+        done
+        bcm_table_layer_sep
+    fi
+
+    # ── Слой PXC ─────────────────────────────────────────────────────────────
+    local nodes_pxc=("${BCM_NODES_PXC[@]:-}")
+    if [[ ( "$scope" == "all" || "$scope" == "pxc" ) && ${#nodes_pxc[@]} -gt 0 ]]; then
+        # Фактический writer — из runtime ProxySQL (galera-checker мог сменить его
+        # после failover); если опрос не удался — откат на [layer.pxc] writer из конфига.
+        local pxc_writer
+        pxc_writer=$(bcm_get_pxc_runtime_writer 2>/dev/null || echo "")
+        [[ -z "$pxc_writer" ]] && pxc_writer=$(bcm_get_pxc_writer 2>/dev/null || echo "")
+        for node in "${nodes_pxc[@]}"; do
+            [[ -z "$node" ]] && continue
+            local ip="${BCM_NODE_IP[$node]:-?}"
+            local version status vipcron
+
+            if bcm_node_in_maintenance "$node"; then
+                version="—"
+                status="maint"
+                vipcron="—"
+            else
+                version=$(bcm_get_pxc_version "$ip")
+                status=$(bcm_check_pxc_health "$ip")
+                if [[ "$pxc_writer" == "$node" ]]; then
+                    vipcron="WRITER"
+                else
+                    vipcron="READER"
+                fi
+                [[ -z "$version" ]] && version="MySQL (нет)"
+            fi
+            bcm_table_row "$node" "$ip" "$vipcron" "pxc" "$version" "$status"
+        done
+        bcm_table_layer_sep
+    fi
+
+    # ── VIP строка (только в полном обзоре и в lb-скоупе: VIP держит lb) ────────
+    local vip
+    vip=$(bcm_get_vip 2>/dev/null || echo "")
+    if [[ ( "$scope" == "all" || "$scope" == "lb" ) && -n "$vip" ]]; then
+        local vip_holder
+        vip_holder=$(bcm_get_vip_holder "$vip" 2>/dev/null || echo "?")
+        local vip_status="ok"
+        [[ -z "$vip_holder" || "$vip_holder" == "?" ]] && vip_status="fail"
+        local vip_ver="держит: ${vip_holder:-нет}"
+        bcm_table_row "VIP" "$vip" "—" "vip" "$vip_ver" "$vip_status"
+    fi
+
+    bcm_divider "$BCM_LINE_H1"
+}
+
+# ──── Полное меню (только web-ноды) ──────────────────────────────────────────
+_show_full_menu() {
+    local menu_items=(
+        "1.  Управление узлами кластера"
+        "2.  Настройка локального хоста"
+        "3.  Кластер БД (Percona XtraDB Cluster)"
+        "4.  ProxySQL"
+        "5.  VIP / Keepalived"
+        "6.  Синхронизация файлов (lsyncd)"
+        "7.  Управление сайтами"
+        "8.  Веб-серверы"
+        "9.  Push/RTC сервис"
+        "10. Фоновые задания (HA Cron)"
+        "11. Облачное хранилище /upload (S3)"
+        "12. SSL-сертификаты (HTTPS / Let's Encrypt)"
+        "13. Резервное копирование (S3, HA-aware)"
+        "14. Генератор документов (Transformer) — нужен портал+Enterprise"
+        "0.  Выход"
+    )
+    bcm_print_menu menu_items
+}
+
+# ──── Урезанное меню (lb / pxc / s3) ─────────────────────────────────────────
+_show_limited_menu() {
+    local role="$1"
+    local -a menu_items=()
+
+    case "$role" in
+        lb)
+            menu_items=(
+                "1.  Настройка локального хоста"
+                "2.  VIP / Keepalived"
+                "0.  Выход"
+            )
+            ;;
+        pxc)
+            menu_items=(
+                "1.  Настройка локального хоста"
+                "2.  Кластер БД (Percona XtraDB Cluster)"
+                "0.  Выход"
+            )
+            ;;
+        s3)
+            menu_items=(
+                "1.  Настройка локального хоста"
+                "2.  MinIO S3 (статус и управление)"
+                "0.  Выход"
+            )
+            ;;
+        *)
+            menu_items=(
+                "1.  Настройка локального хоста"
+                "0.  Выход"
+            )
+            ;;
+    esac
+
+    bcm_print_menu menu_items
+}
+
+# ──── Обработка выбора в полном меню ─────────────────────────────────────────
+_handle_full_menu_choice() {
+    local choice="$1"
+    case "$choice" in
+        1) bash "${BCM_MENU_DIR}/01_cluster_nodes.sh" ;;
+        2) bash "${BCM_MENU_DIR}/02_local_host.sh" ;;
+        3) bash "${BCM_MENU_DIR}/03_pxc.sh" ;;
+        4) bash "${BCM_MENU_DIR}/04_proxysql.sh" ;;
+        5) bash "${BCM_MENU_DIR}/05_keepalived.sh" ;;
+        6) bash "${BCM_MENU_DIR}/06_lsyncd.sh" ;;
+        7) bash "${BCM_MENU_DIR}/07_sites.sh" ;;
+        8) bash "${BCM_MENU_DIR}/08_webservers.sh" ;;
+        9) bash "${BCM_MENU_DIR}/09_push.sh" ;;
+        10) bash "${BCM_MENU_DIR}/10_cron.sh" ;;
+        11) bash "${BCM_MENU_DIR}/11_cloud_storage.sh" ;;
+        12) bash "${BCM_MENU_DIR}/12_ssl.sh" ;;
+        13) bash "${BCM_MENU_DIR}/13_backup.sh" ;;
+        14) bash "${BCM_MENU_DIR}/14_transformer.sh" ;;
+        0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
+        "") : ;;  # пустой ввод — просто обновить экран
+        *) bcm_warn "Неверный выбор: ${choice}. Введите число от 0 до 14." ;;
+    esac
+}
+
+# ──── Обработка выбора в урезанном меню ──────────────────────────────────────
+_handle_limited_menu_choice() {
+    local role="$1"
+    local choice="$2"
+    case "$role" in
+        lb)
+            case "$choice" in
+                1) bash "${BCM_MENU_DIR}/02_local_host.sh" ;;
+                2) bash "${BCM_MENU_DIR}/05_keepalived.sh" ;;
+                0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
+                *) bcm_warn "Неверный выбор." ;;
+            esac
+            ;;
+        pxc)
+            case "$choice" in
+                1) bash "${BCM_MENU_DIR}/02_local_host.sh" ;;
+                2) bash "${BCM_MENU_DIR}/03_pxc.sh" ;;
+                0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
+                *) bcm_warn "Неверный выбор." ;;
+            esac
+            ;;
+        s3)
+            case "$choice" in
+                1) bash "${BCM_MENU_DIR}/02_local_host.sh" ;;
+                2) bash "${BCM_MENU_DIR}/s3_minio.sh" 2>/dev/null || bcm_warn "Модуль MinIO недоступен." ;;
+                0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
+                *) bcm_warn "Неверный выбор." ;;
+            esac
+            ;;
+        *)
+            case "$choice" in
+                1) bash "${BCM_MENU_DIR}/02_local_host.sh" ;;
+                0) exit 0 ;;
+                *) bcm_warn "Неверный выбор." ;;
+            esac
+            ;;
+    esac
+}
+
+# ──── Главный цикл ────────────────────────────────────────────────────────────
+main() {
+    _parse_args "$@"
+    bcm_require_root
+
+    # 1. Проверить конфиг
+    if ! bcm_conf_exists; then
+        { [[ -t 1 && ${BCM_NO_CLEAR:-0} -eq 0 ]] && clear 2>/dev/null; } || true
+        echo
+        bcm_color "RED_BOLD" "  ╔══════════════════════════════════════════════════╗"
+        bcm_color "RED_BOLD" "  ║  Bitrix Cluster Manager — НЕ НАСТРОЕН           ║"
+        bcm_color "RED_BOLD" "  ╚══════════════════════════════════════════════════╝"
+        echo
+        bcm_warn "Конфигурационный файл не найден:"
+        bcm_info  "  ${BCM_CONF_FILE}"
+        echo
+        bcm_info "Для настройки кластера запустите:"
+        bcm_color "WHITE" "  bash /opt/bcm/install.sh"
+        echo
+        exit 1
+    fi
+
+    # 2. Загрузить топологию
+    if ! bcm_load_topology; then
+        bcm_error "Не удалось загрузить топологию из ${BCM_CONF_FILE}"
+        exit 1
+    fi
+
+    # 2b. Самообновление по релизам GitHub (до TUI).
+    if [[ ${BCM_DO_UPDATE} -eq 1 ]]; then
+        local -a _upd_args=()
+        [[ ${BCM_UPDATE_CHECK} -eq 1 ]] && _upd_args+=("--check")
+        [[ ${BCM_UPDATE_FORCE} -eq 1 ]] && _upd_args+=("--force")
+        bcm_self_update "${_upd_args[@]}"
+        exit $?
+    fi
+
+    # 3. Определить роль текущего узла
+    local current_role
+    current_role=$(bcm_get_current_role)
+    local current_node
+    current_node=$(bcm_get_current_node_name)
+
+    # 4. Получить версии для шапки
+    local app_ver
+    app_ver=$(bcm_get_app_version)
+    local benv_ver
+    benv_ver=$(bcm_get_local_benv_version)
+
+    # 5. Режим --status-only
+    if [[ $BCM_STATUS_ONLY -eq 1 ]]; then
+        bcm_print_header "$app_ver" "$benv_ver" "$current_role" "$current_node"
+        # Явный запрос статуса — всегда полный обзор кластера с любой ноды.
+        _draw_status_table all
+        exit 0
+    fi
+
+    # 6. Главный интерактивный цикл
+    local notice=""
+    while true; do
+        bcm_load_topology || true
+        bcm_print_header "$app_ver" "$benv_ver" "$current_role" "$current_node"
+        # Скоуп таблицы: web (мозг) и unknown — весь кластер; lb/pxc/s3 — свой слой.
+        local table_scope="all"
+        [[ "$current_role" != "web" && "$current_role" != "unknown" ]] && table_scope="$current_role"
+        _draw_status_table "$table_scope"
+
+        # Показываем разные меню в зависимости от роли
+        if [[ "$current_role" == "web" ]]; then
+            _show_full_menu
+        else
+            # Не web-нода: показать предупреждение об урезанном меню
+            if [[ "$current_role" == "unknown" ]]; then
+                bcm_warn "Узел не найден в cluster.conf. Доступно только базовое меню."
+            else
+                bcm_info "Узел: ${current_node} (${current_role}). Отображается меню для роли."
+            fi
+            _show_limited_menu "$current_role"
+        fi
+
+        [[ -n "$notice" ]] && bcm_warn "$notice" && notice=""
+
+        local choice
+        bcm_read_choice "Введите ваш выбор" choice
+
+        if [[ "$current_role" == "web" ]]; then
+            _handle_full_menu_choice "$choice"
+        else
+            _handle_limited_menu_choice "$current_role" "$choice"
+        fi
+
+        # Сбросить кэш перед следующим отображением (живые данные)
+        bcm_clear_cache
+        BCM_CONF_LOADED=0
+    done
+}
+
+main "$@"
+

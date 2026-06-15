@@ -1,0 +1,36 @@
+# =============================================================================
+# redis-cache.conf — выделенный Redis под кэш Bitrix (managed_cache + cache), BCM.
+# Отдельный инстанс от session (6380), общего push (6381) и локального push
+# bitrix-env (6379). ОБЩИЙ для всех web-нод через плавающий CACHE_VIP — чтобы кэш
+# (и инвалидация по тегам) были консистентны между нодами: иначе при файловом
+# per-node кэше инвалидация на одной ноде не видна другой → устаревший кэш.
+# Сгенерировано BCM.
+#
+# Особенности:
+#   - allkeys-lru: кэш эфемерен, под давлением вытесняем старые ключи (НЕ блокируем
+#     запись, в отличие от session-redis с noeviction);
+#   - без AOF/RDB: кэш переживать рестарт не обязан (пересоберётся);
+#   - bind 0.0.0.0: redis слушает и на плавающем CACHE_VIP; доступ к порту ограничен
+#     firewall'ом до web-пиров (см. configure_cache_redis), пароль не используется.
+# Подстановки BCM: __NODE_IP__, __CACHE_PORT__, __CACHE_MAXMEM__
+# =============================================================================
+port __CACHE_PORT__
+bind 0.0.0.0
+protected-mode no
+daemonize no
+supervised systemd
+pidfile /run/redis-cache/redis-cache.pid
+dir /var/lib/redis-cache
+logfile /var/log/redis/redis-cache.log
+databases 16
+
+# Кэш эфемерен — персистентность не нужна
+appendonly no
+save ""
+
+maxmemory __CACHE_MAXMEM__
+maxmemory-policy allkeys-lru
+
+# Роль (master/replica) управляется keepalived через redis_session_notify.sh:
+#   notify_master → REPLICAOF NO ONE + maxmemory-policy allkeys-lru
+#   notify_backup → REPLICAOF <CACHE_VIP> <port>
