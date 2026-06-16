@@ -505,6 +505,8 @@ _pxc_change_writer() {
     proxysql_admin_port=$(bcm_get_proxysql_admin_port 2>/dev/null || echo "6032")
     proxysql_admin_user=$(bcm_get_proxysql_admin_user 2>/dev/null || echo "admin")
     proxysql_admin_pass=$(bcm_get_proxysql_admin_pass 2>/dev/null || echo "admin")
+    # Пароль в одинарных кавычках (с экранированием самих ') для инлайна в -p'...'.
+    local aps_q="'${proxysql_admin_pass//\'/\'\\\'\'}'"
 
     bcm_info "Обновляем ProxySQL HG${hg_write} на web-узлах..."
 
@@ -528,15 +530,10 @@ _pxc_change_writer() {
         # 0 строк → HG_WRITE пустел и LOAD падал (ловили вживую).
         local proxysql_update_script
         proxysql_update_script=$(cat <<PROXYSQL_SCRIPT
-# ProxySQL принимает пароль только как -p<pass> (MYSQL_PWD/defaults-file он отвергает).
-MYSQL_ADMIN="mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p'${proxysql_admin_pass}'"
-
-# Базовый вес всем PXC-нодам, новому writer'у — выше остальных.
-\$MYSQL_ADMIN -e "UPDATE mysql_servers SET weight=100;" 2>/dev/null
-\$MYSQL_ADMIN -e "UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}';" 2>/dev/null
-
-# Применить + персист; galera-checker переизберёт writer по весам.
-\$MYSQL_ADMIN -e "LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo PROXYSQL_OK || echo PROXYSQL_FAIL
+# ProxySQL принимает пароль только как -p<pass>. ⚠️ Инлайним -p${aps_q} ПРЯМО в команду:
+# через переменную (MYSQL_ADMIN="...-p'pass'"; \$MYSQL_ADMIN) кавычки остаются литеральными
+# при ре-экспансии → пароль='pass' → Access denied (ловили вживую на rolling-тесте).
+mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "UPDATE mysql_servers SET weight=100; UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}'; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo PROXYSQL_OK || echo PROXYSQL_FAIL
 PROXYSQL_SCRIPT
 )
         local result
@@ -673,6 +670,8 @@ _pxc_auto_failover() {
     proxysql_admin_port=$(bcm_get_proxysql_admin_port 2>/dev/null || echo "6032")
     proxysql_admin_user=$(bcm_get_proxysql_admin_user 2>/dev/null || echo "admin")
     proxysql_admin_pass=$(bcm_get_proxysql_admin_pass 2>/dev/null || echo "admin")
+    # Пароль в одинарных кавычках (с экранированием самих ') для инлайна в -p'...'.
+    local aps_q="'${proxysql_admin_pass//\'/\'\\\'\'}'"
 
     bcm_info "Обновляем ProxySQL HG${hg_write} на web-узлах..."
 
@@ -690,11 +689,9 @@ _pxc_auto_failover() {
         # Ручное DELETE/INSERT между HG нельзя (см. _pxc_change_writer).
         local proxysql_failover_script
         proxysql_failover_script=$(cat <<PROXYSQL_SCRIPT
-# ProxySQL принимает пароль только как -p<pass> (MYSQL_PWD/defaults-file он отвергает).
-MYSQL_ADMIN="mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p'${proxysql_admin_pass}'"
-\$MYSQL_ADMIN -e "UPDATE mysql_servers SET weight=100;" 2>/dev/null
-\$MYSQL_ADMIN -e "UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}';" 2>/dev/null
-\$MYSQL_ADMIN -e "LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo OK || echo FAIL
+# ProxySQL принимает пароль только как -p<pass>. ⚠️ Инлайним -p${aps_q} ПРЯМО в команду
+# (не через переменную — иначе кавычки литеральны при ре-экспансии → Access denied).
+mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "UPDATE mysql_servers SET weight=100; UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}'; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo OK || echo FAIL
 PROXYSQL_SCRIPT
 )
         local result
