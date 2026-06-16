@@ -64,6 +64,16 @@ frontend http_frontend
     acl is_acme path_beg /.well-known/acme-challenge/
     use_backend acme_backend if is_acme
 
+    # ⚠️ CSS/JS-оптимизация Bitrix (/bitrix/cache/css|js): объединённые файлы с
+    # контент-хэшем в имени генерятся ЛЕНИВО и ПОНОДОВО (каталог исключён из lsyncd)
+    # → файл существует только на ноде, отрендерившей страницу. При round-robin
+    # запрос ассета может попасть на ДРУГУЮ ноду → 404 (рвёт kanban/CRM: «Cannot read
+    # properties of undefined»). Отдельный backend с retry-on 404: при 404 HAProxy
+    # переотправляет идемпотентный GET на другую ноду (redispatch), где файл есть.
+    # Active-active сохраняется (без sticky/двусторонней синхронизации кэша).
+    acl is_bx_cache path_beg /bitrix/cache/css/ /bitrix/cache/js/
+    use_backend web_cache_backend if is_bx_cache
+
     # Принудительный HTTPS — управляется BCM (меню «SSL-сертификаты»), не править
     # вручную: маркер bcm:force_https используется для включения/выключения sed'ом.
     # ACME-challenge исключён — выпуск LE должен работать и при включённом редиректе.
@@ -84,6 +94,21 @@ backend web_backend
     # Строки для каждой web-ноды добавляются генератором:
     # server __NODE_NAME__ __NODE_IP__:80 check inter 2s fall 3 rise 2
 __BCM_WEB_NODES_BACKENDS__
+
+# ──── Backend: CSS/JS-кэш Bitrix — retry-on 404 на другую ноду ────────────────
+# Ассеты /bitrix/cache/css|js генерятся поноводно (контент-хэш в имени) и НЕ
+# синкаются lsyncd. retries + option redispatch 1 + retry-on 404: если выбранная
+# нода отдала 404, GET автоматически переотправляется на ДРУГУЮ ноду, где файл есть
+# (redispatch 1 — перекидывать на каждом ретрае, не дожидаясь последнего). Те же
+# серверы/health-check, что и web_backend.
+backend web_cache_backend
+    balance roundrobin
+    retries 2
+    option redispatch 1
+    retry-on 404
+    option httpchk GET /
+    http-check expect status 200
+__BCM_WEB_CACHE_BACKENDS__
 
 # ──── Backend: админка/запись — только источник lsyncd (остальные backup) ────
 backend web_admin_backend

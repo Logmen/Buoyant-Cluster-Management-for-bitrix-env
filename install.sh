@@ -134,6 +134,19 @@ S3_UPLOAD_BUCKET="bitrix-upload"
 # bucket.<домен>; <домен> и bucket.<домен> резолвятся на web-нодах в /etc/hosts на
 # S3-VIP, MinIO получает MINIO_DOMAIN=<домен>. По умолчанию не-маршрутизируемый .lab.
 S3_VHOST_DOMAIN="s3.bitrix.lab"
+# Опционально: выделенный диск под хранилище MinIO на S3-нодах.
+# S3_DATA_DISK — одно блочное устройство для ВСЕХ S3-нод (напр. /dev/sdb);
+# S3_DATA_DISKS_LIST — пер-нодовые устройства "имя:устройство,..." (приоритет выше).
+# Если ничего не задано — данные MinIO лежат на корневой ФС (как раньше).
+# S3_DATA_MOUNT — точка монтирования диска (данные в <mount>/data).
+# S3_DATA_FS — xfs (рекомендация MinIO) или ext4. S3_DATA_DISK_FORCE=1 — форматировать,
+# даже если на устройстве уже есть ФС (⚠️ УНИЧТОЖАЕТ данные).
+S3_DATA_DISK=""
+S3_DATA_DISKS_LIST=""
+declare -A S3_DATA_DISKS=()
+S3_DATA_MOUNT="/var/lib/minio"
+S3_DATA_FS="xfs"
+S3_DATA_DISK_FORCE="0"
 PROXYSQL_PORT="6033"
 PROXYSQL_ADMIN_PORT="6032"
 PROXYSQL_ADMIN_USER="admin"
@@ -551,6 +564,17 @@ collect_topology_interactive() {
     read -r -p "Введите S3 vhost-домен для модуля «Облачные хранилища» (по умолчанию ${S3_VHOST_DOMAIN}): " _s3_vh
     S3_VHOST_DOMAIN="${_s3_vh:-$S3_VHOST_DOMAIN}"
 
+    # Опционально: выделенный диск под хранилище MinIO (общий для всех S3-нод).
+    read -r -p "Выделенный диск под хранилище MinIO на S3-нодах (напр. /dev/sdb; Enter — корневая ФС): " S3_DATA_DISK
+    if [[ -n "$S3_DATA_DISK" ]]; then
+        read -r -p "  Точка монтирования (по умолчанию ${S3_DATA_MOUNT}): " _s3_mnt
+        S3_DATA_MOUNT="${_s3_mnt:-$S3_DATA_MOUNT}"
+        read -r -p "  Файловая система xfs|ext4 (по умолчанию ${S3_DATA_FS}): " _s3_fs
+        S3_DATA_FS="${_s3_fs:-$S3_DATA_FS}"
+        read -r -p "  Форматировать, даже если на диске уже есть ФС? (УНИЧТОЖИТ данные) [y/N]: " _s3_force
+        [[ "$_s3_force" =~ ^[Yy]$ ]] && S3_DATA_DISK_FORCE="1" || S3_DATA_DISK_FORCE="0"
+    fi
+
     read -r -p "Введите порт ProxySQL (по умолчанию 6033): " PROXYSQL_PORT
     PROXYSQL_PORT="${PROXYSQL_PORT:-6033}"
 
@@ -658,6 +682,10 @@ load_answers_file() {
     done
     for pair in ${S3_IPS_LIST:-}; do
         S3_IPS["${pair%%:*}"]="${pair#*:}"
+    done
+    # Пер-нодовые выделенные диски MinIO (опционально): "имя:устройство,..."
+    for pair in ${S3_DATA_DISKS_LIST:-}; do
+        S3_DATA_DISKS["${pair%%:*}"]="${pair#*:}"
     done
 }
 
@@ -1030,6 +1058,69 @@ configure_firewall_for_node() {
     fi
 }
 
+# ──── Подготовка выделенного диска под хранилище MinIO (опционально) ─────────
+# Если для S3-ноды задано блочное устройство (S3_DATA_DISKS_LIST или общий S3_DATA_DISK),
+# форматирует его (по умолчанию xfs — рекомендация MinIO) и монтирует в S3_DATA_MOUNT,
+# чтобы данные MinIO жили на отдельном диске, а не на корневой ФС.
+# ⚠️ Форматирование УНИЧТОЖАЕТ данные на устройстве: пропускается, если на нём уже есть
+# ФС (кроме S3_DATA_DISK_FORCE=1). Идемпотентно: запись в /etc/fstab по UUID.
+# Если устройство не задано — возвращает 0 (данные на корневой ФС, как раньше).
+prepare_s3_data_disk() {
+    local name="$1" ip="$2"
+    local dev="${S3_DATA_DISKS[$name]:-$S3_DATA_DISK}"
+    [[ -z "$dev" ]] && return 0   # выделенный диск не задан — используем корневую ФС
+
+    local mount="${S3_DATA_MOUNT:-/var/lib/minio}"
+    local fs="${S3_DATA_FS:-xfs}"
+    local force="${S3_DATA_DISK_FORCE:-0}"
+
+    log_info "Подготовка выделенного диска $dev под MinIO на $name (монтирование в $mount)..."
+
+    # Скрипт выполняется на ноде: проверка устройства, формат при необходимости, fstab+mount.
+    # Install-side значения подставляются heredoc'ом, remote-переменные экранированы (\$).
+    local script
+    script=$(cat <<REMOTE
+set -euo pipefail
+dev="$dev"; mount="$mount"; fs="$fs"; force="$force"
+
+if [ ! -b "\$dev" ]; then
+    echo "BCM_ERR: устройство \$dev не найдено или не является блочным" >&2
+    exit 10
+fi
+
+# Уже смонтировано в целевую точку → ничего не делаем (идемпотентность).
+if findmnt -rno TARGET "\$dev" 2>/dev/null | grep -qx "\$mount"; then
+    echo "уже смонтировано: \$dev -> \$mount"
+else
+    existing_fs="\$(blkid -o value -s TYPE "\$dev" 2>/dev/null || true)"
+    if [ -n "\$existing_fs" ] && [ "\$force" != "1" ]; then
+        echo "на \$dev уже есть ФС (\$existing_fs) — форматирование пропущено, монтируем как есть"
+    else
+        echo "форматирование \$dev в \$fs..."
+        case "\$fs" in
+            xfs)  mkfs.xfs -f "\$dev" ;;
+            ext4) mkfs.ext4 -F "\$dev" ;;
+            *)    echo "BCM_ERR: неподдерживаемая ФС '\$fs' (xfs|ext4)" >&2; exit 11 ;;
+        esac
+    fi
+    mkdir -p "\$mount"
+    uuid="\$(blkid -o value -s UUID "\$dev")"
+    [ -n "\$uuid" ] || { echo "BCM_ERR: не удалось получить UUID \$dev" >&2; exit 12; }
+    # Монтирование по UUID (устойчиво к перенумерации устройств при перезагрузке).
+    if ! grep -q "UUID=\$uuid[[:space:]]" /etc/fstab; then
+        echo "UUID=\$uuid \$mount \$fs defaults,noatime 0 2" >> /etc/fstab
+    fi
+    mountpoint -q "\$mount" || mount "\$mount"
+fi
+echo "MinIO data dir: \$mount/data (диск \$dev)"
+REMOTE
+)
+    if ! bcm_ssh_exec_logged "$name" "$ip" "$script"; then
+        log_error "Не удалось подготовить диск $dev на $name (см. лог ноды). Установка прервана."
+        exit 1
+    fi
+}
+
 # ──── Конфигурация сервисов ──────────────────────────────────────────────────
 configure_services() {
     log_info "Конфигурация сервисов на узлах..."
@@ -1191,6 +1282,8 @@ SQL
         web_backends="${web_backends}    server ${name} ${ip}:80 check inter 2s fall 3 rise 2\n"
     done
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_NODES_BACKENDS__" "$web_backends"
+    # web_cache_backend (CSS/JS-кэш, retry-on 404) — те же web-ноды, что и публичный.
+    render_multiline "$local_haproxy_cfg" "__BCM_WEB_CACHE_BACKENDS__" "$web_backends"
 
     # Admin/запись (/bitrix/admin) — только на источник lsyncd (первый web),
     # остальные ноды как backup (берутся лишь при падении источника). Так
@@ -1300,17 +1393,21 @@ SQL
 
         configure_firewall_for_node "$name" "$ip" "s3"
 
+        # Опционально: вынести хранилище MinIO на выделенный диск (если задан).
+        prepare_s3_data_disk "$name" "$ip"
+        local s3_data_dir="${S3_DATA_MOUNT:-/var/lib/minio}/data"
+
         local local_minio_cfg="/tmp/minio.env"
         cp "${BCM_BASE_DIR}/templates/minio.env.tmpl" "$local_minio_cfg"
 
-        sed -i "s|__MINIO_VOLUMES__|/var/lib/minio/data|g" "$local_minio_cfg"
+        sed -i "s|__MINIO_VOLUMES__|${s3_data_dir}|g" "$local_minio_cfg"
         render_value "$local_minio_cfg" "__MINIO_ROOT_USER__" "$s3_access_key"
         render_value "$local_minio_cfg" "__MINIO_ROOT_PASSWORD__" "$s3_secret_key"
         sed -i "s/__MINIO_SITE_NAME__/${name}/g" "$local_minio_cfg"
         sed -i "s/__MINIO_SITE_REGION__/us-east-1/g" "$local_minio_cfg"
         sed -i "s/__MINIO_DOMAIN__/${S3_VHOST_DOMAIN}/g" "$local_minio_cfg"
 
-        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/default /var/lib/minio/data /var/log/minio"
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/default '${s3_data_dir}' /var/log/minio"
         bcm_ssh_copy_file "$local_minio_cfg" "$ip" "/etc/default/minio"
 
         local local_minio_svc="/tmp/minio.service"
