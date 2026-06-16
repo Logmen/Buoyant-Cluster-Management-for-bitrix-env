@@ -1,14 +1,18 @@
 name: release-validate
 
 # Релиз публикуется ЛОКАЛЬНО из scripts/release.sh (tarball подписывается GPG-ключом
-# мейнтейнера, который НЕ хранится на GitHub). Этот workflow — лишь страховочная
-# валидация тега: синтаксис скриптов и совпадение bcm/VERSION с тегом.
+# мейнтейнера, который НЕ хранится на GitHub). Этот workflow — страховочная валидация:
+# полный предрелизный набор tests/release_check.sh + совпадение bcm/VERSION с тегом.
 # Артефакты/Release он НЕ создаёт (это делает release.sh через gh).
+# Гоняется и на тегах (релиз), и на push в main / PR — чтобы ловить регрессии заранее.
 
 on:
   push:
     tags:
       - 'v*.*.*'
+    branches:
+      - main
+  pull_request:
 
 permissions:
   contents: read
@@ -21,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: VERSION matches tag
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
@@ -30,14 +35,10 @@ jobs:
             exit 1
           fi
 
-      - name: Syntax check
-        run: |
-          bash -n install.sh scripts/release.sh
-          find bcm -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
-      - name: Trusted release pubkey is committed
-        run: |
-          if [ -z "$(find bcm/keys -maxdepth 1 -type f \( -name '*.asc' -o -name '*.gpg' \) 2>/dev/null)" ]; then
-            echo "::error::в bcm/keys/ нет публичного ключа — операторы не смогут проверить подпись (см. bcm/keys/README.md)"
-            exit 1
-          fi
+      - name: Pre-release checks (tests/release_check.sh)
+        # Полный набор: синтаксис, shellcheck, полнота bcm_deploy_to_node, source-ссылки,
+        # функции меню, плейсхолдеры, секреты, манифест релиза, публичный ключ и т.д.
+        run: bash tests/release_check.sh
