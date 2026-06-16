@@ -168,6 +168,7 @@ bcm_deploy_to_node() {
     # Скопировать общие файлы (включая notify/health-скрипты для keepalived)
     for f in bin/bcm bin/lib/bcm_utils.sh bin/lib/bcm_config.sh \
               bin/lib/bcm_runtime.sh bin/lib/bcm_ssh.sh bin/lib/bcm_cluster_mode.sh \
+              bin/lib/bcm_os_update.sh \
               bin/lib/cron_notify.sh bin/lib/keepalived_notify.sh \
               bin/lib/redis_session_notify.sh bin/lib/redis_session_check.sh \
               bin/lib/pxc_autorecover.sh bin/lib/lsyncd_role.sh \

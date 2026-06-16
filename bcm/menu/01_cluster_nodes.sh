@@ -15,6 +15,7 @@ source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_runtime.sh"
 source "${BCM_LIB_DIR}/bcm_cluster_mode.sh"
+source "${BCM_LIB_DIR}/bcm_os_update.sh"
 
 # ──── Вспомогательные функции ────────────────────────────────────────────────
 
@@ -631,6 +632,7 @@ _cn_print_menu() {
         "5.  Просмотр cluster.conf"
         "6.  Режим обслуживания (ввод/вывод узлов)"
         "7.  Режим единой ноды (single-active: вкл/выкл)"
+        "8.  Обновление пакетов ОС (HA-rolling)"
         "0.  Назад"
     )
     bcm_print_menu items
@@ -758,9 +760,10 @@ main() {
             5) _cn_view_conf ;;
             6) _cn_toggle_maintenance ;;
             7) _cn_single_node_mode ;;
+            8) bcm_osupdate_rolling ;;
             0) break ;;
             "") : ;;
-            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 7." ;;
+            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 8." ;;
         esac
     done
 }
