@@ -157,6 +157,25 @@ bcm_deploy_to_node() {
 
     bcm_log_info "Развёртывание BCM на ${ip} (роль: ${role})"
 
+    # ⚠️ Защита от ДАУНГРЕЙДА (chokepoint для install.sh И bcm --update): не раскатывать
+    # BCM СТАРШЕ той версии, что уже стоит на ноде. Иначе install.sh из устаревшей копии
+    # откатил бы инструментарий, обновлённый ранее через `bcm --update`. Обход —
+    # BCM_ALLOW_DOWNGRADE=1. Свежая установка (на ноде нет VERSION) и равные версии — ок.
+    local _src_ver _node_ver _newer
+    _src_ver="$(tr -d '[:space:]' < "${bcm_src}/VERSION" 2>/dev/null || true)"
+    _node_ver="$(bcm_ssh_exec "$ip" "cat /opt/bcm/VERSION 2>/dev/null" | tr -d '[:space:]')"
+    if [[ -n "$_src_ver" && -n "$_node_ver" && "$_src_ver" != "$_node_ver" ]]; then
+        _newer="$(printf '%s\n%s\n' "$_src_ver" "$_node_ver" | sort -V | tail -1)"
+        if [[ "$_newer" == "$_node_ver" ]]; then
+            if [[ "${BCM_ALLOW_DOWNGRADE:-0}" == "1" ]]; then
+                bcm_log_warn "  ${ip}: даунгрейд BCM ${_node_ver} → ${_src_ver} (BCM_ALLOW_DOWNGRADE=1)."
+            else
+                bcm_log_error "  ${ip}: установлен BCM ${_node_ver}, новее раскатываемого ${_src_ver} — даунгрейд заблокирован (BCM_ALLOW_DOWNGRADE=1 для осознанного отката)."
+                return 1
+            fi
+        fi
+    fi
+
     # Создать директорию на удалённом узле
     bcm_ssh_exec "$ip" "mkdir -p /opt/bcm/bin/lib /opt/bcm/menu /opt/bcm/templates /var/log/bcm /etc/bitrix-cluster"
 

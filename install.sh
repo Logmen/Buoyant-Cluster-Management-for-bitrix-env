@@ -733,6 +733,48 @@ validate_connectivity() {
     log_ok "Связь со всеми узлами успешно проверена."
 }
 
+# ──── Защита от даунгрейда BCM ────────────────────────────────────────────────
+# install.sh раскатывает bcm/ из ЛОКАЛЬНОЙ копии (BCM_INSTALL_SRC). Если на нодах
+# уже стоит БОЛЕЕ НОВЫЙ BCM (например, после `bcm --update`), повторный install из
+# старой копии ОТКАТИЛ БЫ инструментарий. Проверяем РАНО — до любых изменений
+# (до write_conf) — и фейлимся, если хоть одна нода новее источника.
+# Осознанный откат: BCM_ALLOW_DOWNGRADE=1.
+check_bcm_no_downgrade() {
+    local src_ver
+    src_ver="$(tr -d '[:space:]' < "${BCM_INSTALL_SRC}/VERSION" 2>/dev/null || true)"
+    [[ -z "$src_ver" ]] && return 0   # в источнике нет VERSION — сравнивать не с чем
+
+    local name ip node_ver newer found_newer=0
+    for name in "${LB_NODES[@]}" "${WEB_NODES[@]}" "${PXC_NODES[@]}" "${S3_NODES[@]}"; do
+        ip=""
+        [[ -n "${LB_IPS[$name]:-}" ]]  && ip="${LB_IPS[$name]}"
+        [[ -n "${WEB_IPS[$name]:-}" ]] && ip="${WEB_IPS[$name]}"
+        [[ -n "${PXC_IPS[$name]:-}" ]] && ip="${PXC_IPS[$name]}"
+        [[ -n "${S3_IPS[$name]:-}" ]]  && ip="${S3_IPS[$name]}"
+        [[ -z "$ip" ]] && continue
+        node_ver="$(timeout 8 sshpass -p "$ROOT_PASSWORD" ssh -o ConnectTimeout=4 \
+            -o StrictHostKeyChecking=accept-new "root@${ip}" \
+            "cat /opt/bcm/VERSION 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+        [[ -z "$node_ver" || "$node_ver" == "$src_ver" ]] && continue
+        newer="$(printf '%s\n%s\n' "$src_ver" "$node_ver" | sort -V | tail -1)"
+        if [[ "$newer" == "$node_ver" ]]; then
+            found_newer=1
+            log_warn "На ${name} (${ip}) установлен BCM ${node_ver} — НОВЕЕ раскатываемого ${src_ver}."
+        fi
+    done
+
+    if [[ "$found_newer" -eq 1 ]]; then
+        if [[ "${BCM_ALLOW_DOWNGRADE:-0}" == "1" ]]; then
+            log_warn "BCM_ALLOW_DOWNGRADE=1 — продолжаю, ИНСТРУМЕНТАРИЙ BCM будет ОТКАЧЕН до ${src_ver}."
+        else
+            log_error "Повторный install ОТКАТИЛ БЫ инструментарий BCM на более старую версию (${src_ver})."
+            log_error "Обновите управляющую копию до актуального релиза (скачайте tarball релиза или 'git pull') и повторите."
+            log_error "Если откат осознанный — запустите с BCM_ALLOW_DOWNGRADE=1."
+            exit 1
+        fi
+    fi
+}
+
 # ──── Запись cluster.conf ────────────────────────────────────────────────────
 write_conf() {
     local target_conf="${BCM_CONF_FILE}"
@@ -3065,6 +3107,9 @@ main() {
     validate_secrets
 
     validate_connectivity
+
+    # Защита от отката инструментария BCM (до любых изменений на кластере).
+    check_bcm_no_downgrade
 
     # Ключ шифрования conf-бэкапов: при повторном install сохраняем существующий
     # (новый ключ сделал бы старые архивы нерасшифровываемыми).
