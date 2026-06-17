@@ -401,17 +401,24 @@ _pxc_join_node() {
         bcm_any_key; return
     fi
 
+    # ⚠️⚠️ Юнит PXC-ноды для JOIN — `mysql.service` (НЕ `mysqld.service`, его на PXC
+    # НЕТ — ловили вживую: `systemctl start mysqld` → «Unit mysqld.service not found»).
+    # Bootstrap отдельным инстансом `mysql@bootstrap`; рядовой узел джойнится плейн
+    # `mysql.service` (читает wsrep_cluster_address и подтягивается IST/SST). Фолбэк на
+    # `mysqld` — на случай не-PXC сборки (как в menu/01). ⚠️ Код возврата берём от
+    # САМОГО `systemctl start`, а НЕ от пайпа: прежнее `start … | tail && echo JOIN_OK`
+    # отдавало статус `tail` (всегда 0) → JOIN_OK печатался даже при провале старта.
     local result
     result=$(bcm_ssh_exec_timeout "$join_ip" 120 \
-        "systemctl start mysqld 2>&1 | tail -5 && echo JOIN_OK || echo JOIN_FAIL" \
+        "if systemctl start mysql 2>/dev/null || systemctl start mysqld 2>/dev/null; then echo JOIN_OK; else echo JOIN_FAIL; journalctl -u mysql --no-pager -n 10 2>/dev/null | tail -10; fi" \
         2>/dev/null)
 
     if [[ "$result" == *"JOIN_OK"* ]]; then
-        bcm_ok "mysqld запущен на ${join_node}. SST/IST синхронизация запущена."
-        bcm_info "Проверьте статус через меню '1. Статус кластера'."
+        bcm_ok "СУБД запущена на ${join_node}. SST/IST синхронизация запущена."
+        bcm_info "Проверьте статус через меню '1. Статус кластера' (дождитесь Synced)."
         bcm_log_info "PXC Join: ${join_node} (${join_ip}), donor: ${donor_node}"
     else
-        bcm_error "Ошибка запуска mysqld на ${join_node}:"
+        bcm_error "Ошибка запуска СУБД на ${join_node}:"
         echo "$result" | while IFS= read -r line; do echo "    $line"; done
     fi
 
