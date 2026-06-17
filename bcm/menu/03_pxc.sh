@@ -419,6 +419,45 @@ _pxc_join_node() {
 }
 
 # =============================================================================
+# Построить SQL ProxySQL для назначения writer'а = ${target_ip}.
+#
+# ⚠️⚠️ ВЕС САМ ПО СЕБЕ НЕ МЕНЯЕТ WRITER'А (проверено вживую, ProxySQL 2.6.6 + PXC 8.4,
+# июнь 2026). С mysql_galera_hostgroups galera-checker выбирает активным writer'ом
+# (HG_WRITE ONLINE) ноду по весу ТОЛЬКО СРЕДИ нод, сконфигурированных в
+# writer_hostgroup (HG_WRITE) в самой таблице mysql_servers. Нода, осевшая в
+# reader_hostgroup (HG_READ) — а install-сид и SAVE после раскладки checker'а кладут
+# не-writer'ов именно туда — для checker'а «выделенный reader» и НЕ повышается в
+# writer'ы НИКАКИМ весом (db02 weight=1000 в HG20 → writer'ом оставался db03; ловили
+# вживую, это и был баг меню «Сменить Writer»). Прежний код делал только
+# `UPDATE … SET weight` → на живом кластере молча НЕ срабатывал.
+#
+# Детерминированный и самоисцеляющий приём: ПЕРЕСОБРАТЬ набор серверов — все PXC-ноды
+# в HG_WRITE (target вес 1000, остальные 100), checker сам разложит их по
+# backup_writer/reader (writer_is_also_reader=2). Удаляем строки PXC-хостов ПО
+# hostname (по всем HG разом, без констант HG11/HG30), затем вставляем канон.
+# Проверено вживую: db02 стал стабильным writer'ом (все ноды в HG10), failover-пул
+# (HG11) заполнен. ⚠️ Это НЕ прежний «битый» DELETE FROM …WHERE hostgroup_id=HG_WRITE
+# + INSERT…SELECT FROM HG_READ (тот пустил HG_WRITE при target уже в HG_WRITE) —
+# здесь полная пересборка из cluster.conf, поэтому идемпотентна и без гонки с checker'ом.
+# =============================================================================
+_pxc_build_writer_sql() {
+    local target_ip="$1" hg_write="$2"
+    local del_list="" values=""
+    local node ip
+    for node in "${BCM_NODES_PXC[@]}"; do
+        [[ -z "$node" ]] && continue
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        local w=100
+        [[ "$ip" == "$target_ip" ]] && w=1000
+        del_list="${del_list:+${del_list},}'${ip}'"
+        values="${values:+${values},}(${hg_write},'${ip}',3306,${w},200)"
+    done
+    printf 'DELETE FROM mysql_servers WHERE hostname IN (%s); INSERT INTO mysql_servers(hostgroup_id,hostname,port,weight,max_connections) VALUES %s; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;' \
+        "$del_list" "$values"
+}
+
+# =============================================================================
 # 4. Сменить Writer (обновить cluster.conf + ProxySQL HG10 на web-узлах)
 # =============================================================================
 _pxc_change_writer() {
@@ -522,18 +561,18 @@ _pxc_change_writer() {
             continue
         fi
 
-        # Сменить writer через ВЕС (mysql_galera_hostgroups): galera-checker делает
-        # единственным writer'ом (HG_WRITE) ONLINE-ноду с наибольшим weight, остальные
-        # — backup_writer/reader. ⚠️ Ручное DELETE/INSERT между hostgroup'ами НЕЛЬЗЯ:
-        # конфликтует с galera-checker'ом (он сам распределяет ноды по HG), а прежний
-        # INSERT искал ноду в HG_READ, хотя выбранный writer уже сидел в HG_WRITE →
-        # 0 строк → HG_WRITE пустел и LOAD падал (ловили вживую).
+        # Пересобрать набор серверов: все PXC в HG_WRITE, target вес 1000 (см.
+        # _pxc_build_writer_sql — вес сам по себе writer'а НЕ двигает, нужна
+        # HG_WRITE-принадлежность). galera-checker сам разложит остальных в
+        # backup_writer/reader.
+        local writer_sql
+        writer_sql=$(_pxc_build_writer_sql "$new_writer_ip" "$hg_write")
         local proxysql_update_script
         proxysql_update_script=$(cat <<PROXYSQL_SCRIPT
 # ProxySQL принимает пароль только как -p<pass>. ⚠️ Инлайним -p${aps_q} ПРЯМО в команду:
 # через переменную (MYSQL_ADMIN="...-p'pass'"; \$MYSQL_ADMIN) кавычки остаются литеральными
 # при ре-экспансии → пароль='pass' → Access denied (ловили вживую на rolling-тесте).
-mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "UPDATE mysql_servers SET weight=100; UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}'; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo PROXYSQL_OK || echo PROXYSQL_FAIL
+mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "${writer_sql}" 2>/dev/null && echo PROXYSQL_OK || echo PROXYSQL_FAIL
 PROXYSQL_SCRIPT
 )
         local result
@@ -685,13 +724,15 @@ _pxc_auto_failover() {
             continue
         fi
 
-        # Через ВЕС (mysql_galera_hostgroups) — galera-checker сам переизберёт writer.
-        # Ручное DELETE/INSERT между HG нельзя (см. _pxc_change_writer).
+        # Пересобрать набор серверов: все PXC в HG_WRITE, новый writer вес 1000
+        # (см. _pxc_build_writer_sql — вес сам по себе writer'а НЕ двигает).
+        local writer_sql
+        writer_sql=$(_pxc_build_writer_sql "$new_writer_ip" "$hg_write")
         local proxysql_failover_script
         proxysql_failover_script=$(cat <<PROXYSQL_SCRIPT
 # ProxySQL принимает пароль только как -p<pass>. ⚠️ Инлайним -p${aps_q} ПРЯМО в команду
 # (не через переменную — иначе кавычки литеральны при ре-экспансии → Access denied).
-mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "UPDATE mysql_servers SET weight=100; UPDATE mysql_servers SET weight=1000 WHERE hostname='${new_writer_ip}'; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null && echo OK || echo FAIL
+mysql --default-auth=mysql_native_password -h127.0.0.1 -P${proxysql_admin_port} -u${proxysql_admin_user} -p${aps_q} -e "${writer_sql}" 2>/dev/null && echo OK || echo FAIL
 PROXYSQL_SCRIPT
 )
         local result

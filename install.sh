@@ -1521,19 +1521,23 @@ EOF
     local local_proxysql_cfg="/tmp/proxysql.cnf"
     cp "${BCM_BASE_DIR}/templates/proxysql.cnf.tmpl" "$local_proxysql_cfg"
 
-    # ⚠️ Вес сконфигурированного writer'а ВЫШЕ остальных: с mysql_galera_hostgroups
-    # writer выбирает galera-checker по наибольшему weight. При равных весах (было
-    # weight=1 у всех) после рестарта PXC_WRITER кластер мог оставить writer'ом
-    # другую ноду (config говорит db01, а ProxySQL — db03). Меню «Сменить Writer»
-    # тоже оперирует весами (1000/100) — держим единый механизм.
+    # ⚠️⚠️ ВСЕ PXC-ноды сидят в HG_WRITE (writer_hostgroup), а НЕ writer→HG10 /
+    # остальные→HG20. С mysql_galera_hostgroups galera-checker оставляет активным
+    # writer'ом (HG_WRITE ONLINE) ноду с наибольшим weight ТОЛЬКО СРЕДИ нод,
+    # СКОНФИГУРИРОВАННЫХ в writer_hostgroup; остальных он сам раскидывает в
+    # backup_writer (HG11, failover-пул) и reader (HG20, writer_is_also_reader=2).
+    # Нода, ЗАХАРДКоженная в HG_READ, для checker'а «выделенный reader» и НЕ
+    # повышается в writer'ы НИКАКИМ весом → меню «Сменить Writer» (через вес) на ней
+    # молча не срабатывало (db02 weight=1000 в HG20 → writer оставался db03; ловили
+    # вживую, ProxySQL 2.6.6 + PXC 8.4, июнь 2026). Поэтому ВСЕ → HG_WRITE, writer
+    # получает вес 1000, остальные 100. Проверено вживую: writer следует за весом,
+    # HG11 заполнен (failover работает). См. _pxc_build_writer_sql в menu/03_pxc.sh.
     local mysql_servers=""
     for name in "${PXC_NODES[@]}"; do
         local ip="${PXC_IPS[$name]}"
-        local hg="20" weight="100"
-        if [[ "$name" == "$PXC_WRITER" ]]; then
-            hg="10"; weight="1000"
-        fi
-        mysql_servers="${mysql_servers}    { address=\"${ip}\", port=3306, hostgroup=${hg}, max_connections=200, weight=${weight} },\n"
+        local weight="100"
+        [[ "$name" == "$PXC_WRITER" ]] && weight="1000"
+        mysql_servers="${mysql_servers}    { address=\"${ip}\", port=3306, hostgroup=__HG_WRITE__, max_connections=200, weight=${weight} },\n"
     done
     render_multiline "$local_proxysql_cfg" "__MYSQL_SERVERS__" "$mysql_servers"
 
