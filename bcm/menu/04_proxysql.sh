@@ -532,7 +532,7 @@ _psql_sync_config() {
     local idx=0
     for wn in "${web_nodes[@]}"; do
         [[ -z "$wn" ]] && continue
-        ((idx++))
+        idx=$((idx+1))   # ⚠ НЕ ((idx++)): при idx=0 пост-инкремент возвращает 0 → rc=1 → set -e убивает bcm (ловили вживую: меню 4→7 падало в шелл сразу после «Web-ноды:»)
         local wip
         wip=$(bcm_get_node_ip "web" "$wn" 2>/dev/null) || wip="?"
         local reachable_str="✓"

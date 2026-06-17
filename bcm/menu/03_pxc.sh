@@ -564,7 +564,7 @@ _pxc_change_writer() {
 
         if ! bcm_ssh_reachable "$web_ip" 4 2>/dev/null; then
             bcm_warn "  ${web_node}: SSH недоступен — пропускаем."
-            ((web_errors++))
+            web_errors=$((web_errors+1))
             continue
         fi
 
@@ -590,7 +590,7 @@ PROXYSQL_SCRIPT
             bcm_ok "  ${web_node}: ProxySQL обновлён → writer=${new_writer} (${new_writer_ip})"
         else
             bcm_error "  ${web_node}: ошибка обновления ProxySQL"
-            ((web_errors++))
+            web_errors=$((web_errors+1))
         fi
     done
 

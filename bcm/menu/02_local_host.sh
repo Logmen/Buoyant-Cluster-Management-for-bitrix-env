@@ -148,14 +148,14 @@ _lh_change_hostname() {
                      grep -q '${new_hn}' /etc/hosts || echo '${local_ip}  ${new_hn}' >> /etc/hosts" \
                     2>/dev/null && {
                     bcm_ok "  ${node} (${nip}): /etc/hosts обновлён."
-                    ((success++))
+                    success=$((success+1))
                 } || {
                     bcm_warn "  ${node} (${nip}): не удалось обновить /etc/hosts."
-                    ((failed++))
+                    failed=$((failed+1))
                 }
             else
                 bcm_warn "  ${node} (${nip}): недоступен — пропущен."
-                ((failed++))
+                failed=$((failed+1))
             fi
         done
         echo
@@ -315,7 +315,7 @@ _lh_change_repo() {
             sed -i "s|/stable/|/__BCM_NEW_CHANNEL__/|g; s|/beta/|/__BCM_NEW_CHANNEL__/|g" "$f"
             sed -i "s|/__BCM_NEW_CHANNEL__/|/${new_channel}/|g" "$f"
             bcm_ok "  Обновлён: $(basename "$f")"
-            ((changed++))
+            changed=$((changed+1))
         else
             bcm_warn "  Не содержит /stable/ или /beta/: $(basename "$f") — пропущен"
         fi

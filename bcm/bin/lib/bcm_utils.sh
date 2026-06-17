@@ -283,7 +283,7 @@ bcm_spinner_start() {
         printf "  %b%s%b %s\r" \
             "$BCM_COLOR_CYAN" "$c" "$BCM_COLOR_RESET" "$msg"
         sleep 0.1
-        ((i++))
+        i=$((i+1))   # ⚠ НЕ ((i++)): i=0 на 1-й итерации → rc=1 → set -e (тот же класс бага, что menu 4→7)
     done
     printf "  %-50s\r" ""   # очистить строку спиннера
 }
