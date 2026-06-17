@@ -403,12 +403,22 @@ _ls_check_sync() {
     local site_path
     bcm_read_choice "Путь для проверки (напр. /home/bitrix/www)" site_path
     site_path="${site_path:-/home/bitrix/www}"
+    site_path="${site_path%/}"   # без хвостового слэша — для -path '${sp}/...'
+
+    # ⚠️ Считаем ТОЛЬКО синхронизируемые файлы: каталоги, исключённые из lsyncd
+    # (cache/managed_cache/upload/… — per-node, НЕ синкаются), при подсчёте дают
+    # ЛОЖНОЕ «РАСХОЖДЕНИЕ» (на каждой ноде свой кэш). Прунем тот же список, что в
+    # excludes lsyncd-конфига (_ls_configure) + *.tmp. Команда строится ОДИН раз и
+    # выполняется идентично на источнике и приёмниках. Список синхронизировать с
+    # excludes в _ls_configure при изменениях.
+    local sp="$site_path"
+    local find_cmd="find '${sp}' \\( -path '${sp}/upload' -o -path '${sp}/bitrix/cache' -o -path '${sp}/bitrix/managed_cache' -o -path '${sp}/bitrix/stack_cache' -o -path '${sp}/bitrix/html_pages' -o -path '${sp}/bitrix/tmp' -o -path '${sp}/bitrix/updates' -o -path '${sp}/bitrix/backup' -o -name .git \\) -prune -o -type f ! -name '*.tmp' -print 2>/dev/null | wc -l"
 
     # Количество файлов на источнике
     local src_count
-    bcm_info "Считаем файлы на ${src_node} (${src_ip})..."
+    bcm_info "Считаем файлы на ${src_node} (${src_ip}) (без несинхронизируемых каталогов)..."
     src_count=$(bcm_ssh_exec_timeout "$src_ip" 30 \
-        "find '${site_path}' -type f 2>/dev/null | wc -l" \
+        "$find_cmd" \
         2>/dev/null | tr -d '[:space:]')
 
     bcm_color "WHITE" "  ${src_node}: ${src_count:-?} файлов"
@@ -426,7 +436,7 @@ _ls_check_sync() {
 
         local dst_count
         dst_count=$(bcm_ssh_exec_timeout "$ip" 30 \
-            "find '${site_path}' -type f 2>/dev/null | wc -l" \
+            "$find_cmd" \
             2>/dev/null | tr -d '[:space:]')
 
         local sync_status="OK"
