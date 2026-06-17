@@ -236,6 +236,10 @@ bcm_self_update() {
     # install.sh лежит в корне проекта (не в пакете) — обновим best-effort.
     [[ -f "${proj_root}/install.sh" ]] && cp -af "${proj_root}/install.sh" "${dest}/install.sh" 2>/dev/null || true
     chmod +x "${dest}/bin/bcm" "${dest}"/bin/lib/*.sh 2>/dev/null || true
+    # ⚠️ Владелец локального /opt/bcm — root: tar-распаковка релиза может восстановить uid
+    # сборщика (1000), а keepalived brain-ноды (web01) читает notify-скрипты из СВОЕГО
+    # /opt/bcm — под чужим uid он их отключит (enable_script_security). См. bcm_deploy_to_node.
+    chown -R root:root "$dest" 2>/dev/null || true
 
     # 7. Раскатать обновлённый пакет на все ноды кластера.
     bcm_load_topology || true

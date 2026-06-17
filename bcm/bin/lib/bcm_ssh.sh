@@ -234,6 +234,17 @@ bcm_deploy_to_node() {
     bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/bcm && \
         ln -sf /opt/bcm/bin/bcm /usr/local/bin/bcm 2>/dev/null || true"
 
+    # ⚠️⚠️ ВЛАДЕЛЕЦ ВСЕХ ФАЙЛОВ /opt/bcm — root (ловили вживую, июнь 2026): keepalived с
+    # enable_script_security НАВСЕГДА (для текущего процесса) ОТКЛЮЧАЕТ notify-скрипты,
+    # не принадлежащие root («Unsafe permissions found for script … - disabling»). А
+    # раскатка через `rsync -az` (templates/keys/menu) СОХРАНЯЕТ владельца источника, и
+    # `scp` поверх СУЩЕСТВУЮЩЕГО файла сохраняет его прежнего владельца → если на исходной
+    # стороне (релизный tarball/dev) файлы под uid 1000, на ноду приезжали под uid 1000 →
+    # cron_notify.sh/redis_session_notify.sh на web-ноде → notify_master НЕ выполнялся →
+    # lsyncd не промоутился (нет синка), а redis-промоут на failover молча не срабатывал бы.
+    # Финальный chown -R root:root чинит и rsync-, и scp-overwrite-наследование за один шаг.
+    bcm_ssh_exec "$ip" "chown -R root:root /opt/bcm 2>/dev/null || true"
+
     bcm_log_info "BCM развёрнут на ${ip}"
 }
 
