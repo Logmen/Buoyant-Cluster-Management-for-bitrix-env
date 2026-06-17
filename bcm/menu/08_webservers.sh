@@ -213,11 +213,13 @@ _ws_test_nginx_config() {
             2>/dev/null)
 
         local exit_code
-        exit_code=$(echo "$result" | grep 'exit_code:' | cut -d: -f2 | tr -d '[:space:]')
+        # ⚠️ pipefail: при недоступной ноде $result пуст → grep (rc1) через | cut | tr (rc0)
+        # → присваивание rc1 → set -e убивал bcm посреди таблицы. || true нейтрализует.
+        exit_code=$(echo "$result" | grep 'exit_code:' | cut -d: -f2 | tr -d '[:space:]' || true)
 
         echo "$result" | grep -v 'exit_code:' | while IFS= read -r line; do
             echo "  $line"
-        done
+        done || true
 
         if [[ "${exit_code:-1}" == "0" ]]; then
             bcm_ok "  ${node}: конфигурация nginx корректна."

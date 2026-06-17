@@ -162,7 +162,7 @@ _osu_run_dnf() {
     o_out=$(bcm_ssh_exec_timeout "$o_ip" "$_OSU_DNF_TIMEOUT" \
         "dnf -y -q update ${_OSU_EXCLUDE_ARGS} 2>&1; echo RC=\$?" 2>&1)
     o_rc=$(echo "$o_out" | sed -n 's/^RC=//p' | tail -1)
-    echo "$o_out" | grep -vE '^RC=' | tail -4 | sed 's/^/      /'
+    echo "$o_out" | grep -vE '^RC=' | tail -4 | sed 's/^/      /' || true   # pipefail: grep -v (rc1 если все строки RC=) убил бы под set -e
     [[ "${o_rc:-1}" == "0" ]] && return 0
     bcm_error "  ${o_name}: dnf update вернул rc=${o_rc:-?}."
     return 1

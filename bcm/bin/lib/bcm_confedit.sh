@@ -26,12 +26,14 @@ MYSQL_DROPIN="/etc/my.cnf.d/zz-bcm-custom.cnf"
 _ce_open_editor() {
     local file="$1"
     local before after ed
-    before=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
+    # ⚠️ pipefail: sha256sum (rc≠0 если файла нет) просочился бы через | cut (rc0) →
+    # присваивание rc≠0 → set -e. || true нейтрализует (пустой хэш — валидный кейс).
+    before=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || true)
     ed="${EDITOR:-${VISUAL:-}}"
     [[ -z "$ed" ]] && { command -v nano >/dev/null 2>&1 && ed="nano" || ed="vi"; }
     # </dev/tty: редактору нужен терминал даже если stdin меню перенаправлен.
     "$ed" "$file" </dev/tty >/dev/tty 2>&1 || true
-    after=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
+    after=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || true)
     [[ "$before" != "$after" ]]
 }
 
@@ -245,7 +247,7 @@ SEED
         rm -f /tmp/bcm-mysql-dropin.new" 2>/dev/null)
     if ! echo "$vout" | grep -q "^RC=0$"; then
         bcm_error "Конфиг НЕ валиден — изменения НЕ применены:"
-        echo "$vout" | grep -iE 'error|unknown|invalid|suffix' | sed 's/^/    /' | tail -15
+        echo "$vout" | grep -iE 'error|unknown|invalid|suffix' | sed 's/^/    /' | tail -15 || true
         rm -f "$tmp"; bcm_any_key; return
     fi
     bcm_ok "mysqld --validate-config: ок."

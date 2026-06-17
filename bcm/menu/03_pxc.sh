@@ -847,7 +847,7 @@ _pxc_backup() {
 
     if [[ "$result" == *"BACKUP_OK"* ]]; then
         local backup_size
-        backup_size=$(echo "$result" | grep -E '^[0-9]' | head -1 | awk '{print $1}')
+        backup_size=$(echo "$result" | grep -E '^[0-9]' | head -1 | awk '{print $1}' || true)  # pipefail: grep -E rc1 без числовой строки → set -e
         bcm_ok "Резервная копия создана: ${backup_dir} (${backup_size:-?})"
         bcm_log_info "PXC Backup: ${backup_node} (${backup_ip}) → ${backup_dir}"
     else
@@ -1036,9 +1036,10 @@ _pxc_import_dump() {
 
     # 5) существующая БД → предложить DROP/CREATE или импорт поверх
     local drop=0 exists tbls
-    exists=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]')
+    # ⚠️ pipefail: remote mysql (rc≠0 при ошибке) через | tr (rc0) → set -e. || true — пусто валидно.
+    exists=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]' || true)
     if [[ "$exists" == "1" ]]; then
-        tbls=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]')
+        tbls=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]' || true)
         bcm_warn "БД '${db}' уже существует на кластере (${tbls:-?} таблиц)."
         if bcm_confirm "ПЕРЕСОЗДАТЬ БД (DROP + CREATE — удалит ТЕКУЩИЕ данные) перед импортом?"; then
             drop=1
@@ -1089,7 +1090,7 @@ _pxc_import_dump() {
 
     # 9) итог + верификация
     local newtbls
-    newtbls=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]')
+    newtbls=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}'\"" </dev/null 2>/dev/null | tr -d '[:space:]' || true)  # pipefail: remote mysql rc≠0 → set -e
     if [[ $rc -eq 0 ]]; then
         bcm_ok "Импорт завершён: БД '${db}' на ${writer} — таблиц: ${newtbls:-?}. Реплицировано Galera на все PXC."
         bcm_info "Если это БД портала — убедитесь, что .settings.php указывает на ProxySQL (127.0.0.1:6033) и БД '${db}' (см. install.sh::configure_portal_db)."

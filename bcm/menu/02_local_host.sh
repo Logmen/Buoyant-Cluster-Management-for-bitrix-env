@@ -24,7 +24,7 @@ _lh_show_status() {
     local hn_short
     hn_short=$(hostname -s 2>/dev/null || hostname)
     local ips
-    ips=$(hostname -I 2>/dev/null | tr ' ' ',' | sed 's/,$//')
+    ips=$(hostname -I 2>/dev/null | tr ' ' ',' | sed 's/,$//' || true)   # pipefail: hostname -I rc≠0 → set -e
 
     bcm_info "Полное имя хоста:  ${hn}"
     bcm_info "Короткое имя:      ${hn_short}"

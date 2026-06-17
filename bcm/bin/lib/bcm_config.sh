@@ -364,7 +364,9 @@ bcm_conf_remove_node() {
     current_nodes=$(bcm_conf_get "layer.${layer}" "nodes" 2>/dev/null || echo "")
     # Удалить из списка
     local new_nodes
-    new_nodes=$(echo "$current_nodes" | tr ',' '\n' | grep -v "^${node}$" | tr '\n' ',' | sed 's/,$//')
+    # ⚠️ pipefail: grep -v (rc1 если удаляем единственную ноду → пустой вывод) просочился
+    # бы через | tr | sed (rc0) → присваивание rc1 → set -e. Пустой список здесь валиден.
+    new_nodes=$(echo "$current_nodes" | tr ',' '\n' | grep -v "^${node}$" | tr '\n' ',' | sed 's/,$//' || true)
     bcm_conf_set "layer.${layer}" "nodes" "$new_nodes"
     BCM_CONF_LOADED=0
 }

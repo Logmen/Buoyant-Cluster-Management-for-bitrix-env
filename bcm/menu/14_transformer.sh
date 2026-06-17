@@ -234,9 +234,11 @@ _tr_install() {
     local out
     out=$(bcm_ssh_exec_timeout "$mip" 60 \
         "${BX_SITES} -a configure_transformer --site '${site}' --root '${root}' --hostname '${thost}' --domains '${site},localhost' 2>&1" 2>/dev/null)
-    echo "$out" | grep -iE 'error|message' | sed 's/^/    /' | head -5
+    echo "$out" | grep -iE 'error|message' | sed 's/^/    /' | head -5 || true
     local task
-    task=$(echo "$out" | grep -Eo '(configure_)?transformer[_a-z]*_[0-9]+' | head -1)
+    # ⚠️ pipefail: grep -Eo (rc1 если id задачи нет — это штатный error-кейс, ловится
+    # ниже [[ -z "$task" ]]) просочился бы через | head → set -e убил бы ДО проверки.
+    task=$(echo "$out" | grep -Eo '(configure_)?transformer[_a-z]*_[0-9]+' | head -1 || true)
     if [[ -z "$task" ]]; then
         bcm_error "Не удалось получить id задачи. Вывод bx-sites:"
         echo "$out" | sed 's/^/    /' | head -8
@@ -280,7 +282,7 @@ _tr_remove() {
     out=$(bcm_ssh_exec_timeout "$mip" 60 \
         "${BX_SITES} -a remove_transformer --site '${site}' --root '${root}' --hostname '${srv}' 2>&1" 2>/dev/null)
     local task
-    task=$(echo "$out" | grep -Eo '(remove_)?transformer[_a-z]*_[0-9]+' | head -1)
+    task=$(echo "$out" | grep -Eo '(remove_)?transformer[_a-z]*_[0-9]+' | head -1 || true)  # pipefail: grep -Eo rc1 при отсутствии id → set -e (см. configure)
     if [[ -z "$task" ]]; then
         bcm_error "Не удалось получить id задачи:"; echo "$out" | sed 's/^/    /' | head -8; bcm_any_key; return
     fi
@@ -494,11 +496,12 @@ _tr_replicate_peers() {
     [[ ${#peers[@]} -gt 0 ]] || { bcm_info "Других web-нод нет."; bcm_any_key; return; }
 
     local lover
-    lover=$(bcm_ssh_exec "$src_ip" "rpm -q --qf '%{version}' libreoffice25.2 2>/dev/null" </dev/null | tr -d '[:space:]')
+    # ⚠️ pipefail: rpm -q (rc1 если пакет не установлен) через ssh → | tr (rc0) → set -e.
+    lover=$(bcm_ssh_exec "$src_ip" "rpm -q --qf '%{version}' libreoffice25.2 2>/dev/null" </dev/null | tr -d '[:space:]' || true)
 
     # Пароль rabbitmq-юзера bitrix — из опции модуля transformercontroller; иначе спросить
     local rmqpass
-    rmqpass=$(bcm_ssh_exec "$src_ip" "cd /home/bitrix/www 2>/dev/null && php -r '\$_SERVER[\"DOCUMENT_ROOT\"]=\"/home/bitrix/www\"; define(\"NO_KEEP_STATISTIC\",true); define(\"NOT_CHECK_PERMISSIONS\",true); @include(\"/home/bitrix/www/bitrix/modules/main/include/prolog_before.php\"); if(class_exists(\"\\\\Bitrix\\\\Main\\\\Config\\\\Option\")) echo \\Bitrix\\Main\\Config\\Option::get(\"transformercontroller\",\"password\",\"\");' 2>/dev/null" </dev/null | tr -d '[:space:]')
+    rmqpass=$(bcm_ssh_exec "$src_ip" "cd /home/bitrix/www 2>/dev/null && php -r '\$_SERVER[\"DOCUMENT_ROOT\"]=\"/home/bitrix/www\"; define(\"NO_KEEP_STATISTIC\",true); define(\"NOT_CHECK_PERMISSIONS\",true); @include(\"/home/bitrix/www/bitrix/modules/main/include/prolog_before.php\"); if(class_exists(\"\\\\Bitrix\\\\Main\\\\Config\\\\Option\")) echo \\Bitrix\\Main\\Config\\Option::get(\"transformercontroller\",\"password\",\"\");' 2>/dev/null" </dev/null | tr -d '[:space:]' || true)
     if [[ -z "$rmqpass" ]]; then
         bcm_warn "Пароль rabbitmq-юзера 'bitrix' не прочитан из опций модуля (нет портала/модуля transformercontroller)."
         bcm_read_choice "Введите пароль rabbitmq-юзера bitrix (как на ${src}) (0 — отмена)" rmqpass
