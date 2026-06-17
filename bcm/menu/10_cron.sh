@@ -495,7 +495,7 @@ _cron_managed_del() {
     echo "$content" | nl -w4 -s'. ' | sed 's/^/  /'
     echo
     local num total
-    total=$(echo "$content" | grep -c .)
+    total=$(echo "$content" | grep -c . || true)   # grep -c rc=1 при 0 строк + pipefail → set -e (здесь content непуст, но страхуемся)
     bcm_read_choice "Номер задания для удаления (1-${total}, 0 — отмена)" num
     [[ "$num" == "0" || -z "$num" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
     if ! [[ "$num" =~ ^[0-9]+$ ]] || [[ "$num" -lt 1 || "$num" -gt "$total" ]]; then
