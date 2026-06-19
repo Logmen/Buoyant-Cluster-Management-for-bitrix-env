@@ -64,7 +64,7 @@ sudo bash install.sh           # интерактивно (или --answers-file
 [Слой 3]   Веб-ноды — Nginx · Apache · PHP · bx-push-server (NodeJS RTC) ← МОЗГ
    │         + Redis (сессии · push · кэш — HA, master-replica + плавающие VIP)
    ▼
-[Слой 4]   ProxySQL :6033 (embedded в web-ноды) — HG10 write · HG20 read
+[Слой 4]   ProxySQL :6033 (embedded в web-ноды) — HA-прокси: все запросы → writer (HG10)
    │
    ▼
 [Слой 5]   Percona XtraDB Cluster — Galera WSREP (multi-master)
