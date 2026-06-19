@@ -151,7 +151,10 @@ _mail_configure() {
     echo
     bcm_log_info "Postfix-smarthost: применено=${ok}, с ошибкой=${fail}, релей=[${host}]:${port}"
     [[ "$fail" -eq 0 ]] && bcm_ok "Готово на всех web-нодах (${ok})." || bcm_warn "Готово частично (ok=${ok}, fail=${fail})."
-    bcm_info "Дальше: пункт 3 — тест отправки; пункт 4 — DNS-записи (SPF/DKIM/DMARC)."
+    bcm_info "Дальше: пункт 3 — тест отправки."
+    bcm_info "⚠ Если шлёшь от СВОЕГО домена (не от домена релея) — на ТВОЁМ домене нужны"
+    bcm_info "  SPF (include релея) + DKIM + DMARC, а header From в Bitrix должен совпадать"
+    bcm_info "  с ним (иначе DMARC fail). Точные значения записей — у провайдера релея."
     bcm_any_key
 }
 
@@ -187,53 +190,6 @@ _mail_test() {
         bcm_ssh_exec_timeout "$ip" 30 "${MAIL_LIB} --test '${to}'" 2>&1 | sed 's/^/  /'
         echo
     done
-    bcm_any_key
-}
-
-# ──── DNS-подсказки ──────────────────────────────────────────────────────────
-_mail_dns_hints() {
-    bcm_section_header "DNS-записи для доставляемости (SPF / DKIM / DMARC)"
-    local dom relay
-    dom=$(bcm_conf_get mail from_domain 2>/dev/null || echo "")
-    relay=$(bcm_conf_get mail relay_host 2>/dev/null || echo "")
-    [[ -z "$dom" ]] && dom="<ваш-домен>"
-    echo
-    bcm_info "Домен отправителя: ${dom}   Релей: ${relay:-—}"
-    echo
-
-    # ⚠️ Если домен отправителя == домен провайдера релея (релей — хост под ним),
-    # то SPF/DKIM/DMARC этого домена ведёт ПРОВАЙДЕР — публиковать у себя нечего
-    # (и нельзя — это не твой домен). Записи нужны ТОЛЬКО при отправке от СВОЕГО домена.
-    if [[ -n "$relay" && "$dom" != "<ваш-домен>" ]] && { [[ "$relay" == "$dom" ]] || [[ "$relay" == *".${dom}" ]]; }; then
-        bcm_ok "Отправитель (${dom}) — это домен самого провайдера релея (${relay})."
-        echo "  → SPF/DKIM/DMARC для ${dom} ведёт ПРОВАЙДЕР; на твоей стороне публиковать"
-        echo "    НИЧЕГО не нужно (и нельзя — это не твой домен). PTR/reverse-DNS — тоже у него."
-        echo
-        echo "  DNS-записи понадобятся, ТОЛЬКО если будешь слать от СВОЕГО домена"
-        echo "  (напр. noreply@<домен-портала>): тогда меняешь в меню 15→2 «домен отправителя»"
-        echo "  + envelope-from на свой домен и публикуешь записи на НЁМ (этот экран их покажет)."
-        echo
-        bcm_any_key
-        return
-    fi
-
-    echo "  Письма идут как ${dom} через чужой релей (${relay:-внешний SMTP}) → получатель"
-    echo "  проверяет DNS ИМЕННО ${dom}. Опубликуй на СВОЁМ домене (точные значения — у провайдера):"
-    echo
-    echo "  • SPF (TXT @ ${dom}):"
-    echo "      v=spf1 include:<spf-релея> -all"
-    echo "      (include из доков провайдера, напр. include:_spf.${relay#mail.}; IP web-нод НЕ перечислять)"
-    echo
-    echo "  • DKIM (TXT <selector>._domainkey.${dom}):"
-    echo "      <публичный ключ от релея>   (подпись делает релей; селектор выдаёт он)"
-    echo
-    echo "  • DMARC (TXT _dmarc.${dom}):"
-    echo "      v=DMARC1; p=quarantine; rua=mailto:dmarc@${dom}; adkim=s; aspf=s"
-    echo "      (начните с p=none для мониторинга, затем ужесточайте)"
-    echo
-    echo "  ⚠️ Header From писем Bitrix должен быть на ${dom} (Настройки → e-mail сайта),"
-    echo "     иначе DMARC-alignment не сойдётся. PTR/reverse-DNS — на стороне релея."
-    echo
     bcm_any_key
 }
 
@@ -284,9 +240,8 @@ _mail_print_menu() {
         "1.  Статус релея на всех web-нодах"
         "2.  Настроить / обновить smarthost (внешний SMTP)"
         "3.  Тест отправки письма"
-        "4.  DNS-записи (SPF / DKIM / DMARC)"
-        "5.  Очередь почты (mailq / flush)"
-        "6.  Отключить релей (вернуть msmtp)"
+        "4.  Очередь почты (mailq / flush)"
+        "5.  Отключить релей (вернуть msmtp)"
         "0.  Назад"
     )
     bcm_print_menu items
@@ -328,12 +283,11 @@ main() {
             1) _mail_show_status ;;
             2) _mail_configure ;;
             3) _mail_test ;;
-            4) _mail_dns_hints ;;
-            5) _mail_queue ;;
-            6) _mail_disable ;;
+            4) _mail_queue ;;
+            5) _mail_disable ;;
             0) break ;;
             "") : ;;
-            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 6." ;;
+            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 5." ;;
         esac
 
         bcm_clear_cache
