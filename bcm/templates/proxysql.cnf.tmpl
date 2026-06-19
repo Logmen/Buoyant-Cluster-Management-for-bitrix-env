@@ -96,13 +96,23 @@ mysql_query_rules=
         apply=1
     },
     {
-        # Правило 4: остальные SELECT → HG_READ
-        # ВНИМАНИЕ: режим единой ноды (bcm_cluster_mode.sh) переключает именно
-        # rule_id=4 на HG_WRITE. При изменении нумерации правил — поправить там.
+        # Правило 4: остальные SELECT → HG_WRITE (ProxySQL = HA-прокси, НЕ read-splitter).
+        # ⚠️ РАНЕЕ было → HG_READ (read/write split), но это НЕСОВМЕСТИМО с тем, как
+        # Bitrix мешает именованные блокировки (GET_LOCK), temp-таблицы и user-переменные
+        # с обычными SELECT'ами на ОДНОМ соединении: пока коннект залочен на writer (HG_WRITE)
+        # удержанным GET_LOCK, ProxySQL отказывается уводить следующий ^SELECT на HG_READ →
+        # «(9006) connection is locked to hostgroup … but trying to reach hostgroup …»
+        # (ловили вживую при обновлении модулей через /bitrix/admin, июнь 2026). Stateless
+        # query-rule не может «не уводить SELECT, пока держится lock» → чтения тоже на writer.
+        # Galera синхронна, поэтому единый активный узел для чтений/записи консистентен;
+        # failover остаётся за mysql_galera_hostgroups. writer_is_also_reader тут не важен.
+        # ВНИМАНИЕ: режим единой ноды (bcm_cluster_mode.sh) переключает именно rule_id=4
+        # (pin → HG_WRITE = no-op; unpin → ОБРАТНО на HG_WRITE, НЕ HG_READ).
+        # При изменении нумерации правил — поправить там.
         rule_id=4
         active=1
         match_pattern="^SELECT"
-        destination_hostgroup=__HG_READ__
+        destination_hostgroup=__HG_WRITE__
         apply=1
     }
     # Правило по умолчанию (все остальное) → HG_WRITE (настраивается через mysql_users)

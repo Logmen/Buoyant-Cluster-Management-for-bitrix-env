@@ -13,7 +13,9 @@
 #   • HAProxy (на всех lb): все web-сервера, кроме активного → state maint
 #     (drain). Весь HTTP идёт на активную ноду. Возврат → state ready.
 #   • ProxySQL (на всех web): правило ^SELECT (rule_id=4) → HG_WRITE, т.е. и
-#     чтения уходят на writer. Возврат → обратно на HG_READ.
+#     чтения уходят на writer. ⚠️ В варианте A это уже ДЕФОЛТ кластера (proxysql.cnf.tmpl),
+#     поэтому и pin, и unpin ставят rule_id=4 → HG_WRITE (по ProxySQL фактически no-op);
+#     реальное закрепление трафика на единственной ноде делают HAProxy (maint) и lsyncd.
 #   • lsyncd: ОСТАНОВЛЕН на всех web (заморозка). Тёплые ноды держатся как
 #     известно-целая копия кода; auto-promote по VRRP подавляется (mode=single).
 #     unpin поднимает источник на active_node с предварительным catch-up.
@@ -237,16 +239,21 @@ bcm_cluster_pin() {
 
 # ──── Выключить режим single (вернуть HA) ────────────────────────────────────
 bcm_cluster_unpin() {
-    local hg_read
-    hg_read=$(bcm_get_proxysql_hg_read 2>/dev/null || echo "20")
+    # ⚠️ Возврат rule_id=4 → HG_WRITE (НЕ HG_READ): в варианте A нормальное состояние
+    # кластера — все ^SELECT на writer (ProxySQL как HA-прокси, см. proxysql.cnf.tmpl,
+    # rule_id=4). Раньше unpin возвращал на HG_READ и воскрешал ошибку 9006 при
+    # обновлении модулей через /bitrix/admin. Поэтому pin и unpin теперь оба → HG_WRITE
+    # (single-режим по ProxySQL фактически no-op; реальное закрепление — HAProxy+lsyncd).
+    local hg_write
+    hg_write=$(bcm_get_proxysql_hg_write 2>/dev/null || echo "10")
 
     bcm_log_info "Режим единой ноды ВЫКЛ: возврат в HA."
 
     _bcm_haproxy_pin_web "" "ready" \
         || bcm_log_warn "bcm_cluster_unpin: HAProxy восстановлен НЕ полностью (см. выше) — проверь lb."
 
-    if ! _bcm_proxysql_select_target "$hg_read"; then
-        bcm_log_error "bcm_cluster_unpin: ^SELECT НЕ возвращён на readers — режим НЕ снят (cluster.conf не изменён)."
+    if ! _bcm_proxysql_select_target "$hg_write"; then
+        bcm_log_error "bcm_cluster_unpin: ^SELECT не подтверждён на HG_WRITE — режим НЕ снят (cluster.conf не изменён)."
         return 1
     fi
 
@@ -257,7 +264,7 @@ bcm_cluster_unpin() {
     local active_node
     active_node=$(bcm_conf_get "cluster" "active_node" 2>/dev/null || echo "")
     _bcm_lsyncd_thaw "$active_node"
-    bcm_log_info "Возврат в HA выполнен (^SELECT → HG ${hg_read}, lsyncd разморожен)."
+    bcm_log_info "Возврат в HA выполнен (^SELECT → HG ${hg_write}, lsyncd разморожен)."
     return 0
 }
 
