@@ -46,6 +46,9 @@ _m_env() {
 
 # Путь к sendmail от Postfix (а не msmtp-шиму).
 _m_postfix_sendmail() {
+    # Предпочитаем /usr/sbin (канонический путь); /usr/lib/sendmail.postfix тоже рабочий,
+    # но даём один путь на всех нодах (без разнобоя в sendmail_path).
+    [[ -x /usr/sbin/sendmail.postfix ]] && { echo "/usr/sbin/sendmail.postfix"; return; }
     local p
     p=$(rpm -ql postfix 2>/dev/null | grep -m1 '/sendmail\.postfix$') || p=""
     [[ -n "$p" ]] && { echo "$p"; return; }

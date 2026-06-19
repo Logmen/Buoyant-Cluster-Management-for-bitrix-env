@@ -322,7 +322,16 @@ bcm_conf_set() {
         echo "$line" >> "$tmpfile"
     done < "$BCM_CONF_FILE"
 
-    # Если секция не найдена — создаём
+    # ⚠️ Целевая секция — ПОСЛЕДНЯЯ в файле и ключа в ней не было: на EOF мы всё ещё
+    # внутри неё (нового заголовка, который дописал бы ключ, не встретилось). Добавляем
+    # ключ в существующую секцию. БЕЗ этого создавался бы ДУБЛИКАТ [section] в конце
+    # (ловили на новой [mail]: relay_host уезжал во вторую [mail]).
+    if [[ $in_section -eq 1 && $key_updated -eq 0 ]]; then
+        echo "${key} = ${value}" >> "$tmpfile"
+        key_updated=1
+    fi
+
+    # Если секции вообще не было — создаём
     if [[ $key_updated -eq 0 ]]; then
         echo "" >> "$tmpfile"
         echo "[${section}]" >> "$tmpfile"
