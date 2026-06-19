@@ -169,7 +169,9 @@ _mail_test() {
     local from_addr; from_addr=$(_m_env FROM_ADDRESS)
     [[ -z "$from_addr" ]] && from_addr="bcm-test@$(_m_env FROM_DOMAIN 2>/dev/null || hostname -f 2>/dev/null || hostname)"
     local pf_sm; pf_sm=$(_m_postfix_sendmail)
-    printf 'From: %s\nTo: %s\nSubject: BCM mail test (%s)\n\nТест отправки через Postfix-smarthost.\nНода: %s\nВремя: %s\n' \
+    # ⚠️ MIME-заголовки обязательны: тело на кириллице (UTF-8). Без charset=UTF-8 клиент
+    # читает байты как Latin-1 → мохибейк (Subject ASCII — без encoded-word достаточно).
+    printf 'From: %s\nTo: %s\nSubject: BCM mail test (%s)\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\nТест отправки через Postfix-smarthost.\nНода: %s\nВремя: %s\n' \
         "$from_addr" "$to" "$(hostname)" "$(hostname -f 2>/dev/null || hostname)" "$(date '+%F %T')" \
         | "$pf_sm" -t -i
     local rc=$?
