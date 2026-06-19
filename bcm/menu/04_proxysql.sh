@@ -6,11 +6,16 @@
 # ProxySQL встроен в web-узлы (порт 6033 — proxy, 6032 — admin).
 # Не является отдельным типом нод.
 #
+# ⚠️ ProxySQL работает как HA-прокси, а НЕ read-splitter: ВСЕ запросы (включая
+# ^SELECT, rule_id=4) идут на активного writer'а в HG_WRITE (см. proxysql.cnf.tmpl —
+# несовместимость read/write-split с GET_LOCK Bitrix, ошибка 9006). Все PXC-ноды
+# сидят в HG_WRITE (writer вес 1000, остальные 100); reader_hostgroup (HG_READ)
+# наполняет САМ galera-checker — вручную им не управляем.
+#
 # Функционал:
-#   - Статус mysql_servers (HG10 write, HG20 read) на каждой web-ноде
+#   - Статус mysql_servers (все ноды в HG_WRITE; HG_READ — авто от checker'а)
 #   - Показ правил маршрутизации (mysql_query_rules)
-#   - Перестройка HG10/HG20 из cluster.conf
-#   - Добавить/удалить реплику из HG20 (read)
+#   - Перестройка mysql_servers из cluster.conf (все → HG_WRITE, writer=1000)
 #   - Статистика stats_mysql_connection_pool
 #   - Перезапуск ProxySQL на всех web-нодах
 #   - Синхронизация конфига между web-нодами
@@ -88,7 +93,7 @@ _psql_show_status() {
     hg_read=$(_psql_get_hg_read)
     proxy_port=$(_psql_get_proxy_port)
 
-    bcm_info "HG Write: ${hg_write}  |  HG Read: ${hg_read}  |  Proxy port: ${proxy_port}"
+    bcm_info "HG Write: ${hg_write} (все ноды + маршрутизация)  |  HG Read: ${hg_read} (авто от galera-checker)  |  Proxy port: ${proxy_port}"
     echo
 
     for web_node in "${web_nodes[@]}"; do
@@ -182,18 +187,23 @@ _psql_show_query_rules() {
     bcm_any_key
 }
 
-# ──── Перестроить HG10/HG20 из cluster.conf ───────────────────────────────────
+# ──── Перестроить mysql_servers из cluster.conf ───────────────────────────────
+# ⚠️⚠️ ВСЕ PXC-ноды → HG_WRITE (writer вес 1000, остальные 100, max_conn 200).
+# НЕ writer→HG_WRITE / остальные→HG_READ: с mysql_galera_hostgroups galera-checker
+# повышает в writer'ы только ноды, СКОНФИГУРИРОВАННЫЕ в writer_hostgroup; нода,
+# осевшая в HG_READ, не становится writer'ом НИКАКИМ весом (проверено вживую,
+# ProxySQL 2.6.6 + PXC 8.4). reader_hostgroup checker наполняет сам. Идентично
+# install.sh-сиду и menu/03 _pxc_build_writer_sql — держать согласованным.
 _psql_reconfigure() {
-    bcm_section_header "Перестройка ProxySQL HG (из cluster.conf)"
+    bcm_section_header "Перестройка ProxySQL mysql_servers (из cluster.conf)"
 
-    local hg_write hg_read admin_port admin_user admin_pass
+    local hg_write admin_port admin_user admin_pass
     hg_write=$(_psql_get_hg_write)
-    hg_read=$(_psql_get_hg_read)
     admin_port=$(_psql_get_admin_port)
     admin_user=$(_psql_get_admin_user)
     admin_pass=$(_psql_get_admin_pass)
 
-    # Текущий writer
+    # Текущий writer (из cluster.conf — это операция сброса к конфигу)
     local writer
     writer=$(bcm_get_pxc_writer 2>/dev/null || echo "")
     if [[ -z "$writer" ]]; then
@@ -215,14 +225,14 @@ _psql_reconfigure() {
     local pxc_arr
     read -ra pxc_arr <<< "$pxc_str"
 
-    bcm_info "Writer (HG${hg_write}): ${writer} (${writer_ip})"
-    echo "  Узлы PXC (HG${hg_read} — read):"
+    bcm_info "Все PXC-ноды → HG${hg_write} (writer=1000, остальные=100); HG_READ наполнит galera-checker."
+    echo "  Узлы PXC:"
     for pxc_node in "${pxc_arr[@]}"; do
         [[ -z "$pxc_node" ]] && continue
         local pip
         pip=$(bcm_get_node_ip "pxc" "$pxc_node" 2>/dev/null) || pip="?"
-        local role_label="reader"
-        [[ "$pxc_node" == "$writer" ]] && role_label="writer"
+        local role_label="вес 100"
+        [[ "$pxc_node" == "$writer" ]] && role_label="writer, вес 1000"
         printf "  %-14s %-16s [%s]\n" "$pxc_node" "$pip" "$role_label"
     done
     echo
@@ -238,6 +248,21 @@ _psql_reconfigure() {
         return
     fi
 
+    # SQL: убрать все PXC-ноды по hostname (по всем HG разом) и пересоздать в HG_WRITE.
+    local del_list="" values=""
+    for pxc_node in "${pxc_arr[@]}"; do
+        [[ -z "$pxc_node" ]] && continue
+        local pip
+        pip=$(bcm_get_node_ip "pxc" "$pxc_node" 2>/dev/null) || continue
+        local w=100
+        [[ "$pip" == "$writer_ip" ]] && w=1000
+        del_list="${del_list:+${del_list},}'${pip}'"
+        values="${values:+${values},}(${hg_write},'${pip}',3306,${w},200)"
+    done
+    local sql_block="DELETE FROM mysql_servers WHERE hostname IN (${del_list});"
+    sql_block+="INSERT INTO mysql_servers(hostgroup_id,hostname,port,weight,max_connections) VALUES ${values};"
+    sql_block+="LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;"
+
     for web_node in "${web_nodes[@]}"; do
         [[ -z "$web_node" ]] && continue
         local web_ip
@@ -249,28 +274,6 @@ _psql_reconfigure() {
         fi
 
         bcm_info "  Обновление ${web_node} (${web_ip})..."
-
-        # Строим SQL: DELETE + INSERT для каждого PXC-узла
-        local sql_block=""
-        sql_block+="DELETE FROM mysql_servers WHERE hostgroup_id IN (${hg_write},${hg_read});"
-
-        # Writer → HG write
-        sql_block+="INSERT INTO mysql_servers(hostgroup_id,hostname,port,weight,max_connections)
-            VALUES(${hg_write},'${writer_ip}',3306,1000,1000);"
-
-        # Все PXC-узлы → HG read
-        for pxc_node in "${pxc_arr[@]}"; do
-            [[ -z "$pxc_node" ]] && continue
-            local pip
-            pip=$(bcm_get_node_ip "pxc" "$pxc_node" 2>/dev/null) || continue
-            local read_weight=100
-            # Writer тоже в HG read (с меньшим весом)
-            [[ "$pxc_node" == "$writer" ]] && read_weight=50
-            sql_block+="INSERT IGNORE INTO mysql_servers(hostgroup_id,hostname,port,weight,max_connections)
-                VALUES(${hg_read},'${pip}',3306,${read_weight},1000);"
-        done
-
-        sql_block+="LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;"
 
         local result
         result=$(bcm_ssh_exec "$web_ip" \
@@ -285,129 +288,7 @@ _psql_reconfigure() {
     done
 
     echo
-    bcm_log_info "ProxySQL HG${hg_write}/${hg_read} перестроены из cluster.conf (writer=${writer})"
-    bcm_any_key
-}
-
-# ──── Добавить/удалить реплику из HG read ─────────────────────────────────────
-_psql_manage_read_replica() {
-    bcm_section_header "Управление репликами в HG read"
-
-    local hg_read admin_port admin_user
-    hg_read=$(_psql_get_hg_read)
-    admin_port=$(_psql_get_admin_port)
-    admin_user=$(_psql_get_admin_user)
-
-    # Берём первую доступную web-ноду для запроса данных
-    local -a web_nodes
-    _psql_get_web_nodes web_nodes || true
-    local ref_ip=""
-    for wn in "${web_nodes[@]}"; do
-        [[ -z "$wn" ]] && continue
-        local wip
-        wip=$(bcm_get_node_ip "web" "$wn" 2>/dev/null) || continue
-        bcm_ssh_reachable "$wip" 5 2>/dev/null && { ref_ip="$wip"; break; }
-    done
-
-    if [[ -z "$ref_ip" ]]; then
-        bcm_error "Ни одна web-нода недоступна."
-        bcm_any_key
-        return
-    fi
-
-    # Текущие серверы в HG read
-    bcm_info "Текущие серверы в HG${hg_read} (read):"
-    _psql_admin_query "$ref_ip" \
-        "SELECT hostname, port, status, weight FROM mysql_servers
-         WHERE hostgroup_id=${hg_read} ORDER BY hostname;" 2>/dev/null | sed 's/^/  /'
-    echo
-
-    echo "  Действия:"
-    echo "    1. Добавить сервер в HG${hg_read}"
-    echo "    2. Удалить сервер из HG${hg_read}"
-    echo "    0. Назад"
-    echo
-
-    local action
-    bcm_read_choice "Выберите действие" action
-
-    case "$action" in
-        1)
-            local new_host new_port new_weight
-            bcm_read_choice "IP-адрес нового сервера" new_host
-            if ! bcm_valid_ip "$new_host"; then
-                bcm_error "Некорректный IP: ${new_host}"
-                bcm_any_key
-                return
-            fi
-            bcm_read_choice "Порт (Enter = 3306)" new_port
-            [[ -z "$new_port" ]] && new_port="3306"
-            bcm_read_choice "Вес (Enter = 100)" new_weight
-            [[ -z "$new_weight" || ! "$new_weight" =~ ^[0-9]+$ ]] && new_weight="100"
-
-            echo
-            if ! bcm_confirm "Добавить ${new_host}:${new_port} (вес ${new_weight}) в HG${hg_read} на всех web-нодах?"; then
-                bcm_info "Отменено."
-                bcm_any_key
-                return
-            fi
-
-            for web_node in "${web_nodes[@]}"; do
-                [[ -z "$web_node" ]] && continue
-                local web_ip
-                web_ip=$(bcm_get_node_ip "web" "$web_node" 2>/dev/null) || continue
-                if ! bcm_ssh_reachable "$web_ip" 5 2>/dev/null; then
-                    bcm_warn "  ${web_node}: недоступен — пропущен."
-                    continue
-                fi
-                local r
-                r=$(_psql_admin_raw "$web_ip" \
-                    "INSERT IGNORE INTO mysql_servers(hostgroup_id,hostname,port,weight)
-                     VALUES(${hg_read},'${new_host}',${new_port},${new_weight});
-                     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null)
-                bcm_ok "  ${web_node}: ${new_host}:${new_port} добавлен в HG${hg_read}."
-            done
-            bcm_log_info "ProxySQL HG${hg_read}: добавлен ${new_host}:${new_port} (weight=${new_weight})"
-            ;;
-        2)
-            local del_host
-            bcm_read_choice "IP-адрес сервера для удаления из HG${hg_read}" del_host
-            if [[ -z "$del_host" ]]; then
-                bcm_error "IP не может быть пустым."
-                bcm_any_key
-                return
-            fi
-
-            echo
-            if ! bcm_confirm "Удалить ${del_host} из HG${hg_read} на всех web-нодах?"; then
-                bcm_info "Отменено."
-                bcm_any_key
-                return
-            fi
-
-            for web_node in "${web_nodes[@]}"; do
-                [[ -z "$web_node" ]] && continue
-                local web_ip
-                web_ip=$(bcm_get_node_ip "web" "$web_node" 2>/dev/null) || continue
-                if ! bcm_ssh_reachable "$web_ip" 5 2>/dev/null; then
-                    bcm_warn "  ${web_node}: недоступен — пропущен."
-                    continue
-                fi
-                _psql_admin_raw "$web_ip" \
-                    "DELETE FROM mysql_servers WHERE hostgroup_id=${hg_read} AND hostname='${del_host}';
-                     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;" 2>/dev/null
-                bcm_ok "  ${web_node}: ${del_host} удалён из HG${hg_read}."
-            done
-            bcm_log_info "ProxySQL HG${hg_read}: удалён ${del_host}"
-            ;;
-        0|"")
-            return
-            ;;
-        *)
-            bcm_warn "Неверный выбор."
-            ;;
-    esac
-
+    bcm_log_info "ProxySQL mysql_servers перестроены из cluster.conf (все → HG${hg_write}, writer=${writer})"
     bcm_any_key
 }
 
@@ -695,13 +576,12 @@ _psql_print_menu() {
     proxy_port=$(_psql_get_proxy_port)
 
     local -a items=(
-        "1.  Статус mysql_servers (HG${hg_write} write, HG${hg_read} read)"
+        "1.  Статус mysql_servers (все ноды в HG${hg_write}; HG${hg_read} — авто)"
         "2.  Правила маршрутизации (mysql_query_rules)"
-        "3.  Перестроить HG${hg_write}/HG${hg_read} из cluster.conf"
-        "4.  Управление репликами HG${hg_read} (add/remove)"
-        "5.  Статистика connection pool"
-        "6.  Перезапустить ProxySQL на всех web-нодах"
-        "7.  Синхронизировать конфиг между web-нодами"
+        "3.  Перестроить mysql_servers из cluster.conf (все → HG${hg_write})"
+        "4.  Статистика connection pool"
+        "5.  Перезапустить ProxySQL на всех web-нодах"
+        "6.  Синхронизировать конфиг между web-нодами"
         "0.  Назад"
     )
     bcm_print_menu items
@@ -733,9 +613,9 @@ main() {
         proxy_port=$(_psql_get_proxy_port)
         admin_port=$(_psql_get_admin_port)
 
-        bcm_info "HG Write: ${hg_write}  |  HG Read: ${hg_read}  |  Proxy: :${proxy_port}  |  Admin: :${admin_port}"
+        bcm_info "HG Write: ${hg_write} (все ноды + маршрутизация)  |  HG Read: ${hg_read} (авто/checker)  |  Proxy: :${proxy_port}  |  Admin: :${admin_port}"
 
-        # Writer — фактический из runtime ProxySQL (HG10), откат на конфиг.
+        # Writer — фактический из runtime ProxySQL (HG_WRITE), откат на конфиг.
         local writer writer_src="runtime HG${hg_write}"
         writer=$(bcm_get_pxc_runtime_writer 2>/dev/null || echo "")
         [[ -z "$writer" ]] && { writer=$(bcm_get_pxc_writer 2>/dev/null || echo "не задан"); writer_src="cluster.conf"; }
@@ -751,13 +631,12 @@ main() {
             1) _psql_show_status ;;
             2) _psql_show_query_rules ;;
             3) _psql_reconfigure ;;
-            4) _psql_manage_read_replica ;;
-            5) _psql_show_stats ;;
-            6) _psql_restart_all ;;
-            7) _psql_sync_config ;;
+            4) _psql_show_stats ;;
+            5) _psql_restart_all ;;
+            6) _psql_sync_config ;;
             0) break ;;
             "") : ;;
-            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 7." ;;
+            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 6." ;;
         esac
 
         # Сброс кэша
