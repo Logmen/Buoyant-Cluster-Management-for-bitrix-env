@@ -92,7 +92,7 @@ _mail_configure() {
         "smtp_sasl_mechanism_filter = plain, login" \
         "smtp_use_tls = yes" \
         "inet_interfaces = loopback-only" \
-        "inet_protocols = ipv4" \
+        "inet_protocols = all" \
         "myhostname = $(hostname -f 2>/dev/null || hostname)" \
         "smtp_helo_name = ${helo}" \
         || { _m_err "postconf -e не удался."; exit 1; }
