@@ -231,6 +231,7 @@ _show_full_menu() {
         "12. SSL-сертификаты (HTTPS / Let's Encrypt)"
         "13. Резервное копирование (S3, HA-aware)"
         "14. Генератор документов (Transformer) — нужен портал+Enterprise"
+        "15. Почта (HA Postfix smarthost-релей)"
         "0.  Выход"
     )
     bcm_print_menu menu_items
@@ -292,9 +293,10 @@ _handle_full_menu_choice() {
         12) bash "${BCM_MENU_DIR}/12_ssl.sh" ;;
         13) bash "${BCM_MENU_DIR}/13_backup.sh" ;;
         14) bash "${BCM_MENU_DIR}/14_transformer.sh" ;;
+        15) bash "${BCM_MENU_DIR}/15_mail.sh" ;;
         0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
         "") : ;;  # пустой ввод — просто обновить экран
-        *) bcm_warn "Неверный выбор: ${choice}. Введите число от 0 до 14." ;;
+        *) bcm_warn "Неверный выбор: ${choice}. Введите число от 0 до 15." ;;
     esac
 }
 

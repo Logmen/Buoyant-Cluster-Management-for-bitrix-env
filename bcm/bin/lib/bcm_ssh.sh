@@ -193,7 +193,8 @@ bcm_deploy_to_node() {
               bin/lib/pxc_autorecover.sh bin/lib/lsyncd_role.sh \
               bin/lib/ssl_certs.sh bin/lib/bcm_backup.sh \
               bin/lib/bcm_confedit.sh bin/lib/bcm_update.sh \
-              bin/lib/transformer_notify.sh bin/lib/transformer_check.sh VERSION; do
+              bin/lib/transformer_notify.sh bin/lib/transformer_check.sh \
+              bin/lib/bcm_mail.sh VERSION; do
         bcm_ssh_copy_file "${bcm_src}/${f}" "$ip" "/opt/bcm/${f}"
     done
     bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/*.sh 2>/dev/null || true"

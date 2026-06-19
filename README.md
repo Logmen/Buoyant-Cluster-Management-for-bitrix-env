@@ -555,6 +555,30 @@ web-нод; `rabbitmq-server` + `transformer` работают на обеих w
 
 ---
 
+## Почта — HA Postfix smarthost-релей (меню 15)
+
+bitrix-env шлёт почту через **msmtp** (без локальной очереди/ретраев). В кластере
+прямая отправка с каждой ноды плоха: N исходящих IP → хрупкие SPF/PTR/DKIM, нет буфера
+при сбое релея. BCM настраивает **Postfix как smarthost на каждой web-ноде** → единый
+внешний SMTP-релей (SASL+TLS), с локальной очередью и ретраями.
+
+* **HA без VIP**: отправка per-node и stateless к кластеру — каждая нода самостоятельно
+  релеит на внешний SMTP; единая отправляющая идентичность = релей. Отказ ноды не теряет
+  общую почту, keepalived не нужен.
+* **Интеграция**: Postfix слушает только loopback (`inet_interfaces=loopback-only`);
+  PHP переключается на Postfix drop-in'ом `/etc/php.d/zz-bcm-mail.ini` (перекрывает
+  `bitrixenv.ini`) + перезапуск `httpd`. Откат на msmtp — пункт меню.
+* **Не входит в `install.sh` осознанно** (как Transformer): требует внешних SMTP-кред,
+  которых нет в answers. Настройка — из BCM **меню 15** (хост/порт/логин/пароль релея,
+  TLS-режим, домен отправителя, опц. переписывание envelope-from).
+* Меню: статус на всех web, настроить/обновить, тест отправки, готовые DNS-подсказки
+  (SPF/DKIM/DMARC), очередь (`mailq`/flush), отключить.
+
+Файлы: `menu/15_mail.sh`, `bin/lib/bcm_mail.sh`. Конфиг — cluster.conf `[mail]` +
+`/etc/bitrix-cluster/mail.env`; пароль релея — `/etc/bitrix-cluster/.mail_relay_pass` (0600).
+
+---
+
 ## Запуск Buoyant Cluster Management for bitrix-env
 
 После успешного выполнения скрипта BCM будет развёрнут на всех нодах.
@@ -575,6 +599,7 @@ bcm
   | 5 | VIP / Keepalived | 12 | SSL-сертификаты (HTTPS / Let's Encrypt) |
   | 6 | Синхронизация файлов (lsyncd) | 13 | Резервное копирование (S3, HA-aware) |
   | 7 | Управление сайтами | 14 | Генератор документов (Transformer) |
+  | | | 15 | Почта (HA Postfix smarthost-релей) |
 
 * На `lb`, `pxc` и `s3` нодах при запуске команды `bcm` автоматически откроется ограниченное меню (только настройки локального хоста и состояние текущей службы).
 * Статус кластера без TUI: `bcm --status-only`.
