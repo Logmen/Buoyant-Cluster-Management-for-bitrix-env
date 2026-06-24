@@ -169,6 +169,31 @@ sync {
     delete = true,
     delay  = 5,
 }
+
+-- /upload: статика модулей (en/ru-хелп, картинки crm/main, лого sale и т.п.) —
+-- НЕ CFile-объекты, в S3 не уходят, но обязаны быть на ВСЕХ web (иначе round-robin
+-- → 404). Пользовательский контент /upload живёт в S3/MinIO (catch-all FILE_RULES),
+-- локально его нет → отдельный односторонний блок БЕЗ --delete безопасен: статика
+-- расходится источник→пиры, ничего на приёмнике не затирается (анти-клоббер), кэши
+-- (resize_cache) и tmp исключены (per-node, регенерируются).
+sync {
+    default.rsync,
+    source = "${SITE_PATH}/upload/",
+    target = "root@${ip}:${SITE_PATH}/upload/",
+    rsync = {
+        archive  = true,
+        compress = true,
+        rsh      = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i ${SSH_KEY}",
+        _extra = {
+            "--exclude=/resize_cache/",
+            "--exclude=/tmp/",
+            "--exclude=/.bx_temp/",
+            "--exclude=*.tmp",
+        },
+    },
+    delete = false,
+    delay  = 10,
+}
 BLOCK
         done
     } > "$LSYNCD_CONF"
