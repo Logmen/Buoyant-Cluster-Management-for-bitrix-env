@@ -144,11 +144,16 @@ frontend s3_frontend
     option tcplog
     default_backend s3_backend
 
-# ──── Backend: S3 MinIO-ноды (roundrobin) ───────────────────────────────────
+# ──── Backend: S3 MinIO-ноды (active-backup) ────────────────────────────────
+# ⚠️ active-backup, НЕ round-robin: сайты MinIO НЕЗАВИСИМЫ (site replication, не
+# distributed). S3 multipart создаёт uploadId на одном сайте → round-robin раскидал бы
+# part/complete по сайтам → uploadId не найден → загрузка в Диск/CRM рвётся
+# («Could not resume file transfer»). Весь трафик → первый сайт; остальные — backup
+# (горячий резерв, синхронен через site replication; подхват при падении первого).
 backend s3_backend
     mode tcp
     balance roundrobin
     option tcp-check
-    # Строки для каждой s3-ноды добавляются генератором:
-    # server __NODE_NAME__ __NODE_IP__:__S3_PORT__ check inter 5s fall 3 rise 2
+    # Строки для каждой s3-ноды добавляются генератором (первая — primary, остальные backup):
+    # server __NODE_NAME__ __NODE_IP__:__S3_PORT__ check inter 5s fall 3 rise 2 [backup]
 __BCM_S3_NODES_BACKENDS__

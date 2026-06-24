@@ -1421,10 +1421,19 @@ SQL
     done
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_ADMIN_BACKENDS__" "$web_admin_backends"
 
-    local s3_backends=""
+    # ⚠️ S3 — active-backup, НЕ round-robin: MinIO-сайты НЕЗАВИСИМЫ (site replication,
+    # не distributed). S3 multipart создаёт uploadId на одном сайте, а round-robin
+    # раскидывал бы part/complete по сайтам → uploadId не найден → загрузка в Диск/CRM
+    # рвётся («Could not resume file transfer»). Поэтому весь S3 → первый сайт; остальные
+    # сайты — backup (горячий резерв, синхронен через site replication, подхват при
+    # падении первого). Заодно даёт read-after-write консистентность (один источник).
+    local s3_backends="" s3_idx=0
     for name in "${S3_NODES[@]}"; do
         local ip="${S3_IPS[$name]}"
-        s3_backends="${s3_backends}    server ${name} ${ip}:${S3_PORT} check inter 5s fall 3 rise 2\n"
+        local s3_bkp=""
+        [[ $s3_idx -gt 0 ]] && s3_bkp=" backup"
+        s3_backends="${s3_backends}    server ${name} ${ip}:${S3_PORT} check inter 5s fall 3 rise 2${s3_bkp}\n"
+        s3_idx=$((s3_idx+1))
     done
     render_multiline "$local_haproxy_cfg" "__BCM_S3_NODES_BACKENDS__" "$s3_backends"
 
