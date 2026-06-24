@@ -86,13 +86,20 @@ frontend http_frontend
 
     default_backend web_backend
 
-# ──── Backend: web-ноды (roundrobin) — публичный трафик ──────────────────────
+# ──── Backend: web-ноды (roundrobin + sticky) — публичный трафик ─────────────
+# ⚠️ cookie-аффинность ОБЯЗАТЕЛЬНА: многошаговый загрузчик Bitrix (BX:Main:Uploader,
+# Диск/CRM) держит состояние догрузки node-local → без sticky round-robin рвёт
+# finalize/resume («Could not resume file transfer», дубли-сироты в S3, нет Disk-
+# объекта). insert+indirect+nocache: HAProxy сам ставит свою cookie (BXSRV), серверу
+# её не шлёт, добавляет Cache-control. HA цел: при падении ноды cookie протухает →
+# redispatch на живую (сессия в общем redis). Ассеты/админка — отдельные backend'ы.
 backend web_backend
     balance roundrobin
+    cookie BXSRV insert indirect nocache
     option httpchk GET /
     http-check expect status 200
-    # Строки для каждой web-ноды добавляются генератором:
-    # server __NODE_NAME__ __NODE_IP__:80 check inter 2s fall 3 rise 2
+    # Строки для каждой web-ноды добавляются генератором (с `cookie <name>`):
+    # server __NODE_NAME__ __NODE_IP__:80 cookie __NODE_NAME__ check inter 2s fall 3 rise 2
 __BCM_WEB_NODES_BACKENDS__
 
 # ──── Backend: CSS/JS-кэш Bitrix — retry-on 404 на другую ноду ────────────────

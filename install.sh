@@ -1390,13 +1390,21 @@ SQL
     cp "${BCM_BASE_DIR}/templates/haproxy.cfg.tmpl" "$local_haproxy_cfg"
     render_value "$local_haproxy_cfg" "__BCM_STATS_PASSWORD__" "$stats_pass"
 
-    local web_backends=""
+    # web_backend — со sticky-cookie (server-line `cookie <name>` + директива
+    # `cookie ... insert` в стансе): многошаговый протокол загрузчика Bitrix
+    # (BX:Main:Uploader) держит состояние догрузки node-local → без аффинности
+    # round-robin рвёт finalize/resume («Could not resume file transfer», дубли-
+    # сироты в S3, нет Disk-объекта). Bitrix-кластер требует sticky. web_cache_backend
+    # (контент-хэш ассеты, retry-on 404) — БЕЗ cookie (аффинность не нужна, покрыто
+    # ретраем). Аналогично admin (balance first → всегда primary).
+    local web_backends="" web_backends_sticky=""
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
         web_backends="${web_backends}    server ${name} ${ip}:80 check inter 2s fall 3 rise 2\n"
+        web_backends_sticky="${web_backends_sticky}    server ${name} ${ip}:80 cookie ${name} check inter 2s fall 3 rise 2\n"
     done
-    render_multiline "$local_haproxy_cfg" "__BCM_WEB_NODES_BACKENDS__" "$web_backends"
-    # web_cache_backend (CSS/JS-кэш, retry-on 404) — те же web-ноды, что и публичный.
+    render_multiline "$local_haproxy_cfg" "__BCM_WEB_NODES_BACKENDS__" "$web_backends_sticky"
+    # web_cache_backend (CSS/JS-кэш, retry-on 404) — те же web-ноды, БЕЗ cookie.
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_CACHE_BACKENDS__" "$web_backends"
 
     # Admin/запись (/bitrix/admin) — только на источник lsyncd (первый web),
