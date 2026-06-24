@@ -896,15 +896,20 @@ hg_offline = 30
 # Бакет MinIO для пользовательских файлов Bitrix (/upload). Регистрируется в
 # модуле «Облачные хранилища» сидером BCM (меню 7 → Облачное хранилище /upload).
 bucket = ${S3_UPLOAD_BUCKET}
-endpoint = http://${VIP}:${S3_PORT}
+endpoint = https://${VIP}:${S3_PORT}
 region = us-east-1
 access_key = ${S3_ACCESS_KEY:-minioadmin}
 secret_key = ${S3_SECRET_KEY}
+# ⚠️ MinIO работает по HTTPS (TLS терминирует САМ MinIO, см. configure_s3_tls) —
+# обязательно для отдачи облачных файлов через серверный прокси Bitrix при https-портале
+# (иначе ERR_HTTP2_PROTOCOL_ERROR на просмотре/скачивании). use_https=Y → бакет в модуле
+# clouds регистрируется с USE_HTTPS=Y (сидер 11→3 читает это).
+use_https = Y
 # ⚠️ Модуль Bitrix clouds (CCloudStorageService_S3) использует ТОЛЬКО
 # virtual-hosted-style (bucket.api_host) и подпись AWS V4 (region обязателен).
-# В админке: «Имя сервера (API host)» = api_host (БЕЗ http://), Регион = region.
+# В админке: «Имя сервера (API host)» = api_host (БЕЗ схемы), Регион = region, HTTPS = вкл.
 # api_host резолвится на web-нодах в /etc/hosts на S3-VIP, MinIO MINIO_DOMAIN=vhost_domain.
-# endpoint (с http://) — это path-style для mc/бэкапов, НЕ для модуля clouds.
+# endpoint (с https://) — path-style для mc/бэкапов; серт доверен через CA (configure_s3_tls).
 vhost_domain = ${S3_VHOST_DOMAIN}
 api_host = ${S3_VHOST_DOMAIN}:${S3_PORT}
 
@@ -1107,6 +1112,73 @@ configure_firewall_for_node() {
 # ⚠️ Форматирование УНИЧТОЖАЕТ данные на устройстве: пропускается, если на нём уже есть
 # ФС (кроме S3_DATA_DISK_FORCE=1). Идемпотентно: запись в /etc/fstab по UUID.
 # Если устройство не задано — возвращает 0 (данные на корневой ФС, как раньше).
+# ──── TLS для S3 (MinIO) ─────────────────────────────────────────────────────
+# ⚠️⚠️ MinIO ОБЯЗАН отвечать по HTTPS. Причина (диагностировано вживую, июнь 2026):
+# при https-портале Bitrix формирует URL облачного файла со схемой https:// (ИГНОРИРУЯ
+# USE_HTTPS бакета — берёт схему текущего запроса), а disk.api.file.download — серверный
+# прокси: PHP сам качает объект из S3 и стримит клиенту, заранее выставив Content-Length.
+# Если MinIO слушает только http (а :9000 был mode tcp без TLS), фетч https://…:9000 падает
+# на TLS-handshake → тело пустое при заявленной длине → HAProxy рвёт H2-поток → браузерный
+# ERR_HTTP2_PROTOCOL_ERROR на просмотре/скачивании ЛЮБОГО облачного файла. Фикс: TLS
+# терминирует САМ MinIO (S3-фронт HAProxy остаётся mode tcp passthrough — подпись AWS v4
+# цела end-to-end, mc/бэкапы/site-replication не ломаются). Свой CA + серт (SAN: vhost-домен,
+# *.vhost, IP всех S3-нод и VIP, localhost); CA — в доверенные на web+s3 (mc/php/curl
+# верифицируют без --insecure). Идемпотентно: CA/серт создаются один раз и переиспользуются.
+_bcm_s3_tls_dir="/etc/bitrix-cluster/s3-tls"
+configure_s3_tls() {
+    [[ "$DRY_RUN" -eq 1 ]] && { log_info "[DRY RUN] Генерация серта S3 (MinIO TLS)"; return 0; }
+    command -v openssl >/dev/null 2>&1 || { log_error "Нужен openssl для генерации серта S3 (MinIO TLS)."; exit 1; }
+    local d="$_bcm_s3_tls_dir"
+    mkdir -p "$d"; chmod 700 "$d"
+    if [[ -f "$d/public.crt" && -f "$d/private.key" && -f "$d/ca.crt" ]]; then
+        log_info "Серт S3 TLS уже существует — переиспользую (${d})."
+        return 0
+    fi
+    log_info "Генерация внутреннего CA и серта S3 (MinIO TLS)..."
+    # SAN: vhost-домен + wildcard + localhost + VIP + IP всех S3-нод.
+    local alt="" i=1 j=1 n nip
+    alt+="DNS.${j}=${S3_VHOST_DOMAIN}\n"; ((j++))
+    alt+="DNS.${j}=*.${S3_VHOST_DOMAIN}\n"; ((j++))
+    alt+="DNS.${j}=localhost\n"
+    alt+="IP.${i}=${VIP}\n"; ((i++))
+    alt+="IP.${i}=127.0.0.1\n"; ((i++))
+    for n in "${S3_NODES[@]}"; do nip="${S3_IPS[$n]}"; alt+="IP.${i}=${nip}\n"; ((i++)); done
+    {
+        printf '[req]\ndistinguished_name=dn\nreq_extensions=v3\nprompt=no\n'
+        printf '[dn]\nO=BCM Cluster\nCN=%s\n[v3]\nsubjectAltName=@alt\n[alt]\n' "$S3_VHOST_DOMAIN"
+        printf '%b' "$alt"
+    } > "$d/san.cnf"
+    openssl genrsa -out "$d/ca.key" 4096 2>/dev/null
+    openssl req -x509 -new -nodes -key "$d/ca.key" -sha256 -days 3650 \
+        -out "$d/ca.crt" -subj "/O=BCM Cluster/CN=BCM S3 Internal CA" 2>/dev/null
+    openssl genrsa -out "$d/private.key" 2048 2>/dev/null
+    openssl req -new -key "$d/private.key" -out "$d/s3.csr" -config "$d/san.cnf" 2>/dev/null
+    openssl x509 -req -in "$d/s3.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -CAcreateserial \
+        -out "$d/s3.crt" -days 1825 -sha256 -extensions v3 -extfile "$d/san.cnf" 2>/dev/null
+    cat "$d/s3.crt" "$d/ca.crt" > "$d/public.crt"
+    chmod 600 "$d/private.key" "$d/ca.key"
+    log_ok "  Серт S3 сгенерирован (SAN: ${S3_VHOST_DOMAIN}, *.${S3_VHOST_DOMAIN}, VIP, S3-IP)."
+}
+
+# Раскатать доверенный CA серта S3 на ноду (web/s3) — чтобы mc/php-curl верифицировали
+# https://<S3-VIP>:9000 без --insecure. Идемпотентно (фикс. имя в anchors).
+_bcm_install_s3_ca() {
+    local ip="$1"
+    [[ -f "${_bcm_s3_tls_dir}/ca.crt" ]] || return 0
+    bcm_ssh_copy_file "${_bcm_s3_tls_dir}/ca.crt" "$ip" "/etc/pki/ca-trust/source/anchors/bcm-s3-ca.crt"
+    bcm_ssh_exec "$ip" "command -v update-ca-trust >/dev/null 2>&1 && update-ca-trust extract || true"
+}
+
+# Положить серт MinIO в certs-dir ноды (MinIO авто-включает TLS при наличии
+# /root/.minio/certs/{public.crt,private.key}). Вызывать ДО старта minio.
+_bcm_deploy_s3_cert() {
+    local ip="$1"
+    bcm_ssh_exec "$ip" "mkdir -p /root/.minio/certs"
+    bcm_ssh_copy_file "${_bcm_s3_tls_dir}/public.crt"  "$ip" "/root/.minio/certs/public.crt"
+    bcm_ssh_copy_file "${_bcm_s3_tls_dir}/private.key" "$ip" "/root/.minio/certs/private.key"
+    bcm_ssh_exec "$ip" "chmod 600 /root/.minio/certs/private.key && chmod 644 /root/.minio/certs/public.crt"
+}
+
 prepare_s3_data_disk() {
     local name="$1" ip="$2"
     local dev="${S3_DATA_DISKS[$name]:-$S3_DATA_DISK}"
@@ -1424,6 +1496,9 @@ SQL
         log_warn "Secret key MinIO не задан в конфиге — сгенерирован случайный."
     fi
 
+    # TLS для MinIO (серт + доверенный CA) — ОБЯЗАТЕЛЬНО до старта MinIO.
+    configure_s3_tls
+
     for name in "${S3_NODES[@]}"; do
         local ip="${S3_IPS[$name]}"
         log_info "Настройка MinIO на $name ($ip)..."
@@ -1479,6 +1554,10 @@ WantedBy=multi-user.target
 EOF
         bcm_ssh_copy_file "$local_minio_svc" "$ip" "/etc/systemd/system/minio.service"
 
+        # TLS: серт в certs-dir (MinIO авто-включает https) + доверенный CA на ноде.
+        _bcm_deploy_s3_cert "$ip"
+        _bcm_install_s3_ca "$ip"
+
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable minio && systemctl restart minio"
         rm -f "$local_minio_cfg" "$local_minio_svc"
     done
@@ -1502,8 +1581,10 @@ EOF
         # site2 реплицировал бы «на site1» В САМОГО СЕБЯ → репликация site2→site1
         # мертва (массовые ошибки), а всё залитое через VIP на site2 (round-robin —
         # половина PUT'ов!) на site1 не попадает. Ловили вживую.
-        bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc alias set site1 http://${s3_01_ip}:9000 ${s3_ak_q} ${s3_sk_q}"
-        bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc alias set site2 http://${s3_02_ip}:9000 ${s3_ak_q} ${s3_sk_q}"
+        # https: MinIO слушает TLS, серт SAN включает IP S3-нод, CA доверен на ноде →
+        # верификация проходит без --insecure. http://…:9000 теперь вернул бы 400.
+        bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc alias set site1 https://${s3_01_ip}:9000 ${s3_ak_q} ${s3_sk_q}"
+        bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc alias set site2 https://${s3_02_ip}:9000 ${s3_ak_q} ${s3_sk_q}"
         bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc admin replicate add site1 site2 || true"
 
         # Бакет для пользовательских файлов Bitrix (/upload → S3, общий для web-нод).
@@ -2899,7 +2980,7 @@ ENV
 configure_backup() {
     log_info "Настройка резервного копирования (бакет ${BACKUP_BUCKET}, retention ${BACKUP_RETENTION_DAYS}д)..."
 
-    local s3_ep="http://${VIP}:9000"
+    local s3_ep="https://${VIP}:9000"
     local s3_ak="${S3_ACCESS_KEY:-minioadmin}"
     local s3_sk="${S3_SECRET_KEY}"
 
@@ -2950,6 +3031,9 @@ configure_backup() {
             # mc нужен всем (на s3 уже есть); ⚠️ /usr/local/bin/mc — на web
             # /usr/bin/mc занят Midnight Commander'ом из bitrix-env!
             bcm_ssh_exec_logged "$name" "$ip" "[ -x /usr/local/bin/mc ] || (wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc) || true"
+            # Доверенный CA серта MinIO (S3 теперь по https) — чтобы mc верифицировал
+            # S3_ENDPOINT без --insecure; на web заодно чинит php-curl облачной отдачи.
+            _bcm_install_s3_ca "$ip"
             # xtrabackup — только PXC
             if [[ "$layer" == "pxc" ]]; then
                 bcm_ssh_exec_logged "$name" "$ip" "rpm -q percona-xtrabackup-84 >/dev/null 2>&1 || (percona-release enable pxb-84-lts release; dnf install -y percona-xtrabackup-84)"

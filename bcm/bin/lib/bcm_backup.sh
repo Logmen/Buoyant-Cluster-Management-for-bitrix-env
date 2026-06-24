@@ -39,7 +39,7 @@ ENV_FILE="${BCM_BACKUP_ENV:-/etc/bitrix-cluster/backup.env}"
 
 SELF_NODE="${SELF_NODE:-$(hostname -s 2>/dev/null || echo '?')}"
 ROLE="${ROLE:-}"                          # web | lb | pxc | s3
-S3_ENDPOINT="${S3_ENDPOINT:-}"            # http://<VIP>:9000
+S3_ENDPOINT="${S3_ENDPOINT:-}"            # https://<VIP>:9000 (MinIO TLS, CA доверен)
 S3_ACCESS="${S3_ACCESS:-}"
 S3_SECRET="${S3_SECRET:-}"
 BUCKET="${BUCKET:-bitrix-backups}"

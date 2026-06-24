@@ -240,10 +240,13 @@ bcm_check_s3_health() {
         return
     fi
 
-    # MinIO health endpoint
+    # MinIO health endpoint. MinIO слушает HTTPS (см. install.sh::configure_s3_tls) —
+    # http теперь вернул бы 400. CA серта доверен на ноде → https://localhost (SAN
+    # включает localhost) проходит без -k; --fail откатывает на http для до-TLS кластеров.
     local health
     health=$(bcm_ssh_exec_timeout "$ip" 8 \
-        "curl -sf http://localhost:${s3_port}/minio/health/live && echo ok || echo fail" 2>/dev/null | tr -d '[:space:]')
+        "curl -sf https://localhost:${s3_port}/minio/health/live >/dev/null 2>&1 && echo ok || \
+         { curl -sf http://localhost:${s3_port}/minio/health/live >/dev/null 2>&1 && echo ok || echo fail; }" 2>/dev/null | tr -d '[:space:]')
 
     [[ "$health" == "ok" ]] && status="ok"
 

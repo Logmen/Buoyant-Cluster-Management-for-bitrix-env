@@ -38,6 +38,11 @@ S3U_SECRET="$(bcm_conf_get s3_upload secret_key 2>/dev/null || echo '')"
 # Падать назад на хост из endpoint, если api_host не задан (старые конфиги).
 S3U_APIHOST="$(bcm_conf_get s3_upload api_host 2>/dev/null || echo '')"
 [[ -z "$S3U_APIHOST" ]] && S3U_APIHOST="$(printf '%s' "$S3U_ENDPOINT" | sed -E 's#^https?://##')"
+# MinIO работает по HTTPS (TLS терминирует сам MinIO; серт доверен через CA) — иначе
+# серверный прокси Bitrix при https-портале не отдаёт облачные файлы (ERR_HTTP2_PROTOCOL_ERROR).
+# По умолчанию Y (включая старые конфиги без ключа).
+S3U_USE_HTTPS="$(bcm_conf_get s3_upload use_https 2>/dev/null || echo Y)"
+[[ -z "$S3U_USE_HTTPS" ]] && S3U_USE_HTTPS="Y"
 S3U_DOCROOT="/home/bitrix/www"
 
 # Активная нода (single-active) или первый web
@@ -58,7 +63,7 @@ _cs_print_values() {
     printf "  %s %s\n" "$(bcm_pad 'Регион (Location):' 22)" "$S3U_REGION"
     printf "  %s %s\n" "$(bcm_pad 'Ключ доступа:' 22)"      "$S3U_ACCESS"
     printf "  %s %s\n" "$(bcm_pad 'Секретный ключ:' 22)"    "${S3U_SECRET:0:4}••••(скрыт)"
-    printf "  %s %s\n" "$(bcm_pad 'HTTPS:' 22)"             "Нет (внутренний MinIO по http)"
+    printf "  %s %s\n" "$(bcm_pad 'HTTPS:' 22)"             "$([[ "$S3U_USE_HTTPS" == Y ]] && echo 'Да (MinIO TLS, серт доверен через CA)' || echo 'Нет')"
     printf "  %s %s\n" "$(bcm_pad 'CNAME:' 22)"             "(пусто)"
     echo
     bcm_warn "«Имя сервера» — БЕЗ http:// и без бакета (модуль сам строит bucket.<API>)."
@@ -117,7 +122,7 @@ _cs_register() {
     out=$(bcm_ssh_exec_timeout "$ip" 60 \
         "BX_DOCROOT='${S3U_DOCROOT}' BX_S3_APIHOST='${S3U_APIHOST}' BX_S3_BUCKET='${S3U_BUCKET}' \
          BX_S3_REGION='${S3U_REGION}' BX_S3_ACCESS='${S3U_ACCESS}' BX_S3_SECRET='${S3U_SECRET}' \
-         BX_S3_USE_HTTPS='N' \
+         BX_S3_USE_HTTPS='${S3U_USE_HTTPS}' \
          php /tmp/bcm_cloud_seeder.php 2>&1; rm -f /tmp/bcm_cloud_seeder.php" \
         2>/dev/null)
 

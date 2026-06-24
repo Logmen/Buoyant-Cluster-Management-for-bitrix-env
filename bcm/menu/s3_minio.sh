@@ -47,7 +47,7 @@ _s3_status() {
     if [[ "$health" == "ok" ]]; then bcm_status_ok; else bcm_status_fail; fi
     echo
     echo
-    bcm_info "Console: http://${ip}:9001"
+    bcm_info "Console: https://${ip}:9001"
     echo
     bcm_any_key
 }
