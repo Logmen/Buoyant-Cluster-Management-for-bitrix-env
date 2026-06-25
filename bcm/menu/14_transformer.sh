@@ -547,8 +547,11 @@ _tr_replicate_peers() {
         local r6; r6=$(bcm_ssh_exec_verbose "$pip" "systemctl enable --now rabbitmq-server >/dev/null 2>&1; sleep 3; rabbitmqctl list_users 2>/dev/null | awk '{print \$1}' | grep -qx bitrix || rabbitmqctl add_user bitrix ${rmq_q} >/dev/null 2>&1; rabbitmqctl set_user_tags bitrix administrator >/dev/null 2>&1; rabbitmqctl set_permissions -p / bitrix '.*' '.*' '.*' >/dev/null 2>&1; echo rabbit=\$(systemctl is-active rabbitmq-server)" </dev/null)
         bcm_info "  ${p}: ${r6}"
 
-        # 7) firewall 5672 + tmpfiles + unit enable + httpd (php-amqp в mod_php)
-        local r7; r7=$(bcm_ssh_exec_verbose "$pip" "(firewall-cmd --permanent --add-port=5672/tcp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1) || true; systemd-tmpfiles --create /etc/tmpfiles.d/transformer.conf >/dev/null 2>&1 || true; systemctl daemon-reload; systemctl enable transformer >/dev/null 2>&1 || true; systemctl restart httpd >/dev/null 2>&1 || true; echo httpd=\$(systemctl is-active httpd)" </dev/null)
+        # 7) firewall 5672 + log/run dirs + tmpfiles + unit enable + httpd (php-amqp в mod_php)
+        # ⚠ /var/log/transformer НЕ создаётся пакетом на ноде вне пула — workerd пишет туда
+        # workerd.log (transformer-workerd line 30) и без каталога падает с exit 1 → start-limit.
+        # /run/transformer (tmpfs) восстанавливает tmpfiles на boot, но создаём сразу --create'ом.
+        local r7; r7=$(bcm_ssh_exec_verbose "$pip" "(firewall-cmd --permanent --add-port=5672/tcp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1) || true; install -d -o bitrix -g bitrix -m 755 /var/log/transformer 2>/dev/null; systemd-tmpfiles --create /etc/tmpfiles.d/transformer.conf >/dev/null 2>&1 || true; systemctl daemon-reload; systemctl enable transformer >/dev/null 2>&1 || true; systemctl restart httpd >/dev/null 2>&1 || true; echo httpd=\$(systemctl is-active httpd)" </dev/null)
         bcm_info "  ${p}: 5672 открыт, ${r7}"
 
         # 8) transformer — стартуем ТОЛЬКО если модуль (sys_workerd.php) есть
