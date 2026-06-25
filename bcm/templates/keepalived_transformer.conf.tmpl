@@ -2,9 +2,10 @@
 # keepalived_transformer.conf.tmpl — VRRP-инстанс для плавающего VIP генератора
 # документов (Transformer). Добавляется к /etc/keepalived/keepalived.conf web-узла
 # отдельным блоком (рядом с session/push/cache VIP).
-# ⚠️ Дизайн: rabbitmq+transformer работают на ОБЕИХ нодах ВСЕГДА; keepalived только
-# держит VIP (без start/stop сервисов — иначе VRRP флапал на медленных start/stop).
-# Портал/воркеры идут на `default`→VIP→RabbitMQ держателя. notify — только лог.
+# ⚠️ Дизайн: rabbitmq+transformer работают на ОБЕИХ нодах ВСЕГДА; keepalived держит VIP.
+# Портал/воркеры идут на `default`→VIP→RabbitMQ держателя. notify при СМЕНЕ роли
+# перезапускает workerd В ФОНЕ (консьюмеры sys_workerd не переподключаются к VIP сами —
+# после failover висели бы на rabbitmq мёртвого старого держателя; см. transformer_notify.sh).
 # Подстановки BCM: __TR_VRID__, __NODE_IFACE__, __PRIORITY__,
 #   __VRRP_AUTH_PASS__, __TR_VIP__, __NODE_IP__, __PEER_IP__
 # =============================================================================
@@ -48,7 +49,8 @@ vrrp_instance VI_TRANSFORMER___TR_VRID__ {
         chk_transformer___TR_VRID__
     }
 
-    # Поднять/погасить rabbitmq+transformer по роли VRRP (active/standby)
+    # При смене роли — переподключить консьюмеры workerd к rabbitmq держателя VIP
+    # (рестарт transformer В ФОНЕ внутри скрипта; rabbitmq не трогается)
     notify_master "/opt/bcm/bin/lib/transformer_notify.sh MASTER"
     notify_backup "/opt/bcm/bin/lib/transformer_notify.sh BACKUP"
     notify_fault  "/opt/bcm/bin/lib/transformer_notify.sh FAULT"
