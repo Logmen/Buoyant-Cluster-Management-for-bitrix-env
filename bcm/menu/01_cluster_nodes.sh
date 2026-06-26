@@ -117,6 +117,53 @@ _cn_show_node_table() {
 }
 
 # ──── Добавить узел ───────────────────────────────────────────────────────────
+# Печатает готовые строки для install_answers.conf по слою + команду install.sh.
+# ⚠️ Источник правды провизионинга — answers-файл на УПРАВЛЯЮЩЕЙ машине (на ноде его
+# нет, секретов установки у BCM тоже нет) → сами провизионить не можем, делегируем
+# идемпотентному прогону install.sh. Строки генерируются из текущей топологии BCM
+# (она уже включает только что добавленный узел).
+_cn_print_provision_hint() {
+    local layer="$1"
+
+    local nodes_str nodes_csv="" ips_csv="" n ip
+    nodes_str=$(bcm_get_nodes "$layer" 2>/dev/null || echo "")
+    for n in $nodes_str; do
+        [[ -z "$n" ]] && continue
+        ip=$(bcm_get_node_ip "$layer" "$n" 2>/dev/null || echo "?")
+        nodes_csv="${nodes_csv}${n},"
+        ips_csv="${ips_csv}${n}:${ip},"
+    done
+    nodes_csv="${nodes_csv%,}"
+    ips_csv="${ips_csv%,}"
+
+    # В answers отдельный *_NODES-список есть ТОЛЬКО у web; остальные слои выводят
+    # состав узлов из *_IPS_LIST.
+    local ips_var
+    case "$layer" in
+        lb)  ips_var="LB_IPS_LIST"  ;;
+        web) ips_var="WEB_IPS_LIST" ;;
+        pxc) ips_var="PXC_IPS_LIST" ;;
+        s3)  ips_var="S3_IPS_LIST"  ;;
+    esac
+
+    echo
+    bcm_info "Чтобы узел был ПОЛНОСТЬЮ настроен и интегрирован в кластер, обновите"
+    bcm_info "install_answers.conf на УПРАВЛЯЮЩЕЙ машине (где лежит install.sh):"
+    echo
+    [[ "$layer" == "web" ]] && printf '    WEB_NODES="%s"\n' "$nodes_csv"
+    printf '    %s="%s"\n' "$ips_var" "$ips_csv"
+    echo
+    bcm_info "затем выполните оттуда (под root):"
+    printf '    sudo bash install.sh --answers-file install_answers.conf\n'
+    echo
+    bcm_info "install.sh идемпотентен: доустановит недостающее и интегрирует узел во всём"
+    bcm_info "кластере (HAProxy backends на LB, keepalived/VRRP, lsyncd, ProxySQL),"
+    bcm_info "перегенерировав cluster.conf из answers-файла."
+    echo
+    bcm_warn "ИСТОЧНИК ПРАВДЫ — install_answers.conf. Если НЕ добавить узел туда,"
+    bcm_warn "следующий прогон install.sh СОТРЁТ его из cluster.conf."
+}
+
 _cn_add_node() {
     bcm_section_header "Добавление узла в кластер"
 
@@ -185,15 +232,39 @@ _cn_add_node() {
         fi
     done
 
+    # ──── Режим добавления ───────────────────────────────────────────────────
+    # BCM на ноде не имеет секретов установки → провизионинг/интеграцию делает
+    # install.sh (см. _cn_print_provision_hint). Режим влияет на раскатку ключа и
+    # на сопроводительные пояснения, обе ветки делегируют install.sh.
+    echo
+    echo "  Как добавить узел?"
+    echo "    1. Узел уже подготовлен вручную (ОС/стек настроены, как у остальных)"
+    echo "    2. Чистый сервер — нужна полная установка (bitrix-env + стек)"
+    echo
+    local mode_choice
+    bcm_read_choice "Выберите режим [1-2] (0 — отмена)" mode_choice
+    [[ "$mode_choice" == "0" || -z "$mode_choice" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    local mode
+    case "$mode_choice" in
+        1) mode="prepared" ;;
+        2) mode="bare"     ;;
+        *)
+            bcm_error "Неверный выбор режима."
+            bcm_any_key
+            return
+            ;;
+    esac
+
     # Итоговое подтверждение
     echo
-    bcm_info "Будет добавлено:"
-    bcm_info "  Слой:  ${layer}"
-    bcm_info "  Узел:  ${node_name}"
-    bcm_info "  IP:    ${node_ip}"
+    bcm_info "Будет записано в cluster.conf:"
+    bcm_info "  Слой:   ${layer}"
+    bcm_info "  Узел:   ${node_name}"
+    bcm_info "  IP:     ${node_ip}"
+    bcm_info "  Режим:  $([[ "$mode" == "prepared" ]] && echo 'уже подготовлен' || echo 'чистый сервер')"
     echo
 
-    if ! bcm_confirm "Добавить узел в cluster.conf и скопировать SSH-ключ?"; then
+    if ! bcm_confirm "Записать узел в cluster.conf?"; then
         bcm_info "Отменено."
         bcm_any_key
         return
@@ -204,35 +275,49 @@ _cn_add_node() {
     bcm_conf_add_node "$layer" "$node_name" "$node_ip"
     BCM_CONF_LOADED=0
     bcm_load_topology
-    bcm_ok "Узел '${node_name}' добавлен в слой '${layer}'."
+    bcm_ok "Узел '${node_name}' добавлен в cluster.conf (слой '${layer}')."
 
-    # Копирование SSH-ключа
+    # ──── SSH-ключ кластера ───────────────────────────────────────────────────
     local pub_key="${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}.pub"
-    if [[ -f "$pub_key" ]]; then
-        bcm_info "Попытка скопировать SSH-ключ на ${node_ip} (потребуется пароль root)..."
-        echo
-        bcm_warn "Введите пароль root удалённого узла (или Ctrl+C для пропуска):"
-        local ssh_pass
-        read -r -s ssh_pass
-        echo
-
-        if [[ -n "$ssh_pass" ]]; then
-            if bcm_copy_key_to_node "$node_ip" "$ssh_pass" "$pub_key"; then
-                bcm_ok "SSH-ключ успешно скопирован на ${node_ip}."
-            else
-                bcm_error "Не удалось скопировать SSH-ключ. Проверьте пароль и доступность узла."
-                bcm_info "Скопируйте вручную: ssh-copy-id -i ${pub_key} root@${node_ip}"
-            fi
+    if [[ "$mode" == "prepared" ]]; then
+        # Узел уже настроен → ключ нужен сейчас, чтобы BCM видел/опрашивал его.
+        # ⚠️ Раньше успех рапортовался без проверки → молчаливый провал раскатки
+        # (узел оставался без ключа, но «добавлен»). Теперь — с верификацией.
+        if [[ ! -f "$pub_key" ]]; then
+            bcm_warn "Публичный ключ не найден: ${pub_key}"
+            bcm_info "Создайте ключ: ssh-keygen -t ed25519 -f ${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
+        elif bcm_ssh_reachable "$node_ip"; then
+            bcm_ok "SSH-ключ кластера уже работает на ${node_ip}."
         else
-            bcm_warn "Пароль не введён. Скопируйте ключ вручную:"
-            bcm_info "  ssh-copy-id -i ${pub_key} root@${node_ip}"
+            bcm_info "Раскатка SSH-ключа кластера на ${node_ip} (нужен пароль root)."
+            bcm_warn "Введите пароль root узла ${node_ip} (пусто — пропустить):"
+            local ssh_pass
+            read -r -s ssh_pass
+            echo
+            if [[ -z "$ssh_pass" ]]; then
+                bcm_warn "Пароль не введён — ключ НЕ раскатан, BCM пока не сможет управлять узлом."
+                bcm_info "Раскатайте вручную: ssh-copy-id -i ${pub_key} root@${node_ip}"
+            elif bcm_copy_key_to_node "$node_ip" "$ssh_pass" "$pub_key" && bcm_ssh_reachable "$node_ip"; then
+                bcm_ok "SSH-ключ раскатан и проверен на ${node_ip}."
+            else
+                bcm_error "Не удалось раскатать/проверить SSH-ключ на ${node_ip}."
+                bcm_info "Проверьте пароль и доступность. Вручную: ssh-copy-id -i ${pub_key} root@${node_ip}"
+            fi
         fi
     else
-        bcm_warn "Публичный ключ не найден: ${pub_key}"
-        bcm_info "Создайте ключ: ssh-keygen -t ed25519 -f ${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
+        # Чистый сервер → ключ раскатает сам install.sh (deploy_ssh_keys по ROOT_PASSWORD).
+        bcm_info "SSH-ключ кластера раскатает install.sh при установке (по ROOT_PASSWORD)."
     fi
 
-    bcm_log_info "Добавлен узел ${node_name} (${node_ip}) в слой ${layer}"
+    # ──── Что делать дальше: делегирование install.sh ─────────────────────────
+    _cn_print_provision_hint "$layer"
+    if [[ "$mode" == "bare" ]]; then
+        echo
+        bcm_warn "До прогона install.sh узел остаётся неготовым — в статусе он будет"
+        bcm_warn "отображаться недоступным. Это ожидаемо."
+    fi
+
+    bcm_log_info "Добавлен узел ${node_name} (${node_ip}) в слой ${layer} (режим: ${mode})"
     bcm_any_key
 }
 
