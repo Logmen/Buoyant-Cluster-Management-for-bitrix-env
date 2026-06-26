@@ -140,13 +140,11 @@ bcm_get_current_role() {
     local current_ips
     current_ips=$(hostname -I 2>/dev/null || ip addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
 
+    local layer node nodes node_ip node_name
     for layer in lb web pxc s3; do
-        local nodes
         nodes=$(bcm_get_nodes "$layer") || continue
         for node in $nodes; do
-            local node_ip
             node_ip=$(bcm_get_node_ip "$layer" "$node") || continue
-            local node_name
             node_name=$(bcm_conf_get "layer.${layer}" "${node}.hostname" 2>/dev/null || echo "$node")
 
             # Совпадение по hostname или по IP
@@ -177,11 +175,10 @@ bcm_get_current_node_name() {
     local current_ips
     current_ips=$(hostname -I 2>/dev/null)
 
+    local layer node nodes node_ip
     for layer in lb web pxc s3; do
-        local nodes
         nodes=$(bcm_get_nodes "$layer") || continue
         for node in $nodes; do
-            local node_ip
             node_ip=$(bcm_get_node_ip "$layer" "$node") || continue
             if [[ "$current_hostname" == "$node" ]] || \
                echo "$current_ips" | grep -qw "$node_ip"; then
@@ -223,9 +220,14 @@ bcm_load_topology() {
 
     BCM_CONF_VIP=$(bcm_get_vip)
 
+    # ⚠️ layer/node/nodes ОБЯЗАНЫ быть local: bash динамически скоупит, и без local
+    # эта функция затирала бы одноимённые переменные ВЫЗЫВАЮЩЕЙ функции. Симптом
+    # (ловили вживую): после bcm_load_topology у вызвавшего меню $layer становился
+    # "s3" (последняя итерация) → «узел добавлен в слой 's3'» при выборе web; в
+    # _cn_add_node это испортило бы и слой подсказки install_answers.conf.
+    local layer node nodes nodes_str
     local layers=("lb" "web" "pxc" "s3")
     for layer in "${layers[@]}"; do
-        local nodes_str
         nodes_str=$(bcm_get_nodes "$layer" 2>/dev/null) || continue
         read -ra nodes <<< "$nodes_str"
         for node in "${nodes[@]}"; do
@@ -262,9 +264,10 @@ bcm_conf_sync() {
     bcm_load_topology
     local self_node
     self_node=$(bcm_get_current_node_name 2>/dev/null || hostname -s)
+    # layer/node/nodes — local (см. примечание в bcm_load_topology про дин. скоуп).
+    local layer node nodes nodes_str
     local layers=("lb" "web" "pxc" "s3")
     for layer in "${layers[@]}"; do
-        local nodes_str
         nodes_str=$(bcm_get_nodes "$layer" 2>/dev/null) || continue
         read -ra nodes <<< "$nodes_str"
         for node in "${nodes[@]}"; do
