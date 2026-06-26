@@ -1505,7 +1505,7 @@ SQL
 
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable haproxy keepalived && systemctl restart haproxy keepalived"
     done
-    rm -f "$local_haproxy_cfg" "$local_keepalived_cfg" 2>/dev/null
+    rm -f "${local_haproxy_cfg:-}" "${local_keepalived_cfg:-}" 2>/dev/null
 
     # 3. S3 Настройка
     # Креды берём из конфига/файла ответов. Если secret не задан — генерируем случайный,
@@ -1719,7 +1719,7 @@ EOF
 
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable proxysql keepalived && systemctl restart proxysql keepalived"
     done
-    rm -f "$local_proxysql_cfg" "$local_keepalived_web" 2>/dev/null
+    rm -f "${local_proxysql_cfg:-}" "${local_keepalived_web:-}" 2>/dev/null
 }
 
 # ──── Подключение Push & Pull (NodeJS RTC) на web-нодах ──────────────────────
@@ -1971,7 +1971,7 @@ PHPSNIP
         fi
     done
 
-    rm -f "$local_unit"
+    rm -f "${local_unit:-}"
     log_ok "Redis-хранилище сессий настроено. Master: ${master_node}, VIP: ${SESSION_VIP}:${SESSION_REDIS_PORT}."
 }
 
@@ -2364,7 +2364,7 @@ ENV
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl disable mysql 2>/dev/null; systemctl enable pxc-autorecover"
         rm -f "$local_env"
     done
-    rm -f "$local_unit"
+    rm -f "${local_unit:-}"
     log_ok "Авто-восстановление PXC настроено на всех узлах."
 }
 
@@ -2586,7 +2586,7 @@ PHPSNIP
         bcm_ssh_exec_logged "$name" "$ip" "systemctl restart push-server 2>/dev/null || true"
         log_info "  $name: push-server storage → ${PUSH_REDIS_VIP}:${PUSH_REDIS_PORT} (${rp})"
     done
-    rm -f "$local_unit"
+    rm -f "${local_unit:-}"
 
     # 6. path_to_publish → node-local на источнике lsyncd (разъедется на остальные).
     if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -2717,7 +2717,7 @@ UNIT
         bcm_ssh_exec_logged "$name" "$ip" "systemctl reload keepalived 2>/dev/null || systemctl restart keepalived"
         rm -f "$local_cache_ka"
     done
-    rm -f "$local_unit"
+    rm -f "${local_unit:-}"
 
     # 5. Прописать секцию 'cache' в .settings.php на источнике lsyncd (разъедется
     #    на остальные; sid фиксированный → единый неймспейс кэша на всех нодах).
@@ -2904,7 +2904,7 @@ NGX
             fi"
         log_ok "  $name: nginx настроен для работы за LB."
     done
-    rm -f "$local_snippet"
+    rm -f "${local_snippet:-}"
 }
 
 # ──── Продление SSL-сертификата (Let's Encrypt) на LB ────────────────────────
@@ -2990,7 +2990,7 @@ ENV
         rm -f "$local_env"
         log_ok "  $name: таймер продления включён."
     done
-    rm -f "$local_service" "$local_timer"
+    rm -f "${local_service:-}" "${local_timer:-}"
 }
 
 # ──── Резервное копирование (HA-aware, в MinIO кластера) ─────────────────────
@@ -3128,7 +3128,7 @@ UNIT
             log_ok "  $name (${layer}): бэкап настроен (rank=${db_rank})."
         done
     done
-    rm -f "$local_svc" "$local_tmr"
+    rm -f "${local_svc:-}" "${local_tmr:-}"
     log_ok "Резервное копирование настроено. Offsite-копию настройте отдельно (меню 13)."
 }
 
