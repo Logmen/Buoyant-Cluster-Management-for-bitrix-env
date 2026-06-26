@@ -163,7 +163,10 @@ bcm_deploy_to_node() {
     # BCM_ALLOW_DOWNGRADE=1. Свежая установка (на ноде нет VERSION) и равные версии — ок.
     local _src_ver _node_ver _newer
     _src_ver="$(tr -d '[:space:]' < "${bcm_src}/VERSION" 2>/dev/null || true)"
-    _node_ver="$(bcm_ssh_exec "$ip" "cat /opt/bcm/VERSION 2>/dev/null" | tr -d '[:space:]')"
+    # ⚠️ || true: на свежей ноде /opt/bcm/VERSION отсутствует → cat выходит с 1; под
+    # set -euo pipefail (наследуется от install.sh) non-zero substitution оборвал бы
+    # деплой БЕЗ сообщения. Пустой _node_ver = «свежая нода» (проверка ниже пропускает).
+    _node_ver="$(bcm_ssh_exec "$ip" "cat /opt/bcm/VERSION 2>/dev/null" | tr -d '[:space:]' || true)"
     if [[ -n "$_src_ver" && -n "$_node_ver" && "$_src_ver" != "$_node_ver" ]]; then
         _newer="$(printf '%s\n%s\n' "$_src_ver" "$_node_ver" | sort -V | tail -1)"
         if [[ "$_newer" == "$_node_ver" ]]; then

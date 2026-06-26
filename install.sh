@@ -752,9 +752,13 @@ check_bcm_no_downgrade() {
         [[ -n "${PXC_IPS[$name]:-}" ]] && ip="${PXC_IPS[$name]}"
         [[ -n "${S3_IPS[$name]:-}" ]]  && ip="${S3_IPS[$name]}"
         [[ -z "$ip" ]] && continue
+        # ⚠️ || true ОБЯЗАТЕЛЕН: на ДОБАВЛЯЕМОЙ (свежей) ноде /opt/bcm/VERSION ещё нет →
+        # удалённый cat выходит с 1, и под set -euo pipefail non-zero substitution убил бы
+        # install.sh БЕЗ сообщения (ловили вживую при добавлении web03). Пустой node_ver
+        # ниже трактуется как «свежая нода» (пропуск), что и нужно.
         node_ver="$(timeout 8 sshpass -p "$ROOT_PASSWORD" ssh -o ConnectTimeout=4 \
             -o StrictHostKeyChecking=accept-new "root@${ip}" \
-            "cat /opt/bcm/VERSION 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+            "cat /opt/bcm/VERSION 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
         [[ -z "$node_ver" || "$node_ver" == "$src_ver" ]] && continue
         newer="$(printf '%s\n%s\n' "$src_ver" "$node_ver" | sort -V | tail -1)"
         if [[ "$newer" == "$node_ver" ]]; then
