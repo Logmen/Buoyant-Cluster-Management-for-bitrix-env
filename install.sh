@@ -1082,6 +1082,24 @@ EOF"
     done
 }
 
+# ──── Полный список unicast-пиров для блока unicast_peer { __PEER_IP__ } ──────
+# ⚠️⚠️ Возвращает IP ВСЕХ узлов слоя, КРОМЕ self, как многострочный список (для
+# render_multiline; отступ 8 пробелов под блок unicast_peer). РАНЕЕ peer строился как
+# «первый отличный от self узел + break» — для 2 нод ок, но при 3+ нодах каждая нода
+# знала лишь ОДНОГО пира → неполный меш → VRRP не доходит до части нод → они уходят в
+# MASTER → split-brain (ловили вживую на web03: дубликат redis-VIP на web01 и web03).
+# Аргументы: $1=self, далее пары name:ip.
+_bcm_peers_ml() {
+    local self="$1"; shift
+    local out="" pair pn pip
+    for pair in "$@"; do
+        pn="${pair%%:*}"; pip="${pair#*:}"
+        [[ "$pn" == "$self" ]] && continue
+        if [[ -z "$out" ]]; then out="$pip"; else out="${out}\n        ${pip}"; fi
+    done
+    printf '%s' "$out"
+}
+
 # ──── Настройка фаервола на узлах ─────────────────────────────────────────────
 configure_firewall_for_node() {
     local node_name="$1"
@@ -1480,12 +1498,13 @@ SQL
 
         local state="BACKUP"
         local priority="100"
-        local peer_ip="${LB_IPS[${LB_NODES[0]}]}"
         if [[ "$name" == "${LB_NODES[0]}" ]]; then
             state="MASTER"
             priority="110"
-            peer_ip="${LB_IPS[${LB_NODES[1]}]}"
         fi
+        local peer_ip lb_pairs=()
+        local _ln; for _ln in "${LB_NODES[@]}"; do lb_pairs+=("${_ln}:${LB_IPS[$_ln]}"); done
+        peer_ip=$(_bcm_peers_ml "$name" "${lb_pairs[@]}")
 
         local iface
         iface=$(bcm_ssh_exec "$ip" "ip route | grep default | awk '{print \$5}' | head -1" | tr -d '[:space:]')
@@ -1498,7 +1517,7 @@ SQL
         render_value "$local_keepalived_cfg" "__VRRP_AUTH_PASS__" "$auth_pass_lb"
         sed -i "s/__VIP__/${VIP}/g" "$local_keepalived_cfg"
         sed -i "s/__NODE_IP__/${ip}/g" "$local_keepalived_cfg"
-        sed -i "s/__PEER_IP__/${peer_ip}/g" "$local_keepalived_cfg"
+        render_multiline "$local_keepalived_cfg" "__PEER_IP__" "$peer_ip"
 
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived"
         bcm_ssh_copy_file "$local_keepalived_cfg" "$ip" "/etc/keepalived/keepalived.conf"
@@ -1678,12 +1697,13 @@ EOF
 
         local state="BACKUP"
         local priority="100"
-        local peer_ip="${WEB_IPS[${WEB_NODES[0]}]}"
         if [[ "$name" == "${WEB_NODES[0]}" ]]; then
             state="MASTER"
             priority="110"
-            peer_ip="${WEB_IPS[${WEB_NODES[1]}]}"
         fi
+        local peer_ip web_pairs=()
+        local _wn; for _wn in "${WEB_NODES[@]}"; do web_pairs+=("${_wn}:${WEB_IPS[$_wn]}"); done
+        peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
 
         local iface
         iface=$(bcm_ssh_exec "$ip" "ip route | grep default | awk '{print \$5}' | head -1" | tr -d '[:space:]')
@@ -1696,7 +1716,7 @@ EOF
         sed -i "s/__PRIORITY__/${priority}/g" "$local_keepalived_web"
         render_value "$local_keepalived_web" "__VRRP_CRON_PASS__" "$auth_pass_web"
         sed -i "s/__NODE_IP__/${ip}/g" "$local_keepalived_web"
-        sed -i "s/__PEER_IP__/${peer_ip}/g" "$local_keepalived_web"
+        render_multiline "$local_keepalived_web" "__PEER_IP__" "$peer_ip"
 
         # ⚠️ cron_notify.sh ДОЛЖЕН быть на ноде ДО старта keepalived: при
         # enable_script_security keepalived проверяет notify-скрипты на этапе
@@ -1903,10 +1923,11 @@ UNIT
         if [[ "$name" == "$master_node" ]]; then
             state="MASTER"; priority="110"
         fi
-        # Первый web-узел, отличный от текущего — как unicast-пир
-        for peer in "${WEB_NODES[@]}"; do
-            if [[ "$peer" != "$name" ]]; then peer_ip="${WEB_IPS[$peer]}"; break; fi
-        done
+        # Все остальные web-узлы — unicast-пиры (полный меш; при 3+ нодах неполный
+        # список → VRRP split-brain, см. _bcm_peers_ml).
+        local web_pairs=() _wn
+        for _wn in "${WEB_NODES[@]}"; do web_pairs+=("${_wn}:${WEB_IPS[$_wn]}"); done
+        peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
 
         local local_sess_ka="/tmp/keepalived-session-${name}.conf"
         cp "${BCM_BASE_DIR}/templates/keepalived_session.conf.tmpl" "$local_sess_ka"
@@ -1918,7 +1939,7 @@ UNIT
         sed -i "s/__SESSION_VIP__/${SESSION_VIP}/g" "$local_sess_ka"
         sed -i "s/__SESSION_PORT__/${SESSION_REDIS_PORT}/g" "$local_sess_ka"
         sed -i "s/__NODE_IP__/${ip}/g" "$local_sess_ka"
-        sed -i "s/__PEER_IP__/${peer_ip}/g" "$local_sess_ka"
+        render_multiline "$local_sess_ka" "__PEER_IP__" "$peer_ip"
 
         # Идемпотентно: добавляем блок, только если этого VRID ещё нет в конфиге
         if ! bcm_ssh_exec "$ip" "grep -q 'virtual_router_id ${SESSION_VRID}' /etc/keepalived/keepalived.conf 2>/dev/null"; then
@@ -2526,10 +2547,9 @@ UNIT
         iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
         [[ -z "$iface" ]] && iface="ens18"
         if [[ "$name" == "$master_node" ]]; then state="MASTER"; priority="110"; fi
-        local peer
-        for peer in "${WEB_NODES[@]}"; do
-            if [[ "$peer" != "$name" ]]; then peer_ip="${WEB_IPS[$peer]}"; break; fi
-        done
+        local web_pairs=() _wn
+        for _wn in "${WEB_NODES[@]}"; do web_pairs+=("${_wn}:${WEB_IPS[$_wn]}"); done
+        peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
         local local_push_ka="/tmp/keepalived-push-${name}.conf"
         cp "${BCM_BASE_DIR}/templates/keepalived_push.conf.tmpl" "$local_push_ka"
         sed -i "s/__PUSH_VRID__/${PUSH_VRID}/g" "$local_push_ka"
@@ -2540,7 +2560,7 @@ UNIT
         sed -i "s/__PUSH_VIP__/${PUSH_REDIS_VIP}/g" "$local_push_ka"
         sed -i "s/__PUSH_PORT__/${PUSH_REDIS_PORT}/g" "$local_push_ka"
         sed -i "s/__NODE_IP__/${ip}/g" "$local_push_ka"
-        sed -i "s/__PEER_IP__/${peer_ip}/g" "$local_push_ka"
+        render_multiline "$local_push_ka" "__PEER_IP__" "$peer_ip"
         if ! bcm_ssh_exec "$ip" "grep -q 'virtual_router_id ${PUSH_VRID}' /etc/keepalived/keepalived.conf 2>/dev/null"; then
             bcm_ssh_exec "$ip" "cat >> /etc/keepalived/keepalived.conf" < "$local_push_ka"
         fi
@@ -2696,10 +2716,9 @@ UNIT
         iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
         [[ -z "$iface" ]] && iface="ens18"
         if [[ "$name" == "$master_node" ]]; then state="MASTER"; priority="110"; fi
-        local peer
-        for peer in "${WEB_NODES[@]}"; do
-            if [[ "$peer" != "$name" ]]; then peer_ip="${WEB_IPS[$peer]}"; break; fi
-        done
+        local web_pairs=() _wn
+        for _wn in "${WEB_NODES[@]}"; do web_pairs+=("${_wn}:${WEB_IPS[$_wn]}"); done
+        peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
         local local_cache_ka="/tmp/keepalived-cache-${name}.conf"
         cp "${BCM_BASE_DIR}/templates/keepalived_cache.conf.tmpl" "$local_cache_ka"
         sed -i "s/__CACHE_VRID__/${CACHE_VRID}/g" "$local_cache_ka"
@@ -2710,7 +2729,7 @@ UNIT
         sed -i "s/__CACHE_VIP__/${CACHE_REDIS_VIP}/g" "$local_cache_ka"
         sed -i "s/__CACHE_PORT__/${CACHE_REDIS_PORT}/g" "$local_cache_ka"
         sed -i "s/__NODE_IP__/${ip}/g" "$local_cache_ka"
-        sed -i "s/__PEER_IP__/${peer_ip}/g" "$local_cache_ka"
+        render_multiline "$local_cache_ka" "__PEER_IP__" "$peer_ip"
         if ! bcm_ssh_exec "$ip" "grep -q 'virtual_router_id ${CACHE_VRID}' /etc/keepalived/keepalived.conf 2>/dev/null"; then
             bcm_ssh_exec "$ip" "cat >> /etc/keepalived/keepalived.conf" < "$local_cache_ka"
         fi
@@ -3174,12 +3193,67 @@ finalize_web_nodes() {
         log_info "[DRY RUN] disable+stop+reset-failed mysqld, restart proxysql, cron_notify.sh assert на web-нодах"
         return 0
     fi
+    # ── Ре-ассерт подключения БД портала к ProxySQL (ПОСЛЕДНИМ, после оседания ansible).
+    # ⚠️⚠️ Корень бага (ловили вживую при добавлении web03, июнь 2026): на НОВОЙ ноде
+    # configure_push_service запускает `bx-sites -a push_configure_nodejs`, ansible-хвост
+    # которого РЕГЕНЕРИРУЕТ .settings.php к скелету bitrix-env (host=localhost, login
+    # bitrix0), а promote-catch-up lsyncd (`rsync --update` с пиров) затаскивает этот
+    # СВЕЖИЙ скелет на источник → портал теряет PXC-подключение на ВСЕХ web. А затем
+    # выключение локального mysqld давало 500 (localhost + mysqld off, данные-то в PXC).
+    # configure_portal_db отрабатывает РАНЬШЕ этого хвоста, поэтому ассерт повторяем здесь.
+    # ⚠️ Fail-closed: НЕ выключаем mysqld, пока БД не подтверждена на ProxySQL.
+    local repoint_php="${BCM_BASE_DIR}/templates/db_repoint.php"
+    local fz_docroot="/home/bitrix/www"
+    local fz_proxy_host="127.0.0.1:${PROXYSQL_PORT}"
+    local fz_src_ip="${WEB_IPS[${WEB_NODES[0]}]}"
+    # 2 = портала нет (гасить mysqld можно); 1 = БД на ProxySQL (можно); 0 = НЕ на ProxySQL (НЕ гасить)
+    local fz_db_ok=2
+    if [[ -f "$repoint_php" ]]; then
+        bcm_ssh_copy_file "$repoint_php" "$fz_src_ip" "/tmp/bcm_db_repoint.php"
+        local fz_rd fz_res fz_dbn fz_dbh
+        fz_rd=$(bcm_ssh_exec "$fz_src_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=read php /tmp/bcm_db_repoint.php 2>&1")
+        fz_res=$(echo "$fz_rd" | sed -n 's/^RESULT=//p' | head -1)
+        fz_dbn=$(echo "$fz_rd" | sed -n 's/^DB_NAME=//p' | head -1)
+        fz_dbh=$(echo "$fz_rd" | sed -n 's/^DB_HOST=//p' | head -1)
+        if [[ "$fz_res" == "OK" && -n "$fz_dbn" ]]; then
+            if [[ "$fz_dbh" == "$fz_proxy_host" ]]; then
+                fz_db_ok=1
+                log_ok "  Портал уже подключён через ProxySQL (${fz_dbh})."
+            else
+                # БД сброшена не на ProxySQL — репойнтим, но только если ProxySQL реально к ней маршрутизирует.
+                local fz_pt
+                fz_pt=$(bcm_ssh_exec "$fz_src_ip" "mysql --default-auth=mysql_native_password -p'${BITRIX_DB_PASS}' -h127.0.0.1 -P'${PROXYSQL_PORT}' -u'${BITRIX_DB_USER}' '${fz_dbn}' -N -e 'SELECT 1' 2>/dev/null || echo ERR" | tr -d '[:space:]')
+                if [[ "$fz_pt" == "1" ]]; then
+                    log_warn "  Подключение БД портала сброшено на '${fz_dbh}' (ansible/скелет) — восстанавливаю → ProxySQL на всех web."
+                    local fz_n fz_ip fz_w
+                    for fz_n in "${WEB_NODES[@]}"; do
+                        fz_ip="${WEB_IPS[$fz_n]}"
+                        bcm_ssh_copy_file "$repoint_php" "$fz_ip" "/tmp/bcm_db_repoint.php"
+                        fz_w=$(bcm_ssh_exec "$fz_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=write BX_DB_HOST='${fz_proxy_host}' BX_DB_LOGIN='${BITRIX_DB_USER}' BX_DB_PASS='${BITRIX_DB_PASS}' BX_DB_NAME='${fz_dbn}' php /tmp/bcm_db_repoint.php 2>&1; chown bitrix:bitrix '${fz_docroot}/bitrix/.settings.php' 2>/dev/null; rm -f /tmp/bcm_db_repoint.php")
+                        echo "$fz_w" | grep -q 'RESULT=OK' && log_ok "    ${fz_n}: .settings.php → ProxySQL." || log_warn "    ${fz_n}: репойнт БД не удался (${fz_w})."
+                    done
+                    fz_db_ok=1
+                else
+                    fz_db_ok=0
+                    log_error "  БД портала на '${fz_dbh}', ProxySQL НЕ маршрутизирует к '${fz_dbn}' — локальный mysqld НЕ выключаю (иначе портал ляжет). Разберитесь с ProxySQL/PXC и повторите."
+                fi
+            fi
+        fi
+        bcm_ssh_exec "$fz_src_ip" "rm -f /tmp/bcm_db_repoint.php" >/dev/null 2>&1 || true
+    fi
+
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
-        bcm_ssh_exec "$ip" "systemctl disable --now mysqld 2>/dev/null || systemctl disable --now mariadb 2>/dev/null || true; systemctl reset-failed mysqld 2>/dev/null || true" >/dev/null 2>&1
+        if [[ "$fz_db_ok" != "0" ]]; then
+            bcm_ssh_exec "$ip" "systemctl disable --now mysqld 2>/dev/null || systemctl disable --now mariadb 2>/dev/null || true; systemctl reset-failed mysqld 2>/dev/null || true" >/dev/null 2>&1
+        fi
         bcm_ssh_exec "$ip" "systemctl restart proxysql 2>/dev/null || true" >/dev/null 2>&1
         bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/cron_notify.sh ] && /opt/bcm/bin/lib/cron_notify.sh assert 2>/dev/null || true" >/dev/null 2>&1
-        log_ok "  $name: локальный mysqld выключен, ProxySQL перезапущен, HA-Cron роль переприменена."
+        if [[ "$fz_db_ok" == "0" ]]; then
+            log_warn "  $name: mysqld ОСТАВЛЕН включённым (БД портала не на ProxySQL); ProxySQL/HA-Cron переприменены."
+        else
+            log_ok "  $name: локальный mysqld выключен, ProxySQL перезапущен, HA-Cron роль переприменена."
+        fi
     done
 }
 
