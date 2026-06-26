@@ -211,6 +211,16 @@ bcm_load_topology() {
     [[ $BCM_CONF_LOADED -eq 1 ]] && return 0
     bcm_conf_exists || return 1
 
+    # ⚠️ Сброс ассоциативных массивов перед перезаливкой. Индексные BCM_NODES_*
+    # ниже переприсваиваются целиком, а вот ассоциативные только ДОПОЛНЯЛИСЬ →
+    # удалённый из nodes-списка узел оставался в BCM_NODE_LAYER/IP/MAINT после
+    # reload (BCM_CONF_LOADED=0). Симптом: узел удалён (нет в таблице/обходе
+    # nodes-списка), но _cn_add_node по BCM_NODE_LAYER считал его существующим
+    # → «узел уже существует», повторно добавить нельзя.
+    BCM_NODE_IP=()
+    BCM_NODE_LAYER=()
+    BCM_NODE_MAINT=()
+
     BCM_CONF_VIP=$(bcm_get_vip)
 
     local layers=("lb" "web" "pxc" "s3")
@@ -377,6 +387,46 @@ bcm_conf_remove_node() {
     # бы через | tr | sed (rc0) → присваивание rc1 → set -e. Пустой список здесь валиден.
     new_nodes=$(echo "$current_nodes" | tr ',' '\n' | grep -v "^${node}$" | tr '\n' ',' | sed 's/,$//' || true)
     bcm_conf_set "layer.${layer}" "nodes" "$new_nodes"
+
+    # Удалить осиротевшие пер-нодовые ключи (иначе `<node>.ip` и пр. остаются в
+    # cluster.conf мусором; при повторном добавлении узла с тем же именем они бы
+    # «всплыли»). Все возможные пер-нодовые ключи слоёв.
+    local k
+    for k in ip maintenance priority role; do
+        bcm_conf_delete_key "layer.${layer}" "${node}.${k}"
+    done
+    BCM_CONF_LOADED=0
+}
+
+# ──── Удалить ключ из секции ──────────────────────────────────────────────────
+# bcm_conf_delete_key <section> <key> — no-op, если секции/ключа нет.
+bcm_conf_delete_key() {
+    local section="$1"
+    local key="$2"
+    local tmpfile
+    tmpfile=$(mktemp)
+    local in_section=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$section" ]]; then
+                in_section=1
+            else
+                in_section=0
+            fi
+            echo "$line" >> "$tmpfile"
+            continue
+        fi
+        # Внутри нужной секции пропускаем (удаляем) точное совпадение ключа.
+        if [[ $in_section -eq 1 ]] && \
+           [[ "$line" =~ ^[[:space:]]*${key}[[:space:]]*= ]]; then
+            continue
+        fi
+        echo "$line" >> "$tmpfile"
+    done < "$BCM_CONF_FILE"
+
+    cp "$tmpfile" "$BCM_CONF_FILE"
+    rm -f "$tmpfile"
     BCM_CONF_LOADED=0
 }
 
