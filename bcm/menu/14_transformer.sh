@@ -314,7 +314,7 @@ _tr_setup_ha() {
     bcm_section_header "HA-переключение Transformer (VIP + keepalived, active/standby)"
 
     bcm_info "Сервис переезжает на запасную web-ноду через плавающий VIP (как redis-сессии)."
-    bcm_warn "Вариант A: данные клиентов (документы/CRM) — в PXC/Диске/S3, в transformer их нет."
+    bcm_warn "Данные клиентов (документы/CRM) — в PXC/Диске/S3, в transformer их нет."
     bcm_warn "Задачи из очереди RabbitMQ в момент сбоя Bitrix перевыпустит (durable переживают рестарт,"
     bcm_warn "но не гибель ноды — это осознанный компромисс без кластера RabbitMQ)."
     echo
@@ -464,7 +464,7 @@ _tr_ha_status() {
 # ──── Меню ───────────────────────────────────────────────────────────────────
 # ──── Репликация стека Transformer на web-ноды ВНЕ пула bitrix-env ───────────
 # bx-sites -a configure_transformer ставит роль ТОЛЬКО на хост-член пула (у нас
-# web01). Для HA (вариант A: rabbitmq+transformer always-on на ОБЕИХ web + VIP)
+# web01). Для HA (rabbitmq+transformer always-on на ОБЕИХ web + VIP)
 # стек на остальных web разворачивается репликацией с источника (документированная
 # ручная процедура из CLAUDE.md, здесь автоматизирована). Файловые переносы идут
 # С ИСТОЧНИКА (у него /etc/bitrix-cluster/cluster_id_rsa до пиров); команды на пире —
