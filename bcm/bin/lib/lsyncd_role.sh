@@ -51,6 +51,12 @@ LOG_FILE="${LOG_FILE:-/var/log/bcm/lsyncd-role.log}"
 # LSYNCD_MAX_DELETE. Большие легитимные удаления — через контролируемую
 # реконсиляцию в single-режиме, а не «вживую».
 MAX_DELETE="${LSYNCD_MAX_DELETE:-1000}"
+# Кластер без S3: /upload зеркалится отдельным always-on инстансом на КАЖДОЙ
+# web-ноде (lsyncd_upload.sh) — загрузки приходят на любую ноду, а этот
+# односторонний источник→пиры инстанс их не покрывает. Тогда блок /upload отсюда
+# убирается, чтобы дерево не толкали два инстанса разом. Со слоем S3 (=0)
+# остаётся прежнее поведение: раздача статики модулей с источника.
+UPLOAD_MIRROR="${UPLOAD_MIRROR:-0}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o LogLevel=ERROR)
@@ -169,6 +175,9 @@ sync {
     delete = true,
     delay  = 5,
 }
+BLOCK
+            [[ "$UPLOAD_MIRROR" == "1" ]] && continue
+            cat <<BLOCK
 
 -- /upload: статика модулей (en/ru-хелп, картинки crm/main, лого sale и т.п.) —
 -- НЕ CFile-объекты, в S3 не уходят, но обязаны быть на ВСЕХ web (иначе round-robin

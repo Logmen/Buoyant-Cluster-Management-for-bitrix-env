@@ -82,6 +82,19 @@ _ls_show_status() {
         bcm_echo_color "$svc_color" "$svc_st"
         echo
 
+        # Зеркало /upload — отдельный always-on инстанс, есть только без слоя S3.
+        if ! bcm_s3_enabled; then
+            local mir_st
+            mir_st=$(bcm_ssh_service_status "$ip" "lsyncd-upload")
+            printf "  Зеркало /upload: "
+            case "$mir_st" in
+                active) bcm_echo_color "GREEN"  "$mir_st" ;;
+                failed) bcm_echo_color "RED"    "$mir_st" ;;
+                *)      bcm_echo_color "YELLOW" "${mir_st} (пункт 10 — включить)" ;;
+            esac
+            echo
+        fi
+
         local detail
         detail=$(bcm_ssh_exec_timeout "$ip" 10 \
             "systemctl status lsyncd --no-pager -l 2>/dev/null | head -10 || echo 'нет данных'" \
@@ -283,6 +296,14 @@ sync {
     delete = true,
     delay  = 5,
 }
+LSYNCD_SYNC
+)
+        # Без слоя S3 /upload зеркалит отдельный always-on инстанс на КАЖДОЙ
+        # web-ноде (пункт 10) — загрузки приходят на любую, а этот конфиг
+        # односторонний. Тогда блок ниже не генерируем: два инстанса толкали бы
+        # одно дерево. Логика синхронна с lsyncd_role.sh (UPLOAD_MIRROR).
+        bcm_s3_enabled || continue
+        lsyncd_conf+=$(cat <<LSYNCD_SYNC
 
 -- /upload: статика модулей (en/ru-хелп, картинки crm/main, лого sale) — НЕ CFile,
 -- в S3 не уходят, но обязаны быть на ВСЕХ web (иначе round-robin → 404).
@@ -560,6 +581,77 @@ _ls_roles() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Главное меню модуля
 # ─────────────────────────────────────────────────────────────────────────────
+# ──── Зеркало /upload между web-нодами (только для кластера без S3) ──────────
+# Основной lsyncd односторонний и живёт лишь на держателе web-VRRP, а загрузки
+# приходят на любую ноду. Отдельный always-on инстанс (lsyncd_upload.sh) на каждой
+# web-ноде раздаёт свой /upload пирам без --delete.
+_ls_upload_mirror() {
+    bcm_section_header "Зеркало /upload между web-нодами"
+
+    if bcm_s3_enabled; then
+        bcm_info "В кластере развёрнут слой S3: пользовательские файлы /upload хранятся"
+        bcm_info "в бакете и одинаково доступны всем web-нодам — зеркало не нужно."
+        bcm_info "Статику модулей из /upload раздаёт основной lsyncd с источника."
+        bcm_any_key
+        return
+    fi
+
+    bcm_warn "Слоя S3 нет: /upload лежит на дисках web-нод."
+    bcm_info "Зеркало раздаёт файлы, принятые ЛЮБОЙ нодой, на остальные (без --delete),"
+    bcm_info "иначе файл виден только принявшей ноде (404 при round-robin) и теряется"
+    bcm_info "вместе с ней. Удаления не зеркалятся — на пирах остаются сироты."
+    echo
+
+    local node ip st
+    for node in "${BCM_NODES_WEB[@]}"; do
+        [[ -z "$node" ]] && continue
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        st=$(bcm_ssh_exec_timeout "$ip" 10 \
+            "[ -x /opt/bcm/bin/lib/lsyncd_upload.sh ] && /opt/bcm/bin/lib/lsyncd_upload.sh --status || echo 'нет lsyncd_upload.sh'" \
+            2>/dev/null)
+        printf "    %-8s %s\n" "$node" "${st:-нет данных}"
+    done
+    echo
+
+    echo "    1. Включить/переприменить зеркало на всех web-нодах"
+    echo "    2. Выключить зеркало на всех web-нодах"
+    echo "    0. Назад"
+    echo
+    local ch
+    bcm_read_choice "Ваш выбор" ch
+    case "$ch" in
+        1) _ls_upload_mirror_apply "--configure" ;;
+        2)
+            bcm_warn "После выключения файл, загруженный на одну ноду, остальным виден НЕ будет."
+            if bcm_confirm "Выключить зеркало /upload?"; then
+                _ls_upload_mirror_apply "--disable"
+            else
+                bcm_info "Отменено."
+                bcm_any_key
+            fi
+            ;;
+        0|"") return ;;
+        *) bcm_warn "Неверный выбор: ${ch}"; bcm_any_key ;;
+    esac
+}
+
+_ls_upload_mirror_apply() {
+    local action="$1" node ip
+    for node in "${BCM_NODES_WEB[@]}"; do
+        [[ -z "$node" ]] && continue
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        bcm_info "  ${node} (${ip})..."
+        if bcm_ssh_exec_timeout "$ip" 120 "/opt/bcm/bin/lib/lsyncd_upload.sh ${action}" >/dev/null 2>&1; then
+            bcm_ok "  ${node}: готово."
+        else
+            bcm_error "  ${node}: не удалось (нет каталога upload, lsyncd или скрипта?)."
+        fi
+    done
+    bcm_any_key
+}
+
 _ls_menu() {
     while true; do
         bcm_section_header "Синхронизация файлов (lsyncd)"
@@ -575,6 +667,7 @@ _ls_menu() {
             "7.  Показать лог lsyncd"
             "8.  Проверить синхронизацию (счётчик файлов)"
             "9.  Роли источника (авто-failover) / назначить источник"
+            "10. Зеркало /upload между web-нодами (кластер без S3)"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -592,6 +685,7 @@ _ls_menu() {
             7) _ls_show_log                 ;;
             8) _ls_check_sync               ;;
             9) _ls_roles                    ;;
+            10) _ls_upload_mirror           ;;
             0) return 0                     ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

@@ -1,5 +1,8 @@
 # Секреты и ответы установки — НЕ коммитить
 install_answers.conf
+# Копии файла ответов (бэкапы перед правкой) — в них те же пароли
+install_answers.conf.bak-*
+install_answers.conf.*.bak
 *_id_rsa
 *_id_rsa.pub
 temp_id_rsa

@@ -213,15 +213,16 @@ s3_enabled() {
 # Последствия установки без S3 — оператор должен их видеть при каждом прогоне.
 warn_s3_disabled() {
     log_warn "Слой S3 не задан — кластер ставится БЕЗ объектного хранилища."
-    log_warn "  • /upload остаётся на дисках web-нод. lsyncd раздаёт /upload только"
-    log_warn "    С ИСТОЧНИКА и без --delete, поэтому файл, загруженный пользователем"
-    log_warn "    на НЕ-источник, остальным нодам не виден (404 при round-robin)."
+    log_warn "  • /upload остаётся на дисках web-нод. Файлы зеркалятся между нодами"
+    log_warn "    отдельным lsyncd-инстансом (configure_lsyncd_upload_mirror), но это"
+    log_warn "    репликация, а не бэкап: удаления не зеркалятся, а файл, принятый за"
+    log_warn "    секунды до отказа ноды, доехать до пиров не успевает."
     log_warn "  • Резервное копирование не настраивается: нет целевого хранилища"
     log_warn "    (меню 13 сообщит об этом, таймеры bcm-backup-* не ставятся)."
     log_warn "  • Меню 11 «Облачное хранилище /upload» будет недоступно."
-    log_info "Варианты: добавить 2+ S3-нод и повторить install.sh; либо держать портал"
-    log_info "в режиме единой активной ноды (меню 1 → 7), где весь трафик идёт на одну"
-    log_info "web-ноду; бэкапы в этом случае организуйте внешними средствами."
+    log_info "Варианты: добавить 2+ S3-нод и повторить install.sh (тогда /upload уходит"
+    log_info "в бакет, а зеркало снимается автоматически); бэкапы до этого — внешними"
+    log_info "средствами."
 }
 
 # ──── Утилиты валидации ──────────────────────────────────────────────────────
@@ -2476,6 +2477,11 @@ configure_lsyncd_role() {
     web_ips_list="${web_ips_list% }"
     local site_path="/home/bitrix/www"
     local primary="${WEB_NODES[0]}"
+    # Без S3 /upload зеркалится отдельным always-on инстансом на каждой web-ноде
+    # (configure_lsyncd_upload_mirror) — тогда основной конфиг роли блок /upload не
+    # генерирует, иначе дерево толкали бы два инстанса разом.
+    local upload_mirror=0
+    s3_enabled || upload_mirror=1
 
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
@@ -2495,6 +2501,7 @@ SSH_KEY="/etc/bitrix-cluster/cluster_id_rsa"
 LSYNCD_CONF="/etc/lsyncd/lsyncd.conf"
 CLUSTER_CONF="/etc/bitrix-cluster/cluster.conf"
 LOG_FILE="/var/log/bcm/lsyncd-role.log"
+UPLOAD_MIRROR="${upload_mirror}"
 ENV
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /opt/bcm/bin/lib /var/log/bcm /etc/lsyncd /var/log/lsyncd /etc/bitrix-cluster"
         bcm_ssh_copy_file "$local_env" "$ip" "/etc/bitrix-cluster/lsyncd-role.env"
@@ -2518,6 +2525,51 @@ ENV
         done
     fi
     log_ok "Авто-роль источника lsyncd настроена."
+}
+
+# ──── Зеркало /upload между web-нодами (кластер БЕЗ S3) ──────────────────────
+# ⚠️⚠️ Со слоем S3 пользовательские файлы лежат в бакете и одинаково доступны всем
+# web-нодам. Без S3 файл физически остаётся на ноде, принявшей загрузку: остальные
+# отдают 404 (LB балансирует round-robin), а отказ этой ноды делает файл
+# недоступным, хотя запись b_file — в общей БД. Основной lsyncd тут не помогает:
+# он односторонний (источник→пиры) и работает только на держателе web-VRRP, а
+# загрузки приходят на ЛЮБУЮ ноду. Поэтому на КАЖДОЙ web-ноде поднимается
+# отдельный always-on инстанс lsyncd, зеркалящий /upload на пиров (delete=false,
+# --update). Подробности и компромиссы — в шапке bin/lib/lsyncd_upload.sh.
+# Вызывать ПОСЛЕ configure_lsyncd_role (нужен lsyncd-role.env) и deploy_bcm.
+configure_lsyncd_upload_mirror() {
+    local name ip
+    if s3_enabled; then
+        # Идемпотентность: если S3 добавили позже, зеркало снимается — контент
+        # пользовательских файлов уходит в бакет, дублировать его по нодам не нужно.
+        log_info "Слой S3 развёрнут — зеркало /upload между web-нодами не требуется."
+        [[ "$DRY_RUN" -eq 1 ]] && return 0
+        for name in "${WEB_NODES[@]}"; do
+            ip="${WEB_IPS[$name]}"
+            bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/lsyncd_upload.sh ] && /opt/bcm/bin/lib/lsyncd_upload.sh --disable" >/dev/null 2>&1 || true
+        done
+        return 0
+    fi
+
+    log_info "Настройка зеркала /upload между web-нодами (слоя S3 нет)..."
+    for name in "${WEB_NODES[@]}"; do
+        ip="${WEB_IPS[$name]}"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            log_info "[DRY RUN] зеркало /upload на $name ($ip): lsyncd_upload.sh --configure"
+            continue
+        fi
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/bin/lib/lsyncd_upload.sh" "$ip" "/opt/bcm/bin/lib/lsyncd_upload.sh"
+        bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/lsyncd_upload.sh"
+        if bcm_ssh_exec_logged "$name" "$ip" "/opt/bcm/bin/lib/lsyncd_upload.sh --configure"; then
+            log_ok "  $name: зеркало /upload включено."
+        else
+            # Портала может ещё не быть (нет /home/bitrix/www/upload) — не повод
+            # валить установку: зеркало включится повторным прогоном или из меню 6.
+            log_warn "  $name: зеркало /upload не включилось (нет каталога upload или lsyncd?)."
+            log_info "  Повторите после развёртывания портала: меню 6 → синхронизация файлов."
+        fi
+    done
+    log_ok "Зеркало /upload настроено."
 }
 
 # ──── Общий HA push-redis (active-active Push&Pull) ──────────────────────────
@@ -3418,6 +3470,8 @@ main() {
     configure_backup
 
     configure_lsyncd_role
+
+    configure_lsyncd_upload_mirror
 
     configure_push_redis
 
