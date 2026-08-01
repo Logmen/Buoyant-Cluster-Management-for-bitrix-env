@@ -1575,8 +1575,8 @@ SQL
         peer_ip=$(_bcm_peers_ml "$name" "${lb_pairs[@]}")
 
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | grep default | awk '{print \$5}' | head -1" | tr -d '[:space:]')
-        [[ -z "$iface" ]] && iface="eth0"
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        [[ -z "$iface" ]] && iface="ens18"
 
         sed -i "s/__NODE_NAME__/${name}/g" "$local_keepalived_cfg"
         sed -i "s/__VRRP_STATE__/${state}/g" "$local_keepalived_cfg"
@@ -1776,8 +1776,8 @@ EOF
         peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
 
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | grep default | awk '{print \$5}' | head -1" | tr -d '[:space:]')
-        [[ -z "$iface" ]] && iface="eth0"
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        [[ -z "$iface" ]] && iface="ens18"
 
         sed -i "s/__NODE_NAME__/${name}/g" "$local_keepalived_web"
         sed -i "s/__VRRP_STATE__/${state}/g" "$local_keepalived_web"
@@ -1986,8 +1986,8 @@ UNIT
 
         # 4. VRRP-инстанс keepalived для VIP сессий (добавляем к keepalived.conf)
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | grep default | awk '{print \$5}' | head -1" | tr -d '[:space:]')
-        [[ -z "$iface" ]] && iface="eth0"
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        [[ -z "$iface" ]] && iface="ens18"
 
         local state="BACKUP" priority="100" peer_ip=""
         if [[ "$name" == "$master_node" ]]; then
