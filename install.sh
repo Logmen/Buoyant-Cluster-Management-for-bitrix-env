@@ -1184,7 +1184,34 @@ configure_firewall_for_node() {
                 bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=http; firewall-cmd --permanent --add-service=https; ${lb_s3_port}firewall-cmd --permanent --add-port=6033/tcp; firewall-cmd --permanent --add-port=${ACME_HTTP_PORT}/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
                 ;;
             web)
-                bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=http; firewall-cmd --permanent --add-service=https; firewall-cmd --permanent --add-port=6032-6033/tcp; firewall-cmd --permanent --add-port=8010-8015/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
+                # ⚠️⚠️ HTTP/HTTPS web-ноды НЕ открываем всему миру: портал обязан
+                # приходить через LB. Прямое обращение по IP ноды обходит HAProxy и
+                # ломает инварианты кластера — нет sticky-cookie BXSRV (многошаговый
+                # загрузчик Диска/CRM рвётся), нет закрепления /bitrix/admin на
+                # источнике lsyncd (правки уедут на не-источник и будут затёрты
+                # синхронизацией), нет принудительного HTTPS. Плюс ноды с публичным
+                # IP непрерывно сканируются ботами (ловили вживую: запросы /.env.bak
+                # прямо по IP web-нод, мимо балансировщика).
+                # Разрешаем 80/443 ТОЛЬКО с LB (трафик портала + health-check'и) и с
+                # соседних web (Transformer: workerd качает исходники по http через
+                # TRANSFORMER_VIP, который живёт на web-ноде). Локальные self-check'и
+                # Bitrix идут на 127.0.0.1 (домен портала в /etc/hosts) — loopback
+                # фаерволом не фильтруется.
+                # ⚠️ Снимаем и service http/https (их добавлял BCM), и порты 80/443
+                # (их добавляет установщик bitrix-env) — иначе ограничение не вступит
+                # в силу. Шаг идемпотентен: повторный прогон install.sh вернёт правила,
+                # если ansible bitrix-env снова откроет порты.
+                local fw_web_allow="" src
+                for src in "${LB_NODES[@]}"; do
+                    fw_web_allow="${fw_web_allow}firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${LB_IPS[$src]}/32 port port=80 protocol=tcp accept'; "
+                    fw_web_allow="${fw_web_allow}firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${LB_IPS[$src]}/32 port port=443 protocol=tcp accept'; "
+                done
+                for src in "${WEB_NODES[@]}"; do
+                    [[ "$src" == "$node_name" ]] && continue
+                    fw_web_allow="${fw_web_allow}firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${WEB_IPS[$src]}/32 port port=80 protocol=tcp accept'; "
+                    fw_web_allow="${fw_web_allow}firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${WEB_IPS[$src]}/32 port port=443 protocol=tcp accept'; "
+                done
+                bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --remove-service=http 2>/dev/null; firewall-cmd --permanent --remove-service=https 2>/dev/null; firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null; firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null; ${fw_web_allow}firewall-cmd --permanent --add-port=6032-6033/tcp; firewall-cmd --permanent --add-port=8010-8015/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
                 ;;
             pxc)
                 bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=mysql; firewall-cmd --permanent --add-port=4567/tcp; firewall-cmd --permanent --add-port=4567/udp; firewall-cmd --permanent --add-port=4568/tcp; firewall-cmd --permanent --add-port=4444/tcp; firewall-cmd --reload"
