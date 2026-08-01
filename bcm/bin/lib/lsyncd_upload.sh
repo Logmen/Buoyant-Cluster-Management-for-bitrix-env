@@ -164,6 +164,12 @@ _catchup_from_peers() {
             log "catch-up /upload: пир ${ip} недоступен — пропуск."
             continue
         fi
+        # У пира каталога может ещё не быть (портал не развёрнут, зеркало включается
+        # на нодах по очереди) — это норма, а не сбой: тянуть нечего.
+        if ! timeout 8 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "root@${ip}" "[ -d '${SITE_PATH}/upload' ]" 2>/dev/null; then
+            log "catch-up /upload: у пира ${ip} каталога upload ещё нет — пропуск."
+            continue
+        fi
         log "catch-up /upload: тяну свежее с ${ip}..."
         rsync -az --update "${UPLOAD_EXCLUDES[@]}" \
             -e "ssh ${SSH_OPTS[*]} -i ${SSH_KEY}" \
@@ -174,9 +180,21 @@ _catchup_from_peers() {
 }
 
 configure() {
-    if [[ ! -d "${SITE_PATH}/upload" ]]; then
-        log "Каталог ${SITE_PATH}/upload не найден — портал ещё не развёрнут, зеркало не включаю."
+    if [[ ! -d "${SITE_PATH}" ]]; then
+        log "Каталог сайта ${SITE_PATH} не найден — bitrix-env не развёрнут, зеркало не включаю."
         return 1
+    fi
+    # ⚠️ В скелете bitrix-env каталога upload ещё нет — он появляется при установке
+    # портала. Создаём его заранее (владелец/права — от каталога сайта) и поднимаем
+    # зеркало сразу: иначе защита включилась бы только после ручного захода в меню
+    # 6 → 10 уже ПОСЛЕ деплоя портала, то есть ровно тогда, когда первые загрузки
+    # пользователей уже могли осесть на одной ноде.
+    if [[ ! -d "${SITE_PATH}/upload" ]]; then
+        mkdir -p "${SITE_PATH}/upload" 2>>"$LOG_FILE" || {
+            log "ОШИБКА: не удалось создать ${SITE_PATH}/upload."; return 1; }
+        chown --reference="${SITE_PATH}" "${SITE_PATH}/upload" 2>/dev/null || true
+        chmod --reference="${SITE_PATH}" "${SITE_PATH}/upload" 2>/dev/null || true
+        log "Создан ${SITE_PATH}/upload (портал ещё не развёрнут) — зеркало включаю заранее."
     fi
     if [[ -z "$(_other_peers)" ]]; then
         log "Нет web-пиров кроме себя — зеркало не нужно."

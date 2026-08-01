@@ -1136,6 +1136,13 @@ gpgcheck=1
 gpgkey=https://repo.proxysql.com/ProxySQL/repo_pub_key
 enabled=1
 EOF"
+            # ⚠️ lsyncd есть ТОЛЬКО в EPEL: в базовых репозиториях RHEL/Oracle Linux 9
+            # (baseos/appstream/UEK) его нет — «No matching Packages», и установка пакетов
+            # web-ноды падала бы целиком (проверено вживую на Oracle Linux 9.8). Имя пакета
+            # репозитория различается: Oracle Linux — oracle-epel-release-el9 (подключает
+            # ol9_developer_EPEL), RHEL/Alma/Rocky — epel-release; последний фолбэк — rpm с
+            # dl.fedoraproject.org. Идемпотентно: если EPEL уже есть, шаг ничего не делает.
+            bcm_ssh_exec_logged "$name" "$ip" "rpm -q oracle-epel-release-el9 >/dev/null 2>&1 || rpm -q epel-release >/dev/null 2>&1 || dnf install -y oracle-epel-release-el9 || dnf install -y epel-release || dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
             bcm_ssh_exec_logged "$name" "$ip" "dnf install -y proxysql lsyncd keepalived || yum install -y proxysql lsyncd keepalived"
         fi
     done
@@ -2552,6 +2559,7 @@ configure_lsyncd_upload_mirror() {
     fi
 
     log_info "Настройка зеркала /upload между web-нодами (слоя S3 нет)..."
+    local ok_count=0
     for name in "${WEB_NODES[@]}"; do
         ip="${WEB_IPS[$name]}"
         if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -2562,14 +2570,23 @@ configure_lsyncd_upload_mirror() {
         bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/lsyncd_upload.sh"
         if bcm_ssh_exec_logged "$name" "$ip" "/opt/bcm/bin/lib/lsyncd_upload.sh --configure"; then
             log_ok "  $name: зеркало /upload включено."
+            ok_count=$((ok_count+1))
         else
-            # Портала может ещё не быть (нет /home/bitrix/www/upload) — не повод
-            # валить установку: зеркало включится повторным прогоном или из меню 6.
-            log_warn "  $name: зеркало /upload не включилось (нет каталога upload или lsyncd?)."
-            log_info "  Повторите после развёртывания портала: меню 6 → синхронизация файлов."
+            # Не повод валить установку (нет каталога сайта — bitrix-env не встал),
+            # но и рапортовать успех нельзя: файлы останутся привязаны к одной ноде.
+            log_warn "  $name: зеркало /upload НЕ включилось (нет каталога сайта или lsyncd?)."
         fi
     done
-    log_ok "Зеркало /upload настроено."
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    if [[ "$ok_count" -eq ${#WEB_NODES[@]} ]]; then
+        log_ok "Зеркало /upload настроено на всех web-нодах (${ok_count}/${#WEB_NODES[@]})."
+    elif [[ "$ok_count" -gt 0 ]]; then
+        log_warn "Зеркало /upload включено ЧАСТИЧНО (${ok_count}/${#WEB_NODES[@]}) — файлы с невключённых нод пирам не разъедутся."
+        log_info "Почините недоступные ноды и переприменте: меню 6 → 10."
+    else
+        log_warn "Зеркало /upload НЕ включено ни на одной ноде: файлы останутся на той ноде, что приняла загрузку."
+        log_info "Переприменте после развёртывания портала: меню 6 → 10."
+    fi
 }
 
 # ──── Общий HA push-redis (active-active Push&Pull) ──────────────────────────
