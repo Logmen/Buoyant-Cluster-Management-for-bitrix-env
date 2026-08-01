@@ -26,6 +26,19 @@ if ! bcm_conf_exists; then
 fi
 bcm_load_topology
 
+# Хранилище копий — MinIO кластера; слой S3 опционален, и без него install.sh не
+# настраивает ни бакет, ни таймеры. Показывать статус/запуски было бы обманом.
+if ! bcm_s3_enabled; then
+    bcm_section_header "Резервное копирование"
+    bcm_error "Слой S3 в кластере не развёрнут — резервное копирование не настроено."
+    bcm_info "Хранилище копий (бакет с versioning + lifecycle) живёт в MinIO кластера:"
+    bcm_info "без S3-нод ни бакета, ни таймеров bcm-backup-* не существует."
+    bcm_info "Чтобы включить: добавьте 2+ S3-нод в файл ответов и повторите install.sh."
+    bcm_warn "До этого копии портала и БД делайте внешними средствами."
+    bcm_any_key
+    exit 0
+fi
+
 BK_LIB="/opt/bcm/bin/lib/bcm_backup.sh"
 BK_BUCKET="$(bcm_conf_get backup bucket 2>/dev/null || echo bitrix-backups)"
 BK_RETENTION="$(bcm_conf_get backup retention_days 2>/dev/null || echo 14)"

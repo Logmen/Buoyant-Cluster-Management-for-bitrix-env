@@ -137,7 +137,10 @@ backend acme_backend
     # server __NODE_NAME__ __NODE_IP__:__ACME_PORT__
 __BCM_ACME_BACKENDS__
 
+# bcm:s3-begin
 # ──── Frontend: S3 MinIO :9000 ───────────────────────────────────────────────
+# Блок до bcm:s3-end генератор вырезает целиком, если слой S3 в кластере не
+# развёрнут (он опционален) — иначе LB слушал бы :9000 с пустым бэкендом.
 frontend s3_frontend
     bind *:9000
     mode tcp
@@ -157,3 +160,4 @@ backend s3_backend
     # Строки для каждой s3-ноды добавляются генератором (первая — primary, остальные backup):
     # server __NODE_NAME__ __NODE_IP__:__S3_PORT__ check inter 5s fall 3 rise 2 [backup]
 __BCM_S3_NODES_BACKENDS__
+# bcm:s3-end

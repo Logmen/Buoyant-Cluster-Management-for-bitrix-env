@@ -28,6 +28,18 @@ if ! bcm_conf_exists; then
 fi
 bcm_load_topology
 
+# Слой S3 опционален (install.sh допускает кластер без него) — без MinIO облачное
+# хранилище /upload подключать не к чему.
+if ! bcm_s3_enabled; then
+    bcm_section_header "Облачное хранилище /upload (S3)"
+    bcm_error "Слой S3 в кластере не развёрнут — облачное хранилище недоступно."
+    bcm_info "Пользовательские файлы /upload лежат на дисках web-нод: файл, загруженный"
+    bcm_info "на НЕ-источник lsyncd, остальным нодам не виден (404 при round-robin)."
+    bcm_info "Чтобы включить: добавьте 2+ S3-нод в файл ответов и повторите install.sh."
+    bcm_any_key
+    exit 0
+fi
+
 # ──── Параметры из [s3_upload] ───────────────────────────────────────────────
 S3U_BUCKET="$(bcm_conf_get s3_upload bucket 2>/dev/null || echo bitrix-upload)"
 S3U_ENDPOINT="$(bcm_conf_get s3_upload endpoint 2>/dev/null || echo '')"

@@ -126,6 +126,14 @@ bcm_get_proxysql_admin_pass() { bcm_conf_get "proxysql" "admin_password"; }
 # ──── MinIO параметры ────────────────────────────────────────────────────────
 bcm_get_s3_port() { bcm_conf_get "layer.s3" "port"; }
 
+# Слой S3 опционален (install.sh допускает 0 нод): без него нет ни облачного
+# /upload, ни цели для бэкапов. Меню, завязанные на S3, обязаны это проверять.
+bcm_s3_enabled() {
+    local n
+    n="$(bcm_get_nodes "s3" 2>/dev/null || echo '')"
+    [[ -n "${n// }" ]]
+}
+
 # ──── SSH ключ кластера ───────────────────────────────────────────────────────
 bcm_get_ssh_key() {
     bcm_conf_get "ssh" "private_key"

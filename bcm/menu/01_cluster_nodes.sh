@@ -172,7 +172,7 @@ _cn_add_node() {
     echo "    1. lb   — балансировщик нагрузки (HAProxy + Keepalived)"
     echo "    2. web  — веб-узел (bitrix-env + ProxySQL)"
     echo "    3. pxc  — узел базы данных (Percona XtraDB Cluster)"
-    echo "    4. s3   — хранилище объектов (MinIO)"
+    echo "    4. s3   — хранилище объектов (MinIO), слой опционален"
     echo
 
     local layer_choice
@@ -191,6 +191,15 @@ _cn_add_node() {
             return
             ;;
     esac
+
+    # S3 разворачивается только парами и более (install.sh отвергает ровно одну ноду:
+    # всё хранилище файлов портала осталось бы без резерва). Предупреждаем заранее,
+    # чтобы оператор не упёрся в это на следующем прогоне install.sh.
+    if [[ "$layer" == "s3" ]] && ! bcm_s3_enabled; then
+        echo
+        bcm_warn "Слой S3 сейчас пуст. install.sh принимает 0 либо 2+ S3-нод —"
+        bcm_warn "одна нода будет отвергнута: добавьте сразу вторую."
+    fi
 
     # Имя узла
     local node_name
@@ -384,7 +393,14 @@ _cn_remove_node() {
     esac
     if [[ "$remaining" -lt "$min_count" ]]; then
         bcm_error "Нельзя удалить '${target_node}': в слое '${target_layer}' останется ${remaining}, минимум — ${min_count}."
-        bcm_info "Конфигурация минимальна. Сначала добавьте узел в слой '${target_layer}'."
+        if [[ "$target_layer" == "s3" ]]; then
+            # Слой S3 опционален, но убирается только целиком: поштучное удаление
+            # прошло бы через одну ноду — хранилище файлов портала без резерва.
+            bcm_info "Слой S3 отключается целиком: уберите все S3-ноды из install_answers.conf"
+            bcm_info "и повторите install.sh (/upload и бэкапы в S3 при этом перестанут работать)."
+        else
+            bcm_info "Конфигурация минимальна. Сначала добавьте узел в слой '${target_layer}'."
+        fi
         bcm_any_key
         return
     fi

@@ -200,6 +200,30 @@ WEB_NODES=()
 PXC_NODES=()
 S3_NODES=()
 
+# ──── Слой S3 — опционален ───────────────────────────────────────────────────
+# Пустой S3_NODES = кластер разворачивается без объектного хранилища: MinIO не
+# ставится, S3-фронт HAProxy не рендерится, бэкапы в S3 не настраиваются, /upload
+# остаётся на дисках web-нод. Допустимы только 0 (выключен) или 2+ нод (site
+# replication); одна нода дала бы хранилище без отказоустойчивости — единственная
+# точка отказа для ВСЕХ пользовательских файлов портала.
+s3_enabled() {
+    [[ ${#S3_NODES[@]} -gt 0 ]]
+}
+
+# Последствия установки без S3 — оператор должен их видеть при каждом прогоне.
+warn_s3_disabled() {
+    log_warn "Слой S3 не задан — кластер ставится БЕЗ объектного хранилища."
+    log_warn "  • /upload остаётся на дисках web-нод. lsyncd раздаёт /upload только"
+    log_warn "    С ИСТОЧНИКА и без --delete, поэтому файл, загруженный пользователем"
+    log_warn "    на НЕ-источник, остальным нодам не виден (404 при round-robin)."
+    log_warn "  • Резервное копирование не настраивается: нет целевого хранилища"
+    log_warn "    (меню 13 сообщит об этом, таймеры bcm-backup-* не ставятся)."
+    log_warn "  • Меню 11 «Облачное хранилище /upload» будет недоступно."
+    log_info "Варианты: добавить 2+ S3-нод и повторить install.sh; либо держать портал"
+    log_info "в режиме единой активной ноды (меню 1 → 7), где весь трафик идёт на одну"
+    log_info "web-ноду; бэкапы в этом случае организуйте внешними средствами."
+}
+
 # ──── Утилиты валидации ──────────────────────────────────────────────────────
 valid_ip() {
     local ip="$1"
@@ -523,56 +547,64 @@ collect_topology_interactive() {
         fi
     done
 
-    # 5. S3 ноды
+    # 5. S3 ноды (слой опционален: 0 — без объектного хранилища)
     local count_s3=0
+    echo
+    log_info "Слой S3 (MinIO) — объектное хранилище для /upload и бэкапов. Он ОПЦИОНАЛЕН:"
+    log_info "  без него /upload остаётся на дисках web-нод, а бэкапы в S3 не настраиваются"
+    log_info "  (подробности — в предупреждении после ввода топологии)."
     while true; do
-        read -r -p "Введите количество S3-нод (минимум 2): " count_s3
-        if [[ "$count_s3" =~ ^[0-9]+$ && "$count_s3" -ge 2 ]]; then
+        read -r -p "Введите количество S3-нод (0 — без S3, иначе минимум 2): " count_s3
+        if [[ "$count_s3" =~ ^[0-9]+$ && ( "$count_s3" -eq 0 || "$count_s3" -ge 2 ) ]]; then
             break
         else
-            log_warn "Минимум 2 S3-ноды необходимы для отказоустойчивости."
+            log_warn "Допустимо 0 (слой отключён) либо 2+ (site replication для отказоустойчивости)."
         fi
     done
-    for ((i=1; i<=count_s3; i++)); do
-        local name ip
-        read -r -p "Введите имя для S3-ноды #$i (например, s3-0$i): " name
-        while true; do
-            read -r -p "Введите IP для S3-ноды $name: " ip
-            if valid_ip "$ip"; then
-                S3_IPS["$name"]="$ip"
-                S3_NODES+=("$name")
-                break
-            else
-                log_warn "Неверный формат IP-адреса."
-            fi
+    if [[ "$count_s3" -eq 0 ]]; then
+        log_warn "Слой S3 отключён — вопросы про MinIO пропущены."
+    else
+        for ((i=1; i<=count_s3; i++)); do
+            local name ip
+            read -r -p "Введите имя для S3-ноды #$i (например, s3-0$i): " name
+            while true; do
+                read -r -p "Введите IP для S3-ноды $name: " ip
+                if valid_ip "$ip"; then
+                    S3_IPS["$name"]="$ip"
+                    S3_NODES+=("$name")
+                    break
+                else
+                    log_warn "Неверный формат IP-адреса."
+                fi
+            done
         done
-    done
 
-    read -r -p "Введите порт MinIO (по умолчанию 9000): " S3_PORT
-    S3_PORT="${S3_PORT:-9000}"
+        read -r -p "Введите порт MinIO (по умолчанию 9000): " S3_PORT
+        S3_PORT="${S3_PORT:-9000}"
 
-    read -r -p "Введите access key MinIO (root user, по умолчанию minioadmin): " S3_ACCESS_KEY
-    S3_ACCESS_KEY="${S3_ACCESS_KEY:-minioadmin}"
+        read -r -p "Введите access key MinIO (root user, по умолчанию minioadmin): " S3_ACCESS_KEY
+        S3_ACCESS_KEY="${S3_ACCESS_KEY:-minioadmin}"
 
-    read -r -s -p "Введите secret key MinIO (Enter — сгенерировать случайный): " S3_SECRET_KEY
-    echo
-    if [[ -z "$S3_SECRET_KEY" ]]; then
-        S3_SECRET_KEY="$(_bcm_rand_hex 16)"
-        log_info "Сгенерирован случайный secret key MinIO."
-    fi
+        read -r -s -p "Введите secret key MinIO (Enter — сгенерировать случайный): " S3_SECRET_KEY
+        echo
+        if [[ -z "$S3_SECRET_KEY" ]]; then
+            S3_SECRET_KEY="$(_bcm_rand_hex 16)"
+            log_info "Сгенерирован случайный secret key MinIO."
+        fi
 
-    read -r -p "Введите S3 vhost-домен для модуля «Облачные хранилища» (по умолчанию ${S3_VHOST_DOMAIN}): " _s3_vh
-    S3_VHOST_DOMAIN="${_s3_vh:-$S3_VHOST_DOMAIN}"
+        read -r -p "Введите S3 vhost-домен для модуля «Облачные хранилища» (по умолчанию ${S3_VHOST_DOMAIN}): " _s3_vh
+        S3_VHOST_DOMAIN="${_s3_vh:-$S3_VHOST_DOMAIN}"
 
-    # Опционально: выделенный диск под хранилище MinIO (общий для всех S3-нод).
-    read -r -p "Выделенный диск под хранилище MinIO на S3-нодах (напр. /dev/sdb; Enter — корневая ФС): " S3_DATA_DISK
-    if [[ -n "$S3_DATA_DISK" ]]; then
-        read -r -p "  Точка монтирования (по умолчанию ${S3_DATA_MOUNT}): " _s3_mnt
-        S3_DATA_MOUNT="${_s3_mnt:-$S3_DATA_MOUNT}"
-        read -r -p "  Файловая система xfs|ext4 (по умолчанию ${S3_DATA_FS}): " _s3_fs
-        S3_DATA_FS="${_s3_fs:-$S3_DATA_FS}"
-        read -r -p "  Форматировать, даже если на диске уже есть ФС? (УНИЧТОЖИТ данные) [y/N]: " _s3_force
-        [[ "$_s3_force" =~ ^[Yy]$ ]] && S3_DATA_DISK_FORCE="1" || S3_DATA_DISK_FORCE="0"
+        # Опционально: выделенный диск под хранилище MinIO (общий для всех S3-нод).
+        read -r -p "Выделенный диск под хранилище MinIO на S3-нодах (напр. /dev/sdb; Enter — корневая ФС): " S3_DATA_DISK
+        if [[ -n "$S3_DATA_DISK" ]]; then
+            read -r -p "  Точка монтирования (по умолчанию ${S3_DATA_MOUNT}): " _s3_mnt
+            S3_DATA_MOUNT="${_s3_mnt:-$S3_DATA_MOUNT}"
+            read -r -p "  Файловая система xfs|ext4 (по умолчанию ${S3_DATA_FS}): " _s3_fs
+            S3_DATA_FS="${_s3_fs:-$S3_DATA_FS}"
+            read -r -p "  Форматировать, даже если на диске уже есть ФС? (УНИЧТОЖИТ данные) [y/N]: " _s3_force
+            [[ "$_s3_force" =~ ^[Yy]$ ]] && S3_DATA_DISK_FORCE="1" || S3_DATA_DISK_FORCE="0"
+        fi
     fi
 
     read -r -p "Введите порт ProxySQL (по умолчанию 6033): " PROXYSQL_PORT
@@ -896,6 +928,13 @@ hg_read = 20
 hg_backup_write = 11
 hg_offline = 30
 
+EOF
+
+    # [s3_upload] и [backup] — только когда слой S3 развёрнут. Без него ни бакета
+    # загрузок, ни цели для бэкапов не существует, а «мёртвые» параметры ввели бы
+    # в заблуждение меню 11/13 и bcm_backup.sh.
+    if s3_enabled; then
+        cat >> "$target_conf" <<EOF
 [s3_upload]
 # Бакет MinIO для пользовательских файлов Bitrix (/upload). Регистрируется в
 # модуле «Облачные хранилища» сидером BCM (меню 7 → Облачное хранилище /upload).
@@ -917,6 +956,17 @@ use_https = Y
 vhost_domain = ${S3_VHOST_DOMAIN}
 api_host = ${S3_VHOST_DOMAIN}:${S3_PORT}
 
+EOF
+    else
+        cat >> "$target_conf" <<EOF
+# Слой S3 не развёрнут: секций [s3_upload] и [backup] нет. /upload лежит на дисках
+# web-нод, бэкапы в S3 не настроены. Чтобы включить — добавьте 2+ S3-нод в файл
+# ответов и повторите install.sh.
+
+EOF
+    fi
+
+    cat >> "$target_conf" <<EOF
 [ssl]
 # TLS терминируется на HAProxy (LB): один pem на оба LB в /etc/haproxy/certs/.
 # mode: none | custom | letsencrypt (меняется меню 12). domain по умолчанию = домен портала.
@@ -929,6 +979,10 @@ acme_ca = letsencrypt
 # acme_method: http (HTTP-01 через acme_backend) | dns_cf (DNS-01 Cloudflare, токен из меню 12)
 acme_method = http
 
+EOF
+
+    if s3_enabled; then
+        cat >> "$target_conf" <<EOF
 [backup]
 # Бэкапы в MinIO кластера (versioning + lifecycle). Креды/endpoint — из [s3_upload].
 # enc_key — шифрование conf-архивов (внутри пароли/ключи); retention применяет MinIO.
@@ -936,6 +990,10 @@ bucket = ${BACKUP_BUCKET}
 retention_days = ${BACKUP_RETENTION_DAYS}
 enc_key = ${BACKUP_ENC_KEY}
 
+EOF
+    fi
+
+    cat >> "$target_conf" <<EOF
 [ssh]
 private_key = /etc/bitrix-cluster/cluster_id_rsa
 EOF
@@ -1112,7 +1170,10 @@ configure_firewall_for_node() {
             lb)
                 # 8402 — ответчик ACME HTTP-01 (acme.sh --standalone): на него ходит
                 # HAProxy соседнего LB; наружу отдаёт только challenge-токены (безвредно).
-                bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=http; firewall-cmd --permanent --add-service=https; firewall-cmd --permanent --add-port=9000/tcp; firewall-cmd --permanent --add-port=6033/tcp; firewall-cmd --permanent --add-port=${ACME_HTTP_PORT}/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
+                # 9000 (S3-фронт) — только если слой S3 развёрнут: он опционален.
+                local lb_s3_port=""
+                s3_enabled && lb_s3_port="firewall-cmd --permanent --add-port=9000/tcp; "
+                bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=http; firewall-cmd --permanent --add-service=https; ${lb_s3_port}firewall-cmd --permanent --add-port=6033/tcp; firewall-cmd --permanent --add-port=${ACME_HTTP_PORT}/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
                 ;;
             web)
                 bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=http; firewall-cmd --permanent --add-service=https; firewall-cmd --permanent --add-port=6032-6033/tcp; firewall-cmd --permanent --add-port=8010-8015/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
@@ -1148,6 +1209,7 @@ configure_firewall_for_node() {
 # верифицируют без --insecure). Идемпотентно: CA/серт создаются один раз и переиспользуются.
 _bcm_s3_tls_dir="/etc/bitrix-cluster/s3-tls"
 configure_s3_tls() {
+    s3_enabled || return 0
     [[ "$DRY_RUN" -eq 1 ]] && { log_info "[DRY RUN] Генерация серта S3 (MinIO TLS)"; return 0; }
     command -v openssl >/dev/null 2>&1 || { log_error "Нужен openssl для генерации серта S3 (MinIO TLS)."; exit 1; }
     local d="$_bcm_s3_tls_dir"
@@ -1449,15 +1511,21 @@ SQL
     # рвётся («Could not resume file transfer»). Поэтому весь S3 → первый сайт; остальные
     # сайты — backup (горячий резерв, синхронен через site replication, подхват при
     # падении первого). Заодно даёт read-after-write консистентность (один источник).
-    local s3_backends="" s3_idx=0
-    for name in "${S3_NODES[@]}"; do
-        local ip="${S3_IPS[$name]}"
-        local s3_bkp=""
-        [[ $s3_idx -gt 0 ]] && s3_bkp=" backup"
-        s3_backends="${s3_backends}    server ${name} ${ip}:${S3_PORT} check inter 5s fall 3 rise 2${s3_bkp}\n"
-        s3_idx=$((s3_idx+1))
-    done
-    render_multiline "$local_haproxy_cfg" "__BCM_S3_NODES_BACKENDS__" "$s3_backends"
+    # Слой S3 опционален: без него фронт/бэкенд :9000 вырезаются целиком (иначе LB
+    # слушал бы порт с пустым бэкендом, отдавая 503 на каждый S3-запрос).
+    if s3_enabled; then
+        local s3_backends="" s3_idx=0
+        for name in "${S3_NODES[@]}"; do
+            local ip="${S3_IPS[$name]}"
+            local s3_bkp=""
+            [[ $s3_idx -gt 0 ]] && s3_bkp=" backup"
+            s3_backends="${s3_backends}    server ${name} ${ip}:${S3_PORT} check inter 5s fall 3 rise 2${s3_bkp}\n"
+            s3_idx=$((s3_idx+1))
+        done
+        render_multiline "$local_haproxy_cfg" "__BCM_S3_NODES_BACKENDS__" "$s3_backends"
+    else
+        sed -i '/# bcm:s3-begin/,/# bcm:s3-end/d' "$local_haproxy_cfg"
+    fi
 
     # ACME-бэкенд (Let's Encrypt HTTP-01): по серверу на каждый LB, БЕЗ check —
     # ответчик acme.sh живёт только на время выпуска, redispatch найдёт живого.
@@ -1526,12 +1594,14 @@ SQL
     done
     rm -f "${local_haproxy_cfg:-}" "${local_keepalived_cfg:-}" 2>/dev/null
 
-    # 3. S3 Настройка
+    # 3. S3 Настройка (слой опционален: без S3-нод все шаги ниже — no-op)
+    s3_enabled || log_info "Слой S3 не задан — настройка MinIO пропущена."
+
     # Креды берём из конфига/файла ответов. Если secret не задан — генерируем случайный,
     # чтобы не оставлять общеизвестный пароль minioadminpassword.
     local s3_access_key="${S3_ACCESS_KEY:-minioadmin}"
     local s3_secret_key="${S3_SECRET_KEY:-}"
-    if [[ -z "$s3_secret_key" ]]; then
+    if s3_enabled && [[ -z "$s3_secret_key" ]]; then
         s3_secret_key="$(_bcm_rand_hex 16)"
         log_warn "Secret key MinIO не задан в конфиге — сгенерирован случайный."
     fi
@@ -3018,6 +3088,14 @@ ENV
 # момент запуска (Synced-реплика для БД, источник lsyncd для файлов) — см.
 # bcm_backup.sh. Вызывать ПОСЛЕ deploy_bcm (нужен /opt/bcm/bin/lib/bcm_backup.sh).
 configure_backup() {
+    # Цель бэкапов — MinIO кластера. Без слоя S3 хранить копии негде: env, таймеры
+    # и бакет не создаются (иначе таймеры ежедневно падали бы на несуществующий S3).
+    if ! s3_enabled; then
+        log_warn "Слой S3 не развёрнут — резервное копирование НЕ настроено."
+        log_info "Настройте внешнее хранилище копий или добавьте 2+ S3-нод и повторите install.sh."
+        return 0
+    fi
+
     log_info "Настройка резервного копирования (бакет ${BACKUP_BUCKET}, retention ${BACKUP_RETENTION_DAYS}д)..."
 
     local s3_ep="https://${VIP}:9000"
@@ -3282,9 +3360,14 @@ main() {
         log_error "Количество PXC-нод должно быть нечетным (для кворума)."
         exit 1
     fi
-    if [[ ${#S3_NODES[@]} -lt 2 ]]; then
-        log_error "Количество S3-нод должно быть не менее 2."
+    # S3 — опциональный слой: 0 (выключен) либо 2+ (site replication). Одна нода
+    # запрещена: всё хранилище файлов портала оказалось бы без резерва.
+    if [[ ${#S3_NODES[@]} -eq 1 ]]; then
+        log_error "S3-нода задана одна. Допустимо 0 (слой отключён) либо 2 и более."
         exit 1
+    fi
+    if ! s3_enabled; then
+        warn_s3_disabled
     fi
 
     validate_secrets
@@ -3361,6 +3444,12 @@ main() {
         fi
         # Удаляем локальные временные файлы с машины управления
         rm -rf "$BCM_CONF_DIR"
+    fi
+
+    if ! s3_enabled; then
+        echo
+        warn_s3_disabled
+        echo
     fi
 
     log_ok "Установка кластера Bitrix завершена успешно!"
