@@ -207,6 +207,17 @@ _ls_configure() {
 
     local ssh_key="${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}"
 
+    # Порог --max-delete берётся с источника из lsyncd-role.env (LSYNCD_MAX_DELETE) —
+    # тот же source of truth, что у lsyncd_role.sh: при авто-promote по VRRP конфиг
+    # перегенерирует РОЛЬ, и её порог обязан совпадать с записанным отсюда (иначе
+    # предохранитель молча меняется при первом же failover). Нет env/нода недоступна —
+    # дефолт роли (1000).
+    local max_delete
+    max_delete=$(bcm_ssh_exec_timeout "$src_ip" 8 \
+        "grep -E '^[[:space:]]*LSYNCD_MAX_DELETE=' /etc/bitrix-cluster/lsyncd-role.env 2>/dev/null | tail -1 | tr -dc '0-9'" \
+        2>/dev/null | tr -d '[:space:]') || max_delete=""
+    [[ "$max_delete" =~ ^[0-9]+$ ]] || max_delete=1000
+
     # Собрать целевые узлы (все web кроме src_node)
     local -a dst_nodes=()
     for node in "${BCM_NODES_WEB[@]}"; do
@@ -253,10 +264,10 @@ sync {
         --   кэш и tmp — локальные на каждой ноде, синкать нельзя;
         --   /bitrix/updates — временный churn обновлятора Bitrix (не синкать).
         -- rsync --delete уважает excludes (не удаляет исключённое на target).
-        -- --max-delete=1000 — предохранитель: один проход не сносит >1000 файлов
+        -- --max-delete — предохранитель: один проход не сносит больше порога файлов
         -- (обрезанное дерево/churn под --delete не уничтожит приёмник; rc=25).
         _extra = {
-            "--max-delete=1000",
+            "--max-delete=${max_delete}",
             "--exclude=/upload/",
             "--exclude=/bitrix/cache/",
             "--exclude=/bitrix/managed_cache/",
