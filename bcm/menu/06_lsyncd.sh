@@ -50,7 +50,7 @@ _warn_portal_required() {
     bcm_color "YELLOW_BOLD" "  ╔══════════════════════════════════════════════════════════════╗"
     bcm_color "YELLOW_BOLD" "  ║  ⚠  ВНИМАНИЕ:                                                ║"
     bcm_color "YELLOW_BOLD" "  ║  Синхронизация запускается только после деплоя портала       ║"
-    bcm_color "YELLOW_BOLD" "  ║  на web01. До этого lsyncd должен быть остановлен!            ║"
+    bcm_color "YELLOW_BOLD" "  ║  на web01. До этого lsyncd должен быть остановлен!           ║"
     bcm_color "YELLOW_BOLD" "  ╚══════════════════════════════════════════════════════════════╝"
     echo
 }

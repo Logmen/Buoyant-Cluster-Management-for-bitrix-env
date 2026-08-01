@@ -361,13 +361,19 @@ bcm_get_local_benv_version() {
     fi
 
     if [[ -z "$ver" ]]; then
-        # Источник 3: rpm
-        ver=$(rpm -q bitrix-env \
-            --queryformat '%{VERSION}.%{RELEASE}' 2>/dev/null | \
-            sed 's/\.el[0-9]*$//')
+        # Источник 3: rpm. ⚠️ `rpm -q` на ОТСУТСТВУЮЩИЙ пакет печатает «package
+        # bitrix-env is not installed» в STDOUT (не в stderr), поэтому 2>/dev/null
+        # его не глушит — эта строка попадала прямо в шапку BCM на lb/pxc-нодах,
+        # где bitrix-env и не должен стоять. Берём вывод только при успешном коде.
+        ver=$(rpm -q bitrix-env --queryformat '%{VERSION}.%{RELEASE}' 2>/dev/null) || ver=""
+        ver=$(printf '%s' "$ver" | sed 's/\.el[0-9]*$//')
     fi
 
-    echo "${ver:-unknown}"
+    # Санити-проверка: версия начинается с цифры. Иначе (мусор/сообщение rpm)
+    # честнее показать прочерк, чем строку, похожую на ошибку.
+    [[ "$ver" =~ ^[0-9] ]] || ver=""
+
+    echo "${ver:-—}"
 }
 
 # ──── Галера WSREP статус на узле ────────────────────────────────────────────

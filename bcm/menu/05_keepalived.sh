@@ -368,27 +368,24 @@ _kp_show_web_vrid() {
         "$(bcm_pad 'Узел' 12)" "$(bcm_pad 'IP' 15)" "$(bcm_pad 'VRRP роль' 12)" "Статус keepalived"
     bcm_divider "$BCM_LINE_H1"
 
+    # ⚠️ Роль VI_<vrid> определяется НАЛИЧИЕМ маркерного адреса 127.0.0.254/32 на lo:
+    # у этого инстанса нет «настоящего» VIP, адрес на loopback и есть признак MASTER
+    # (см. keepalived_web.conf.tmpl). Тем же способом работает bcm_get_cron_vrrp_holder,
+    # поэтому спрашиваем его — один опрос на экран вместо двух на ноду.
+    # Прежние способы не работали и экран ВСЕГДА показывал BACKUP на ОБЕИХ нодах при
+    # живом HA-Cron (ловили вживую): команды `ip vrrp show` в iproute2 не существует,
+    # keepalived не пишет состояние в /var/run/keepalived, а grep по последним 10
+    # строкам journalctl не находит давний переход в MASTER.
+    local cron_holder
+    cron_holder=$(bcm_get_cron_vrrp_holder --force 2>/dev/null || echo "")
+
     for node in "${BCM_NODES_WEB[@]}"; do
         [[ -z "$node" ]] && continue
         local ip="${BCM_NODE_IP[$node]:-}"
         [[ -z "$ip" ]] && continue
 
-        local state
-        state=$(bcm_ssh_exec_timeout "$ip" 8 \
-            "ip vrrp show 2>/dev/null | grep -w ${vrid} | awk '{print \$NF}' | head -1 || \
-             keepalived -v 2>/dev/null | head -1 || echo UNKNOWN" \
-            2>/dev/null | tr -d '[:space:]')
-
-        # Более надёжный способ через /var/run/keepalived
-        local master_count
-        master_count=$(bcm_ssh_exec_timeout "$ip" 5 \
-            "grep -r 'MASTER' /var/run/keepalived/ 2>/dev/null | grep -c '${vrid}' || \
-             journalctl -u keepalived -n 10 --no-pager 2>/dev/null | grep 'VRID ${vrid}' | grep -c MASTER || \
-             echo 0" \
-            2>/dev/null | tail -1 | tr -d '[:space:]')
-
         local role="BACKUP"
-        [[ "${master_count:-0}" -gt 0 ]] && role="MASTER"
+        [[ "$node" == "$cron_holder" ]] && role="MASTER"
 
         local svc_st
         svc_st=$(bcm_ssh_service_status "$ip" "keepalived")

@@ -10,6 +10,12 @@
 set -euo pipefail
 
 # ──── Загрузка библиотек ─────────────────────────────────────────────────────
+# Пути определяем сами (как в остальных модулях меню): при запуске из bcm они уже
+# экспортированы, но модуль должен работать и напрямую — без этого под set -u
+# первый же source падал с «BCM_LIB_DIR: unbound variable».
+BCM_BASE_DIR="${BCM_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+BCM_LIB_DIR="${BCM_LIB_DIR:-${BCM_BASE_DIR}/bin/lib}"
+
 source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
@@ -28,7 +34,7 @@ _cn_show_node_table() {
     # и значения (ОБСЛУЖ) иначе уже своих колонок → разделители не совпадают.
     printf "  %s │ %s │ %s │ %s │ %s\n" \
         "$(bcm_pad 'Имя узла' 14)" "$(bcm_pad 'IP-адрес' 15)" "$(bcm_pad 'Слой' 5)" \
-        "$(bcm_pad 'Статус' 7)" "SSH"
+        "$(bcm_pad 'Роль' 7)" "SSH"
     bcm_divider "${BCM_LINE_H1}"
 
     # Фактический writer PXC — из runtime ProxySQL (galera-checker мог сменить его
@@ -36,6 +42,11 @@ _cn_show_node_table() {
     local pxc_writer
     pxc_writer=$(bcm_get_pxc_runtime_writer 2>/dev/null || echo "")
     [[ -z "$pxc_writer" ]] && pxc_writer=$(bcm_get_pxc_writer 2>/dev/null || echo "")
+
+    # Держатель web-VRRP (HA Cron + источник lsyncd) — один опрос на таблицу, как и
+    # writer выше. Колонка «Роль» иначе дублировала бы слой (было «lb│lb», «web│web»).
+    local cron_holder
+    cron_holder=$(bcm_get_cron_vrrp_holder 2>/dev/null || echo "")
 
     local found=0
     for layer in lb web pxc s3; do
@@ -83,13 +94,11 @@ _cn_show_node_table() {
                         [[ "$pxc_writer" == "$node" ]] && marker="WRITER" || marker="reader"
                         ;;
                     lb)
-                        marker="lb"
+                        # Держатель кластерного VIP
+                        marker=$(bcm_get_lb_vrrp_role "$node" 2>/dev/null || echo "—")
                         ;;
                     web)
-                        marker="web"
-                        ;;
-                    s3)
-                        marker="s3"
+                        [[ "$cron_holder" == "$node" ]] && marker="MASTER" || marker="BACKUP"
                         ;;
                 esac
             fi

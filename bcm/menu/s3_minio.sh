@@ -12,6 +12,12 @@
 # =============================================================================
 set -euo pipefail
 
+# Пути определяем сами (как в остальных модулях меню): при запуске из bcm они уже
+# экспортированы, но модуль должен работать и напрямую — без этого под set -u
+# первый же source падал с «BCM_LIB_DIR: unbound variable».
+BCM_BASE_DIR="${BCM_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+BCM_LIB_DIR="${BCM_LIB_DIR:-${BCM_BASE_DIR}/bin/lib}"
+
 source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"

@@ -95,7 +95,7 @@ _draw_status_table() {
     bcm_table_header
 
     # ── Слой LB ──────────────────────────────────────────────────────────────
-    local nodes_lb=("${BCM_NODES_LB[@]:-}")
+    local -a nodes_lb=(); mapfile -t nodes_lb < <(_bcm_nonempty "${BCM_NODES_LB[@]:-}")
     if [[ ( "$scope" == "all" || "$scope" == "lb" ) && ${#nodes_lb[@]} -gt 0 ]]; then
         for node in "${nodes_lb[@]}"; do
             [[ -z "$node" ]] && continue
@@ -118,7 +118,7 @@ _draw_status_table() {
     fi
 
     # ── Слой WEB ─────────────────────────────────────────────────────────────
-    local nodes_web=("${BCM_NODES_WEB[@]:-}")
+    local -a nodes_web=(); mapfile -t nodes_web < <(_bcm_nonempty "${BCM_NODES_WEB[@]:-}")
     if [[ ( "$scope" == "all" || "$scope" == "web" ) && ${#nodes_web[@]} -gt 0 ]]; then
         local cron_holder
         cron_holder=$(bcm_get_cron_vrrp_holder 2>/dev/null || echo "")
@@ -147,7 +147,7 @@ _draw_status_table() {
     fi
 
     # ── Слой S3 ───────────────────────────────────────────────────────────────
-    local nodes_s3=("${BCM_NODES_S3[@]:-}")
+    local -a nodes_s3=(); mapfile -t nodes_s3 < <(_bcm_nonempty "${BCM_NODES_S3[@]:-}")
     if [[ ( "$scope" == "all" || "$scope" == "s3" ) && ${#nodes_s3[@]} -gt 0 ]]; then
         for node in "${nodes_s3[@]}"; do
             [[ -z "$node" ]] && continue
@@ -168,7 +168,7 @@ _draw_status_table() {
     fi
 
     # ── Слой PXC ─────────────────────────────────────────────────────────────
-    local nodes_pxc=("${BCM_NODES_PXC[@]:-}")
+    local -a nodes_pxc=(); mapfile -t nodes_pxc < <(_bcm_nonempty "${BCM_NODES_PXC[@]:-}")
     if [[ ( "$scope" == "all" || "$scope" == "pxc" ) && ${#nodes_pxc[@]} -gt 0 ]]; then
         # Фактический writer — из runtime ProxySQL (galera-checker мог сменить его
         # после failover); если опрос не удался — откат на [layer.pxc] writer из конфига.
