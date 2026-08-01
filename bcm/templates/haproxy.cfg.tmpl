@@ -62,6 +62,16 @@ frontend http_frontend
     # ACME HTTP-01 (Let's Encrypt): challenge приходит на VIP:80 → отдать ответчику
     # acme.sh --standalone, поднятому на время выпуска на одном из LB (см. ssl_certs.sh).
     acl is_acme path_beg /.well-known/acme-challenge/
+
+    # Принудительный HTTPS — управляется BCM (меню «SSL-сертификаты»), не править
+    # вручную: маркер bcm:force_https используется для включения/выключения sed'ом.
+    # ACME-challenge исключён — выпуск LE должен работать и при включённом редиректе.
+    # ⚠️ Правило стоит ДО use_backend осознанно: HAProxy всё равно выполняет
+    # http-request раньше выбора бэкенда, а обратный порядок даёт warning при
+    # проверке конфига («a 'http-request' rule placed after a 'use_backend' rule
+    # will still be processed before») на каждом reload.
+    # http-request redirect scheme https if !{ ssl_fc } !is_acme # bcm:force_https
+
     use_backend acme_backend if is_acme
 
     # ⚠️ CSS/JS-оптимизация Bitrix (/bitrix/cache/css|js): объединённые файлы с
@@ -73,11 +83,6 @@ frontend http_frontend
     # Active-active сохраняется (без sticky/двусторонней синхронизации кэша).
     acl is_bx_cache path_beg /bitrix/cache/css/ /bitrix/cache/js/
     use_backend web_cache_backend if is_bx_cache
-
-    # Принудительный HTTPS — управляется BCM (меню «SSL-сертификаты»), не править
-    # вручную: маркер bcm:force_https используется для включения/выключения sed'ом.
-    # ACME-challenge исключён — выпуск LE должен работать и при включённом редиректе.
-    # http-request redirect scheme https if !{ ssl_fc } !is_acme # bcm:force_https
 
     # Админка/запись (обновление модулей, маркетплейс, файловый редактор) — всегда
     # на источник lsyncd, иначе изменения на не-источнике затрутся синхронизацией.
