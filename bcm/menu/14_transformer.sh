@@ -248,6 +248,9 @@ _tr_install() {
     if _tr_wait_task "$mip" "$task" 1800; then
         echo
         bcm_ok "Transformer установлен для сайта '${site}'."
+        echo
+        _tr_reassert_db_path
+        echo
         bcm_info "Завершите в админке портала: Настройки → Настройки продукта → Настройки модулей →"
         bcm_info "Диск → включить просмотр документов средствами Bitrix24."
     fi
@@ -287,7 +290,11 @@ _tr_remove() {
         bcm_error "Не удалось получить id задачи:"; echo "$out" | sed 's/^/    /' | head -8; bcm_any_key; return
     fi
     bcm_ok "Задача запущена: ${task}"
-    _tr_wait_task "$mip" "$task" 1200
+    if _tr_wait_task "$mip" "$task" 1200; then
+        echo
+        # Роль удаления — тот же ansible-путь с обновлением пакетов, mysqld может вернуться.
+        _tr_reassert_db_path
+    fi
     bcm_any_key
 }
 
@@ -302,6 +309,32 @@ _tr_pool_tasks() {
 }
 
 # ──── HA: есть ли transformer-стек на ноде (rabbitmq + workerd) ──────────────
+# Роль transformer в bitrix-env выполняет полный `dnf update '*'`, а он возвращает
+# автозапуск локального mysqld. В кластере порт 127.0.0.1:3306 держит ProxySQL (через
+# него идёт management-проверка bitrix-env `bx_test_mysql_opts`, она хардкодит этот
+# адрес). Поднявшийся mysqld отбирает порт: проверка перестаёт достукиваться до БД,
+# сайт уходит в статус error и bitrix-env перестаёт видеть модули — включая сам
+# Конвертер. Переприменяем состояние на всех web-узлах, как install.sh::finalize_web_nodes.
+# Порядок важен: сначала гасим mysqld, потом рестартуем ProxySQL — иначе 3306 занят.
+_tr_reassert_db_path() {
+    bcm_info "Переприменение доступа к БД (локальный mysqld выключен, 3306 за ProxySQL)..."
+    local n ip ok
+    for n in "${BCM_NODES_WEB[@]}"; do
+        [[ -n "$n" ]] || continue
+        ip="${BCM_NODE_IP[$n]:-}"; [[ -z "$ip" ]] && continue
+        bcm_ssh_exec "$ip" "systemctl disable --now mysqld >/dev/null 2>&1 || true
+            systemctl reset-failed mysqld >/dev/null 2>&1 || true
+            systemctl restart proxysql >/dev/null 2>&1 || true" </dev/null
+        ok=$(bcm_ssh_exec_timeout "$ip" 10 \
+            "ss -lnt 2>/dev/null | grep -q '127.0.0.1:3306' && echo OK" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ok" == "OK" ]]; then
+            bcm_ok "  ${n}: mysqld выключен, 127.0.0.1:3306 за ProxySQL."
+        else
+            bcm_warn "  ${n}: ProxySQL не слушает 127.0.0.1:3306 — портал не увидит модули, проверьте вручную."
+        fi
+    done
+}
+
 _tr_stack_present() {
     local ip="$1"
     bcm_ssh_exec_timeout "$ip" 8 \
@@ -364,26 +397,57 @@ _tr_setup_ha() {
     local tmpl="${BCM_BASE_DIR}/templates/keepalived_transformer.conf.tmpl"
     [[ -f "$tmpl" ]] || tmpl="/opt/bcm/templates/keepalived_transformer.conf.tmpl"
 
-    local node ip state priority peer_ip
-    for node in "$active" "$standby"; do
+    # Участники VRRP-инстанса. Роль ставится на мозг-ноду и дублируется на пиров,
+    # keepalived-инстанс получают только эти узлы — из этого набора и строится
+    # unicast_peer, а не «один сосед».
+    local -a parts=("$active" "$standby")
+    local node ip priority
+    for node in "${parts[@]}"; do
         ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
-        if [[ "$node" == "$active" ]]; then state="MASTER"; priority="110"; peer_ip="$standby_ip"; else state="BACKUP"; priority="100"; peer_ip="$active_ip"; fi
+        if [[ "$node" == "$active" ]]; then priority="110"; else priority="100"; fi
         local iface
         iface=$(bcm_ssh_exec_timeout "$ip" 8 "ip route | awk '/default/{print \$5; exit}'" 2>/dev/null | tr -d '[:space:]'); [[ -z "$iface" ]] && iface="ens18"
 
+        # ⚠️ unicast_peer — ПОЛНЫМ списком участников, кроме self: при unicast нода
+        # принимает адверты только от перечисленных пиров. Список строится из набора
+        # участников, а не «сосед один» — иначе при расширении каждая нода знала бы
+        # лишь одного пира и инстанс распался бы на несколько MASTER'ов (ровно так
+        # ловили дубликат redis-VIP при добавлении третьей web-ноды).
+        local -a peer_ips=()
+        local pn pip
+        for pn in "${parts[@]}"; do
+            [[ "$pn" == "$node" ]] && continue
+            pip="${BCM_NODE_IP[$pn]:-}"; [[ -n "$pip" ]] && peer_ips+=("$pip")
+        done
+        if [[ ${#peer_ips[@]} -eq 0 ]]; then
+            bcm_error "  ${node}: не с кем строить unicast_peer — проверьте адреса web-узлов."
+            bcm_any_key; return
+        fi
+
         local lka="/tmp/keepalived-transformer-${node}.conf"
+        # state в шаблоне захардкожен (BACKUP + nopreempt), подставлять его не нужно.
         sed -e "s/__TR_VRID__/${tr_vrid}/g" \
-            -e "s/__VRRP_STATE__/${state}/g" \
             -e "s/__NODE_IFACE__/${iface}/g" \
             -e "s/__PRIORITY__/${priority}/g" \
             -e "s/__VRRP_AUTH_PASS__/${auth_pass}/g" \
             -e "s/__TR_VIP__/${tr_vip}/g" \
             -e "s/__NODE_IP__/${ip}/g" \
-            -e "s/__PEER_IP__/${peer_ip}/g" \
             "$tmpl" > "$lka"
+        local peer_block; peer_block=$(printf '        %s\n' "${peer_ips[@]}")
+        awk -v blk="$peer_block" '/__PEER_IP__/{print blk; next} {print}' "$lka" > "${lka}.new" \
+            && mv "${lka}.new" "$lka"
 
-        # notify/check уже раскатаны bcm_deploy_to_node; добиваем на всякий случай
+        # ⚠️ keepalived проверяет notify-скрипты при парсинге конфига и при недоступности
+        # НАВСЕГДА (для текущей загрузки) отключает notify, ограничившись warning'ом.
+        # Поэтому наличие проверяем жёстко и ДО подключения VRRP-блока: молча
+        # неработающий failover хуже явного отказа настроить его.
         bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/transformer_notify.sh /opt/bcm/bin/lib/transformer_check.sh 2>/dev/null || true"
+        if ! bcm_ssh_exec "$ip" "test -x /opt/bcm/bin/lib/transformer_notify.sh && test -x /opt/bcm/bin/lib/transformer_check.sh" </dev/null; then
+            rm -f "$lka"
+            bcm_error "  ${node}: нет /opt/bcm/bin/lib/transformer_{notify,check}.sh."
+            bcm_info "Раскатайте BCM на узел (меню 1 → обновление узлов) и повторите — иначе keepalived молча отключит notify и failover не сработает."
+            bcm_any_key; return
+        fi
         # always-on: rabbitmq+transformer работают на ОБЕИХ нодах (keepalived только
         # держит VIP, без start/stop — иначе VRRP флапал на медленных start/stop).
         bcm_ssh_exec "$ip" "systemctl enable --now rabbitmq-server 2>/dev/null; systemctl enable --now transformer 2>/dev/null || true"
@@ -400,7 +464,7 @@ _tr_setup_ha() {
         fi
         bcm_ssh_exec_timeout "$ip" 15 "systemctl reload keepalived 2>/dev/null || systemctl restart keepalived" 2>/dev/null
         rm -f "$lka"
-        bcm_ok "  ${node}: keepalived-инстанс transformer (${state}, prio ${priority}) добавлен."
+        bcm_ok "  ${node}: keepalived-инстанс transformer добавлен (prio ${priority}, пиров: ${#peer_ips[@]})."
     done
 
     # Репойнт эндпоинта RabbitMQ на VIP: модуль transformercontroller ходит на
@@ -559,6 +623,9 @@ _tr_replicate_peers() {
         bcm_ok "  ${p}: ${r8}"
     done
 
+    echo
+    # Репликация ставит пакеты dnf'ом на пирах — там тот же риск возврата mysqld.
+    _tr_reassert_db_path
     echo
     bcm_ok "Репликация завершена. Дальше — HA-переключение: пункт 5 (TRANSFORMER_VIP + keepalived)."
     bcm_warn "Пока модуль transformercontroller (Enterprise) не развёрнут — transformer.service не стартует (это норма)."
