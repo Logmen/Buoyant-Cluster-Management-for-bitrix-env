@@ -5,15 +5,26 @@
 #   scripts/release.sh X.Y.Z
 #
 # Что делает:
-#   1) проверяет, что дерево чистое и мы на ветке main;
-#   2) пишет X.Y.Z в bcm/VERSION;
-#   3) коммитит "release: vX.Y.Z";
-#   4) ставит аннотированный тег vX.Y.Z;
-#   5) пушит ветку и тег.
+#   1) проверяет дерево (чистое, ветка main, синхронно с origin) и preflight
+#      инструментов, gh-аутентификации и GPG-ключа подписи;
+#   2) гоняет tests/release_check.sh — гейт ДО любых изменений;
+#   3) пишет X.Y.Z в bcm/VERSION, коммитит "release: vX.Y.Z", ставит тег vX.Y.Z
+#      (пока ЛОКАЛЬНО — всё обратимо);
+#   4) собирает bcm-X.Y.Z.tar.gz из `git archive` тега, ПОДПИСЫВАЕТ его GPG,
+#      считает sha256, проверяет подпись и структуру распаковкой;
+#   5) только теперь пушит ветку и тег и публикует GitHub Release с артефактами.
 #
-# Push тега запускает .github/workflows/release.yml, который собирает
-# bcm-X.Y.Z.tar.gz и публикует GitHub Release. После этого операторы
-# обновляются командой `bcm --update` на web-ноде.
+# Порядок неслучаен: всё, что можно провалить, проваливается ДО необратимых
+# удалённых действий (push тега, gh release create). Собираем из `git archive`,
+# а не из рабочего дерева — так tarball гарантированно равен содержимому тега и
+# не тащит неотслеживаемые/игнорируемые файлы.
+#
+# ⚠ .github/workflows/release.yml Release НЕ создаёт — он только валидирует
+# (совпадение VERSION с тегом + tests/release_check.sh). Публикует ИМЕННО этот
+# скрипт: два `gh release create` на один тег конфликтовали бы.
+#
+# После публикации операторы обновляются командой `bcm --update` на web-ноде —
+# она проверяет подпись доверенным ключом из bcm/keys/.
 # =============================================================================
 set -euo pipefail
 
@@ -39,6 +50,19 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$BRANCH" == "main" ]] || die "релиз делается с ветки main (сейчас: $BRANCH)"
 [[ -z "$(git status --porcelain)" ]] || die "рабочее дерево не чистое — закоммитьте/уберите изменения"
 git rev-parse "$TAG" >/dev/null 2>&1 && die "тег $TAG уже существует"
+
+# Локальная main должна быть синхронна с origin/main: иначе push в конце упадёт
+# (отставание) уже ПОСЛЕ создания коммита и тега, и состояние придётся разбирать руками.
+if git remote get-url origin >/dev/null 2>&1; then
+    git fetch --quiet origin "$BRANCH" || die "не удалось получить origin/$BRANCH"
+    behind="$(git rev-list --count "HEAD..origin/${BRANCH}")"
+    [[ "$behind" == "0" ]] || die "локальная $BRANCH отстаёт от origin на $behind коммит(ов) — сначала git pull"
+    git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1 && die "тег $TAG уже существует локально"
+    git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1 \
+        && die "тег $TAG уже существует на origin — выберите другую версию"
+else
+    die "не настроен remote origin"
+fi
 
 # ── Предрелизная проверка корректности (статика по всему дереву) ─────────────
 # Ловит: lib не в bcm_deploy_to_node, битые source, неопределённые функции меню,
@@ -101,27 +125,62 @@ git add "$VER_FILE"
 git commit -q -m "release: ${TAG}"
 git tag -a "$TAG" -m "BCM ${TAG}"
 
-echo "Пушу ветку и тег ${TAG}…"
-git push origin "$BRANCH"
-git push origin "$TAG"
+# С этого момента и до пуша всё состояние ЛОКАЛЬНОЕ. Любой die ниже оставляет
+# репозиторий с лишним коммитом и тегом — печатаем, как откатить.
+_undo_hint() {
+    echo "  Откат локального состояния: git tag -d ${TAG} && git reset --hard HEAD~1" >&2
+}
 
 # ── Сборка развёртываемого tarball'а (== содержимое тега) ─────────────────────
+# Источник — `git archive` тега, а не рабочее дерево: tarball побайтово соответствует
+# тому, что лежит в теге, и не может утащить неотслеживаемые или .gitignore'нутые
+# файлы (редакторские бэкапы, локальные ключи), случайно оказавшиеся в bcm/.
 BUILD="$(mktemp -d)"; trap 'rm -rf "$_tmpgnupg" "$BUILD"' EXIT
 STAGE="bcm-${VERSION}"
 mkdir -p "${BUILD}/${STAGE}"
-cp -a bcm install.sh install_answers.conf.example \
-      README.md LICENSE NOTICE DEPLOY_REQUIREMENTS.txt "${BUILD}/${STAGE}/"
+git archive --format=tar "$TAG" \
+    bcm install.sh install_answers.conf.example \
+    README.md LICENSE NOTICE DEPLOY_REQUIREMENTS.txt \
+    | tar -x -C "${BUILD}/${STAGE}" \
+    || { _undo_hint; die "не удалось собрать дерево релиза из git archive"; }
 TARBALL="${BUILD}/bcm-${VERSION}.tar.gz"
 tar -czf "$TARBALL" -C "$BUILD" "$STAGE"
+
+# ── Smoke-тест собранного пакета ─────────────────────────────────────────────
+# Проверяем распаковкой ровно то, на что опирается `bcm --update`: он ищет корень
+# пакета как единственный путь '*/bin/bcm'. Лишний или отсутствующий — обновление
+# на нодах сломается уже после публикации.
+CHECK="${BUILD}/verify"; mkdir -p "$CHECK"
+tar -xzf "$TARBALL" -C "$CHECK" || { _undo_hint; die "собранный tarball не распаковывается"; }
+mapfile -t _roots < <(find "$CHECK" -path '*/bin/bcm' -type f)
+[[ ${#_roots[@]} -eq 1 ]] \
+    || { _undo_hint; die "в tarball'е ${#_roots[@]} путей '*/bin/bcm' (нужен ровно 1) — bcm --update не найдёт корень"; }
+_pkg="$(dirname "$(dirname "${_roots[0]}")")"
+_tarver="$(tr -d '[:space:]' < "${_pkg}/VERSION" 2>/dev/null || true)"
+[[ "$_tarver" == "$VERSION" ]] \
+    || { _undo_hint; die "VERSION внутри tarball'а ('$_tarver') не совпадает с релизом ($VERSION)"; }
+for _need in "${CHECK}/${STAGE}/install.sh" "${_pkg}/bin/bcm"; do
+    [[ -s "$_need" ]] || { _undo_hint; die "в tarball'е нет обязательного файла: ${_need#"$CHECK"/}"; }
+done
+compgen -G "${_pkg}/keys/*.asc" >/dev/null \
+    || { _undo_hint; die "в tarball'е нет bcm/keys/*.asc — операторы не смогут проверить подпись"; }
+echo "Пакет проверен: корень $(basename "$_pkg"), VERSION ${_tarver}, ключи на месте ✓"
 
 # ── Подпись (detached, ASCII-armored) + контрольная сумма ────────────────────
 echo "Подписываю tarball ключом ${SIGNER_FPR}…"
 gpg --batch --yes --armor ${SIGNING_KEY:+--local-user "$SIGNING_KEY"} \
-    --output "${TARBALL}.asc" --detach-sign "$TARBALL"
+    --output "${TARBALL}.asc" --detach-sign "$TARBALL" \
+    || { _undo_hint; die "подпись не удалась — релиз НЕ опубликован"; }
 ( cd "$BUILD" && sha256sum "bcm-${VERSION}.tar.gz" > "bcm-${VERSION}.tar.gz.sha256" )
 # Самопроверка подписи перед публикацией.
 gpg --verify "${TARBALL}.asc" "$TARBALL" >/dev/null 2>&1 \
-    || die "самопроверка подписи не прошла — релиз НЕ опубликован"
+    || { _undo_hint; die "самопроверка подписи не прошла — релиз НЕ опубликован"; }
+
+# ── Необратимая часть: публикация ────────────────────────────────────────────
+# Всё проверяемое проверено выше, поэтому push и создание Release идут последними.
+echo "Пушу ветку и тег ${TAG}…"
+git push origin "$BRANCH" || { _undo_hint; die "не удалось запушить ветку"; }
+git push origin "$TAG"    || { _undo_hint; die "не удалось запушить тег"; }
 
 # ── Публикация GitHub Release с подписанными артефактами ─────────────────────
 echo "Публикую GitHub Release ${TAG}…"

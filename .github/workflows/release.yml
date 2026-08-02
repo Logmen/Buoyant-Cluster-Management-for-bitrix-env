@@ -35,8 +35,10 @@ jobs:
             exit 1
           fi
 
-      - name: Install shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Install shellcheck + php-cli
+        # php-cli нужен проверке 12 (синтаксис шаблонов и PHP-сниппетов install.sh);
+        # без него она молча пропускается с warning.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck php-cli
 
       - name: Pre-release checks (tests/release_check.sh)
         # Полный набор: синтаксис, shellcheck, полнота bcm_deploy_to_node, source-ссылки,
