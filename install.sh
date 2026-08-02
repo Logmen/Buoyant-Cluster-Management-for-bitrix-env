@@ -2075,8 +2075,18 @@ $cfg['session'] = array(
     ),
     'readonly' => false,
 );
+// Бэкап наследует владельца и режим оригинала: сниппет исполняется от root с umask 022,
+// а .settings.php — bitrix:bitrix 0640. Без наследования рядом остаётся root:root 0644:
+// копия реквизитов БД, читаемая любым пользователем ноды, и «Проверка системы» Bitrix
+// помечает файл недоступным для чтения/записи.
+function bcm_backup_file($src, $bak) {
+    if (is_file($bak) || !@copy($src, $bak)) { return; }
+    @chmod($bak, @fileperms($src) & 0777);
+    @chown($bak, @fileowner($src));
+    @chgrp($bak, @filegroup($src));
+}
 $bak = $file . '.bcm-bak';
-if (!is_file($bak)) { @copy($file, $bak); }
+bcm_backup_file($file, $bak);
 $out = "<?php\nreturn " . var_export($cfg, true) . ";\n";
 if (file_put_contents($file, $out, LOCK_EX) === false) { fwrite(STDERR, "WRITE_FAIL\n"); exit(3); }
 echo "SETTINGS_OK\n";
@@ -2786,7 +2796,10 @@ $s=include $f;
 if(!isset($s['pull']['value']['path_to_publish'])){fwrite(STDERR,"NO_PULL\n");exit(2);}
 $new='http://127.0.0.1:8895/bitrix/pub/';
 if($s['pull']['value']['path_to_publish']===$new){echo "PUB_ALREADY\n";exit(0);}
-if(!is_file($f.'.bcm-bak-push')) @copy($f,$f.'.bcm-bak-push');
+// Бэкап наследует владельца/режим оригинала (сниппет от root, umask 022) — иначе
+// root:root 0644 рядом с bitrix:bitrix 0640, и «Проверка системы» Bitrix ругается.
+function bcm_backup_file($src,$bak){ if(is_file($bak)||!@copy($src,$bak)) return; @chmod($bak,@fileperms($src)&0777); @chown($bak,@fileowner($src)); @chgrp($bak,@filegroup($src)); }
+bcm_backup_file($f,$f.'.bcm-bak-push');
 $s['pull']['value']['path_to_publish']=$new;
 file_put_contents($f,"<?php\nreturn ".var_export($s,true).";\n",LOCK_EX);
 echo "PUB_OK\n";
@@ -2931,7 +2944,10 @@ $s['cache']=array(
   ),
   'readonly'=>false,
 );
-if(!is_file($f.'.bcm-bak-cache')) @copy($f,$f.'.bcm-bak-cache');
+// Бэкап наследует владельца/режим оригинала (сниппет от root, umask 022) — иначе
+// root:root 0644 рядом с bitrix:bitrix 0640, и «Проверка системы» Bitrix ругается.
+function bcm_backup_file($src,$bak){ if(is_file($bak)||!@copy($src,$bak)) return; @chmod($bak,@fileperms($src)&0777); @chown($bak,@fileowner($src)); @chgrp($bak,@filegroup($src)); }
+bcm_backup_file($f,$f.'.bcm-bak-cache');
 file_put_contents($f,"<?php\nreturn ".var_export($s,true).";\n",LOCK_EX);
 echo "CACHE_OK\n";
 PHPSNIP

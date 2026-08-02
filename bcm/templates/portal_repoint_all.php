@@ -110,8 +110,16 @@ if ($pub !== false && $pub !== '' && isset($cfg['pull']['value']['path_to_publis
 $sig = isset($cfg['pull']['value']['signature_key']) ? $cfg['pull']['value']['signature_key'] : '';
 
 if (!empty($changed)) {
+    // Бэкап наследует владельца и режим оригинала: скрипт исполняется от root с umask 022,
+    // а .settings.php — bitrix:bitrix 0640. Иначе рядом остаётся root:root 0644 (копия
+    // реквизитов БД, читаемая всеми), и «Проверка системы» Bitrix помечает файл
+    // недоступным для чтения/записи.
     $bak = $file . '.bcm-bak-repoint';
-    if (!is_file($bak)) { @copy($file, $bak); }
+    if (!is_file($bak) && @copy($file, $bak)) {
+        @chmod($bak, @fileperms($file) & 0777);
+        @chown($bak, @fileowner($file));
+        @chgrp($bak, @filegroup($file));
+    }
     if (file_put_contents($file, "<?php\nreturn " . var_export($cfg, true) . ";\n", LOCK_EX) === false) {
         out('RESULT=WRITE_FAIL'); exit(5);
     }

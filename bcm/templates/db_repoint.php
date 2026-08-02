@@ -43,9 +43,16 @@ if ($host === false || $host === '' || $login === false || $login === '') {
     out('RESULT=BAD_PARAMS'); exit(4);
 }
 
-// Бэкап один раз
+// Бэкап один раз, с наследованием владельца и режима оригинала: скрипт исполняется от
+// root с umask 022, а .settings.php — bitrix:bitrix 0640. Иначе рядом остаётся root:root
+// 0644 (копия реквизитов БД, читаемая всеми), и «Проверка системы» Bitrix помечает файл
+// недоступным для чтения/записи.
 $bak = $file . '.bcm-bak-db';
-if (!is_file($bak)) { @copy($file, $bak); }
+if (!is_file($bak) && @copy($file, $bak)) {
+    @chmod($bak, @fileperms($file) & 0777);
+    @chown($bak, @fileowner($file));
+    @chgrp($bak, @filegroup($file));
+}
 
 $cfg['connections']['value']['default']['host']     = $host;
 $cfg['connections']['value']['default']['login']    = $login;
