@@ -59,11 +59,15 @@ bcm_ssh_exec_timeout() {
 bcm_ssh_reachable() {
     local ip="$1"
     local timeout="${2:-5}"
+    # ⚠️ </dev/null здесь ОБЯЗАТЕЛЕН и безопасен: это проба доступности, stdin ей не
+    # нужен (в отличие от bcm_ssh_exec*, которым скрипт подают на вход — тем редирект
+    # добавлять НЕЛЬЗЯ). Без него ssh под TTY захватывает терминал и блокируется, а
+    # `timeout` его уже не снимает: вызов из TUI (меню, статус) виснет намертво.
     timeout "$timeout" ssh "${BCM_SSH_OPTS[@]}" \
         -o ConnectTimeout="$timeout" \
         -i "$BCM_SSH_KEY" \
         "root@${ip}" \
-        "exit 0" 2>/dev/null
+        "exit 0" </dev/null 2>/dev/null
 }
 
 # ──── Получить статус сервиса на удалённом узле ──────────────────────────────

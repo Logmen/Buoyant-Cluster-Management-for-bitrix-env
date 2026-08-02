@@ -289,10 +289,10 @@ _kp_force_failover() {
     bcm_confirm "Выполнить переезд?" || { bcm_info "Отменено."; bcm_any_key; return; }
 
     if [[ -n "$marker" ]]; then
-        bcm_ssh_exec_timeout "$hip" 10 "touch '${marker}'" 2>/dev/null
+        bcm_ssh_exec_timeout "$hip" 10 "touch '${marker}'" </dev/null 2>/dev/null
         bcm_ok "Маркер выставлен, ждём переезда..."
         _kp_wait_holder_change "$vip" "$layer" "$holder" 25
-        bcm_ssh_exec_timeout "$hip" 10 "rm -f '${marker}'" 2>/dev/null
+        bcm_ssh_exec_timeout "$hip" 10 "rm -f '${marker}'" </dev/null 2>/dev/null
         bcm_info "Маркер снят — инстанс на ${holder} снова здоров (останется BACKUP)."
     else
         local orig
@@ -329,7 +329,7 @@ _kp_holder_of() {
     fi
     for node in $(bcm_get_nodes "$layer" 2>/dev/null); do
         ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
-        if [[ "$(bcm_ssh_exec_timeout "$ip" 5 "ip -4 addr 2>/dev/null | grep -q 'inet ${vip}[/ ]' && echo YES" 2>/dev/null | tr -d '[:space:]')" == "YES" ]]; then
+        if [[ "$(bcm_ssh_exec_timeout "$ip" 5 "ip -4 addr 2>/dev/null | grep -q 'inet ${vip}[/ ]' && echo YES" </dev/null 2>/dev/null | tr -d '[:space:]')" == "YES" ]]; then
             echo "$node"; return
         fi
     done
@@ -346,7 +346,7 @@ _kp_set_priority() {
             /^}/ { inb = 0 }
             { print }
         ' /etc/keepalived/keepalived.conf > /tmp/bcm-kp.new && mv /tmp/bcm-kp.new /etc/keepalived/keepalived.conf
-        systemctl reload keepalived 2>/dev/null || systemctl restart keepalived" 2>/dev/null
+        systemctl reload keepalived 2>/dev/null || systemctl restart keepalived" </dev/null 2>/dev/null
 }
 
 # Ждать смены держателя (или таймаут).

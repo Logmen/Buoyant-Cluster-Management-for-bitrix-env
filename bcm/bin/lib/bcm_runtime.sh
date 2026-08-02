@@ -273,8 +273,10 @@ bcm_get_vip_holder() {
             continue
         fi
         local has_vip
+        # ⚠️ </dev/null: без него ssh под TTY забирает терминал и вызов внутри $( )
+        # виснет навсегда (timeout не спасает) — TUI замирает при опросе держателя VIP.
         has_vip=$(bcm_ssh_exec_timeout "$ip" 5 \
-            "ip addr show | grep -c '${vip}' 2>/dev/null || echo 0" 2>/dev/null | tr -d '[:space:]')
+            "ip addr show | grep -c '${vip}' 2>/dev/null || echo 0" </dev/null 2>/dev/null | tr -d '[:space:]')
         if [[ "${has_vip:-0}" -gt 0 ]]; then
             holder="$node"
             break
@@ -327,7 +329,7 @@ bcm_get_cron_vrrp_holder() {
         if ! bcm_ssh_reachable "$ip" 3; then continue; fi
         local state
         state=$(bcm_ssh_exec_timeout "$ip" 5 \
-            "ip addr show dev lo 2>/dev/null | grep -q '127.0.0.254' && echo 1 || echo 0" 2>/dev/null | head -1 | tr -d '[:space:]')
+            "ip addr show dev lo 2>/dev/null | grep -q '127.0.0.254' && echo 1 || echo 0" </dev/null 2>/dev/null | head -1 | tr -d '[:space:]')
         if [[ "${state:-0}" -eq 1 ]]; then
             holder="$node"
             break
