@@ -257,20 +257,36 @@ _cron_show_bitrix_agent() {
 
         bcm_color "WHITE" "  ── ${node} (${ip}) ──"
 
-        # Проверить bitrix_agent или cron
+        # ⚠️ Задание агентов bitrix-env лежит в /etc/crontab, а НЕ в crontab
+        # пользователя bitrix — прежняя проверка смотрела не туда и панель всегда
+        # была пустой, из чего можно было заключить, что агенты не работают.
+        # На BACKUP-ноде строка закомментирована маркером #bcm-ha-backup# (это и есть
+        # механизм HA Cron), поэтому показываем ещё и роль, и фактические тики.
         local agent_output
-        agent_output=$(bcm_ssh_exec_timeout "$ip" 15 \
-            "# Статус Bitrix Agent через crontab
-             echo '=== crontab bitrix пользователя ==='
-             crontab -l -u bitrix 2>/dev/null | grep -v '^#' | grep -v '^$' | head -10 || echo '(нет задач)'
+        agent_output=$(bcm_ssh_exec_timeout "$ip" 20 \
+            "echo '=== роль ноды ==='
+             cat /run/bcm-ha-cron.role 2>/dev/null || echo '(роль не назначена — notify keepalived не отрабатывал)'
 
-             # Запущенные процессы агента
-             echo '=== Процессы php agent ==='
-             ps aux 2>/dev/null | grep -E 'bitrix.*agent|cron_events' | grep -v grep | head -5 || echo '(нет процессов)'
+             echo '=== агенты Bitrix в /etc/crontab ==='
+             line=\$(grep -n 'cron_events\.php' /etc/crontab 2>/dev/null | head -1)
+             if [ -z \"\$line\" ]; then
+                 echo '(строки нет — bitrix-env её не создавал)'
+             elif echo \"\$line\" | grep -q '#bcm-ha-backup#'; then
+                 echo 'отключена маркером #bcm-ha-backup# (штатно для BACKUP)'
+             else
+                 echo 'активна (агенты выполняются на этой ноде)'
+             fi
 
-             # Проверка cron.php
-             echo '=== Последний запуск cron.php ==='
-             find /home/*/www/bitrix/ /home/bitrix/www/bitrix/ -name 'cron_events.php' 2>/dev/null | head -2" \
+             echo '=== тиков cron_events за последний час ==='
+             since=\$(date -d '1 hour ago' '+%b %e %H' 2>/dev/null)
+             grep 'CMD.*cron_events' /var/log/cron 2>/dev/null | tail -60 | awk -v s=\"\$since\" 'index(\$0,substr(s,1,9))>0' | wc -l
+
+             echo '=== задания BCM в /etc/cron.d ==='
+             ls -1 /etc/cron.d/bcm-* 2>/dev/null || echo '(нет)'
+             test -f /etc/bitrix-cluster/bcm-portal-master.disabled && echo 'bcm-portal-master: вынесен из cron.d (нода BACKUP)'
+
+             echo '=== процессы агента ==='
+             pgrep -af 'cron_events\.php' 2>/dev/null | head -3 || echo '(сейчас не выполняются)'" \
             2>/dev/null)
 
         echo "$agent_output" | while IFS= read -r line; do echo "  $line"; done
