@@ -602,14 +602,34 @@ _tr_replicate_peers() {
 
         # 4) /etc/rabbitmq (с источника) + per-node NODENAME
         bcm_ssh_exec "$src_ip" "rsync -az -e \"${NSSH}\" /etc/rabbitmq/ root@${pip}:/etc/rabbitmq/ 2>/dev/null" </dev/null
-        bcm_ssh_exec "$pip" "sed -i 's/^NODENAME=.*/NODENAME=rabbit@${p}/' /etc/rabbitmq/rabbitmq-env.conf 2>/dev/null" </dev/null
+        # ⚠️ Имя ноды обязано согласоваться с USE_LONGNAME из конфига bitrix-env: при
+        # USE_LONGNAME=true и брокер, и rabbitmqctl работают с FQDN, а короткое
+        # rabbit@<node> делает их РАЗНЫМИ узлами — rabbitmqctl не достучится до брокера,
+        # и создание пользователя ниже провалится молча (все его вызовы заглушены).
+        # Ловили вживую: пользователь bitrix не появился на пире, и переезд VIP оставил
+        # бы портал без доступа к брокеру. Имя считаем НА пире, из его же hostname.
+        bcm_ssh_exec "$pip" "if grep -qiE '^[[:space:]]*USE_LONGNAME[[:space:]]*=[[:space:]]*true' /etc/rabbitmq/rabbitmq-env.conf 2>/dev/null; then rn=\"rabbit@\$(hostname -f)\"; else rn=\"rabbit@\$(hostname -s)\"; fi
+            sed -i \"s/^NODENAME=.*/NODENAME=\${rn}/\" /etc/rabbitmq/rabbitmq-env.conf 2>/dev/null" </dev/null
 
         # 5) unit + workerd + tmpfiles (с источника)
         bcm_ssh_exec "$src_ip" "rsync -az -e \"${NSSH}\" /etc/systemd/system/transformer.service root@${pip}:/etc/systemd/system/ 2>/dev/null; rsync -az -e \"${NSSH}\" /usr/local/sbin/transformer-workerd root@${pip}:/usr/local/sbin/ 2>/dev/null; rsync -az -e \"${NSSH}\" /etc/tmpfiles.d/transformer.conf root@${pip}:/etc/tmpfiles.d/ 2>/dev/null" </dev/null
 
         # 6) rabbitmq up + юзер bitrix (идемпотентно)
-        local r6; r6=$(bcm_ssh_exec_verbose "$pip" "systemctl enable --now rabbitmq-server >/dev/null 2>&1; sleep 3; rabbitmqctl list_users 2>/dev/null | awk '{print \$1}' | grep -qx bitrix || rabbitmqctl add_user bitrix ${rmq_q} >/dev/null 2>&1; rabbitmqctl set_user_tags bitrix administrator >/dev/null 2>&1; rabbitmqctl set_permissions -p / bitrix '.*' '.*' '.*' >/dev/null 2>&1; echo rabbit=\$(systemctl is-active rabbitmq-server)" </dev/null)
+        # Ждём готовности брокера (await_startup), иначе rabbitmqctl не успевает и юзер
+        # не создаётся. Результат ПРОВЕРЯЕМ: без юзера bitrix переезд VIP на эту ноду
+        # оставит портал и воркеров без доступа к брокеру.
+        local r6; r6=$(bcm_ssh_exec_verbose "$pip" "systemctl enable --now rabbitmq-server >/dev/null 2>&1
+            for i in \$(seq 1 20); do rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 3; done
+            rabbitmqctl list_users 2>/dev/null | awk '{print \$1}' | grep -qx bitrix || rabbitmqctl add_user bitrix ${rmq_q} >/dev/null 2>&1
+            rabbitmqctl set_user_tags bitrix administrator >/dev/null 2>&1
+            rabbitmqctl set_permissions -p / bitrix '.*' '.*' '.*' >/dev/null 2>&1
+            if rabbitmqctl list_users 2>/dev/null | awk '{print \$1}' | grep -qx bitrix; then u=ok; else u=FAIL; fi
+            echo rabbit=\$(systemctl is-active rabbitmq-server) user_bitrix=\$u" </dev/null)
         bcm_info "  ${p}: ${r6}"
+        if [[ "$r6" == *"user_bitrix=FAIL"* ]]; then
+            bcm_warn "  ${p}: пользователь rabbitmq 'bitrix' НЕ создан — при переезде VIP портал не подключится к брокеру."
+            bcm_info "  Проверьте NODENAME и USE_LONGNAME в /etc/rabbitmq/rabbitmq-env.conf на ${p}: они должны быть согласованы."
+        fi
 
         # 7) firewall 5672 + log/run dirs + tmpfiles + unit enable + httpd (php-amqp в mod_php)
         # ⚠ /var/log/transformer НЕ создаётся пакетом на ноде вне пула — workerd пишет туда
