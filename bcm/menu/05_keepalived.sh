@@ -306,15 +306,33 @@ _kp_force_failover() {
         _kp_set_priority "$hip" "$vrid" "$orig"
     fi
 
-    sleep 3
-    local now
-    now=$(_kp_holder_of "$vip" "$layer")
-    if [[ -n "$now" && "$now" != "$holder" ]]; then
-        bcm_ok "${label}: VIP перешёл ${holder} → ${now}."
-    elif [[ "$now" == "$holder" ]]; then
-        bcm_warn "${label}: VIP остался на ${holder}. Проверьте состояние пира (keepalived, health-check)."
+    # ⚠️ Ждём, пока держатель устоится, а не проверяем один раз: у preempt-инстанса
+    # после возврата приоритета VIP переезжает обратно, и несколько секунд его не
+    # держит НИКТО. Одиночная проверка попадала в это окно и пугала оператора
+    # сообщением «держатель не определяется», хотя всё шло штатно.
+    local now="" t
+    for ((t = 0; t < 25; t++)); do
+        now=$(_kp_holder_of "$vip" "$layer")
+        [[ -n "$now" ]] && break
+        sleep 1
+    done
+
+    if [[ -z "$now" ]]; then
+        bcm_warn "${label}: за 25с держатель не определился — проверьте keepalived на обеих нодах."
+    elif [[ -n "$marker" ]]; then
+        # nopreempt: VIP закрепляется за новым узлом, обратно сам не вернётся.
+        if [[ "$now" != "$holder" ]]; then
+            bcm_ok "${label}: VIP перешёл ${holder} → ${now} и останется там (nopreempt)."
+        else
+            bcm_warn "${label}: VIP остался на ${holder}. Проверьте health-check и keepalived на пире."
+        fi
     else
-        bcm_warn "${label}: держатель не определяется — проверьте keepalived на обеих нодах."
+        # preempt: понижение приоритета — временное, возврат на исходный узел штатен.
+        if [[ "$now" == "$holder" ]]; then
+            bcm_ok "${label}: переезд проверен; приоритет возвращён, VIP снова на ${holder} — так и задумано для preempt-инстанса."
+        else
+            bcm_ok "${label}: VIP сейчас на ${now} (был ${holder}); с восстановленным приоритетом вернётся на ${holder}."
+        fi
     fi
     bcm_any_key
 }
