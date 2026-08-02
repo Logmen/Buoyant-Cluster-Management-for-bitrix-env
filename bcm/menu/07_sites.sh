@@ -266,7 +266,7 @@ _st_configure_s3() {
     bcm_section_header "S3 для /upload — настраивается в меню 11"
 
     # Слой S3 опционален: без него подключать нечего, [s3_upload] в конфиге нет.
-    if ! bcm_s3_enabled; then
+    if ! bcm_s3_storage_enabled; then
         bcm_error "Слой S3 в кластере не развёрнут — облачное хранилище недоступно."
         bcm_info "Файлы /upload лежат на дисках web-нод. Чтобы включить S3: добавьте"
         bcm_info "2+ S3-нод в install_answers.conf и повторите install.sh."

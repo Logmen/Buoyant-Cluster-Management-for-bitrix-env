@@ -83,7 +83,7 @@ _ls_show_status() {
         echo
 
         # Зеркало /upload — отдельный always-on инстанс, есть только без слоя S3.
-        if ! bcm_s3_enabled; then
+        if ! bcm_s3_storage_enabled; then
             local mir_st
             mir_st=$(bcm_ssh_service_status "$ip" "lsyncd-upload")
             printf "  Зеркало /upload: "
@@ -302,7 +302,7 @@ LSYNCD_SYNC
         # web-ноде (пункт 10) — загрузки приходят на любую, а этот конфиг
         # односторонний. Тогда блок ниже не генерируем: два инстанса толкали бы
         # одно дерево. Логика синхронна с lsyncd_role.sh (UPLOAD_MIRROR).
-        bcm_s3_enabled || continue
+        bcm_s3_storage_enabled || continue
         lsyncd_conf+=$(cat <<LSYNCD_SYNC
 
 -- /upload: статика модулей (en/ru-хелп, картинки crm/main, лого sale) — НЕ CFile,
@@ -588,7 +588,7 @@ _ls_roles() {
 _ls_upload_mirror() {
     bcm_section_header "Зеркало /upload между web-нодами"
 
-    if bcm_s3_enabled; then
+    if bcm_s3_storage_enabled; then
         bcm_info "В кластере развёрнут слой S3: пользовательские файлы /upload хранятся"
         bcm_info "в бакете и одинаково доступны всем web-нодам — зеркало не нужно."
         bcm_info "Статику модулей из /upload раздаёт основной lsyncd с источника."

@@ -199,7 +199,7 @@ bcm_deploy_to_node() {
               bin/lib/redis_session_notify.sh bin/lib/redis_session_check.sh \
               bin/lib/pxc_autorecover.sh bin/lib/lsyncd_role.sh \
               bin/lib/lsyncd_upload.sh \
-              bin/lib/ssl_certs.sh bin/lib/bcm_backup.sh \
+              bin/lib/ssl_certs.sh bin/lib/bcm_backup.sh bin/lib/bcm_s3_external.sh \
               bin/lib/bcm_confedit.sh bin/lib/bcm_update.sh \
               bin/lib/transformer_notify.sh bin/lib/transformer_check.sh \
               bin/lib/bcm_mail.sh VERSION; do

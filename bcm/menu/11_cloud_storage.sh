@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034,SC1091,SC2229,SC2015,SC2129,SC2001,SC2155,SC2181
 # =============================================================================
-# 11_cloud_storage.sh — Облачное хранилище /upload (MinIO S3)
+# 11_cloud_storage.sh — Облачное хранилище /upload (S3: свой MinIO или внешний бакет)
 #
 # Уводит пользовательские файлы Bitrix (/upload) в общий MinIO S3 через модуль
 # «Облачные хранилища», чтобы файлы не расходились между web-нодами (см. также
 # харднинг lsyncd: код синкается, /upload — нет). Параметры — из [s3_upload]
-# в cluster.conf (заполняется install.sh).
+# в cluster.conf: их пишет install.sh для своего слоя S3 либо bcm_s3_external.sh
+# при подключении внешнего бакета провайдера.
 #
 # Надёжная часть (всегда работает): проверка связи + готовые значения для
 # админки. Авто-регистрация бакета — best-effort (cloud_seeder.php), т.к. точная
@@ -21,6 +22,7 @@ source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_runtime.sh"
+source "${BCM_LIB_DIR}/bcm_s3_external.sh"
 
 if ! bcm_conf_exists; then
     bcm_error "cluster.conf не найден. Запустите install.sh."
@@ -28,16 +30,38 @@ if ! bcm_conf_exists; then
 fi
 bcm_load_topology
 
-# Слой S3 опционален (install.sh допускает кластер без него) — без MinIO облачное
-# хранилище /upload подключать не к чему.
-if ! bcm_s3_enabled; then
+# Хранилище может быть своим (слой S3) или внешним (бакет провайдера). Пока не
+# подключено ни то, ни другое — предлагаем подключить внешнее прямо отсюда: для
+# облачного /upload свои ноды не нужны, достаточно доступа к бакету.
+if ! bcm_s3_storage_enabled; then
     bcm_section_header "Облачное хранилище /upload (S3)"
-    bcm_error "Слой S3 в кластере не развёрнут — облачное хранилище недоступно."
-    bcm_info "Пользовательские файлы /upload лежат на дисках web-нод и зеркалятся между"
-    bcm_info "ними отдельным lsyncd-инстансом (меню 6 → 10). Это репликация, а не бэкап."
-    bcm_info "Чтобы включить: добавьте 2+ S3-нод в файл ответов и повторите install.sh."
-    bcm_any_key
-    exit 0
+    bcm_warn "Хранилище не подключено: файлы /upload лежат на дисках web-нод."
+    bcm_info "Между нодами их зеркалит отдельный lsyncd-инстанс (меню 6 → 10) — это"
+    bcm_info "репликация, а не бэкап: удаления не расходятся, а файл, принятый за секунды"
+    bcm_info "до отказа ноды, доехать не успеет."
+    echo
+    bcm_info "Варианты подключения:"
+    bcm_info "  • внешний бакет провайдера — можно подключить сейчас, пункт 1;"
+    bcm_info "  • собственный слой S3 (свои MinIO-ноды) — задаётся при установке кластера."
+    echo
+    while true; do
+        local_items=(
+            "1.  Подключить внешнее S3-хранилище (бакет провайдера)"
+            "0.  Назад"
+        )
+        bcm_print_menu local_items
+        bcm_read_choice "Ваш выбор" cs_choice
+        case "$cs_choice" in
+            1) bcm_s3ext_setup ;;
+            0|"") exit 0 ;;
+            *) bcm_warn "Неверный выбор." ; bcm_any_key ;;
+        esac
+        # После удачного подключения дальше идёт обычное меню раздела.
+        # ⚠️ Только через if: `cmd && break` последней командой тела цикла вернул бы
+        # ненулевой код и под set -e убил бы меню.
+        if bcm_s3_storage_enabled; then break; fi
+    done
+    bcm_load_topology
 fi
 
 # ──── Параметры из [s3_upload] ───────────────────────────────────────────────
@@ -82,7 +106,11 @@ _cs_print_values() {
     bcm_warn "Модуль clouds работает ТОЛЬКО virtual-host + подпись V4 → Регион обязателен."
     bcm_warn "Во вкладке «Правила» — хранить ВСЕ файлы (пустой модуль). Иначе Disk-файлы"
     bcm_warn "(.docx/.pdf) осядут локально → генератор документов/просмотр выдаст 404."
-    bcm_info "Это имя резолвится на web-нодах в /etc/hosts на S3-VIP; MinIO MINIO_DOMAIN совпадает."
+    if bcm_s3_storage_external; then
+        bcm_info "Хранилище внешнее: имя резолвится публичным DNS провайдера."
+    else
+        bcm_info "Это имя резолвится на web-нодах в /etc/hosts на S3-VIP; MinIO MINIO_DOMAIN совпадает."
+    fi
     bcm_info "После добавления: отметьте хранилище активным и включите перенос новых файлов."
     bcm_info "resize_cache оставьте локальным (не переносить в облако)."
     echo
@@ -91,21 +119,29 @@ _cs_print_values() {
 
 # ──── Проверка связи с MinIO с целевой web-ноды ──────────────────────────────
 _cs_test_conn() {
-    bcm_section_header "Проверка связи web-ноды с MinIO"
+    bcm_section_header "Проверка связи web-ноды с хранилищем"
     local node ip
     node=$(_cs_target_node); ip="${BCM_NODE_IP[$node]:-}"
     if [[ -z "$ip" ]]; then bcm_error "Не найдена web-нода."; bcm_any_key; return; fi
 
     bcm_info "Нода: ${node} (${ip}), endpoint: ${S3U_ENDPOINT}"
     echo
-    local health
-    health=$(bcm_ssh_exec_timeout "$ip" 10 \
-        "curl -sf -o /dev/null -w '%{http_code}' '${S3U_ENDPOINT}/minio/health/live' 2>/dev/null || echo 000" \
-        2>/dev/null | tr -d '[:space:]')
-    if [[ "$health" == "200" ]]; then
+    # У своего MinIO есть health-endpoint; у внешнего провайдера его нет — там
+    # достаточно любого HTTP-ответа от эндпоинта.
+    local health url
+    if bcm_s3_storage_external; then url="${S3U_ENDPOINT}"; else url="${S3U_ENDPOINT}/minio/health/live"; fi
+    health=$(bcm_ssh_exec_timeout "$ip" 15 \
+        "curl -s -o /dev/null -w '%{http_code}' --max-time 10 '${url}' 2>/dev/null || echo 000" \
+        </dev/null 2>/dev/null | tr -d '[:space:]')
+    if [[ "$health" == "000" || -z "$health" ]]; then
+        bcm_warn "Эндпоинт недоступен с ноды (нет ответа). Проверьте сеть, DNS и доверие к сертификату."
+    elif bcm_s3_storage_external; then
+        bcm_ok "Эндпоинт отвечает (HTTP ${health})."
+        bcm_info "Полная проверка (ключи, запись, virtual-host) — пункт 4."
+    elif [[ "$health" == "200" ]]; then
         bcm_ok "MinIO health-endpoint доступен (HTTP 200)."
     else
-        bcm_warn "MinIO health-endpoint недоступен (код: ${health}). Проверьте VIP/HAProxy S3 и firewall."
+        bcm_warn "MinIO health-endpoint вернул ${health}. Проверьте VIP/HAProxy S3 и firewall."
     fi
     echo
     bcm_any_key
@@ -161,8 +197,9 @@ _cs_menu() {
         bcm_info "Бакет: ${S3U_BUCKET}  Endpoint: ${S3U_ENDPOINT}"
         local items=(
             "1.  Показать значения для админки (надёжно)"
-            "2.  Проверить связь web→MinIO"
+            "2.  Проверить связь web→хранилище"
             "3.  Авто-регистрация бакета (best-effort, нужен портал)"
+            "4.  Полная проверка доступа к бакету (запись/чтение/vhost)"
             "0.  Назад"
         )
         bcm_print_menu items
@@ -172,6 +209,7 @@ _cs_menu() {
             1) _cs_print_values ;;
             2) _cs_test_conn ;;
             3) _cs_register ;;
+            4) bcm_s3ext_check ;;
             0) return 0 ;;
             "") : ;;
             *) bcm_warn "Неверный выбор." ;;
