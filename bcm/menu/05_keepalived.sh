@@ -215,68 +215,150 @@ _kp_change_priority() {
     bcm_any_key
 }
 
-# Принудительный failover (MASTER → BACKUP временно)
+# Принудительный переезд ОДНОГО VRRP-инстанса.
+#
+# ⚠️ Механизм зависит от инстанса, единого нет:
+#   • без nopreempt (LB-VIP, VI_<web_vrid> крона/lsyncd) — понижаем priority ЭТОГО
+#     инстанса, пир перехватывает по preempt, потом возвращаем исходное значение;
+#   • с nopreempt (сессии, push, кэш, transformer) — понижение приоритета НЕ работает
+#     по определению: резервная нода не отбирает VIP у живого MASTER'а. Единственный
+#     путь — увести инстанс в FAULT, чтобы держатель сам отдал VIP. Для этого health-
+#     check'и понимают маркер /run/bcm-vrrp-fault-*, который здесь ставится и снимается.
+#     Сервисы при этом НЕ трогаются.
+# ⚠️ Правится ТОЛЬКО блок выбранного инстанса: на web-нодах их пять, и общий
+# `sed 's/priority .../'` по файлу обнулил бы приоритеты сразу всем.
 _kp_force_failover() {
-    bcm_section_header "Принудительный failover VIP"
+    bcm_section_header "Принудительный переезд VIP (по одному инстансу)"
 
-    local vip
-    vip=$(bcm_get_vip 2>/dev/null || echo "")
-    if [[ -z "$vip" ]]; then
-        bcm_warn "VIP не задан."
-        bcm_any_key; return
-    fi
-
-    local master_node
-    master_node=$(bcm_get_vip_holder "$vip" 2>/dev/null || echo "")
-    if [[ -z "$master_node" ]]; then
-        bcm_warn "Не удалось определить текущий MASTER."
-        bcm_any_key; return
-    fi
-
-    local master_ip="${BCM_NODE_IP[$master_node]:-}"
-    bcm_info "Текущий MASTER: ${master_node} (${master_ip})"
-    bcm_warn "Действие: понизить приоритет до 90 на ${master_node}, через 30 сек восстановить."
-
-    if ! bcm_confirm "Выполнить failover?"; then
-        bcm_info "Отменено."
-        bcm_any_key; return
-    fi
-
-    # Получить текущий приоритет
-    local orig_priority
-    orig_priority=$(bcm_ssh_exec_timeout "$master_ip" 5 \
-        "grep -m1 'priority' /etc/keepalived/keepalived.conf 2>/dev/null | awk '{print \$2}'" \
-        2>/dev/null | tr -d '[:space:]')
-    orig_priority="${orig_priority:-110}"
-
-    bcm_info "Исходный приоритет: ${orig_priority}"
-    bcm_info "Понижаем до 90..."
-
-    bcm_ssh_exec_timeout "$master_ip" 10 \
-        "sed -i 's/^\(\s*priority\s\+\)[0-9]\+/\190/' /etc/keepalived/keepalived.conf && \
-         systemctl reload-or-restart keepalived" 2>/dev/null || true
-
-    bcm_ok "Приоритет понижен. Ожидаем 30 секунд..."
-
-    local i
-    for i in $(seq 30 -1 1); do
-        printf "  \r  Восстановление через: %2d сек..." "$i"
-        sleep 1
+    # Таблица инстансов: метка|VRID|VIP|слой|маркер FAULT (пусто — механизм priority)
+    local -a rows=()
+    local v
+    v=$(bcm_get_vip 2>/dev/null || echo "")
+    [[ -n "$v" ]] && rows+=("VIP портала (HAProxy)|-|${v}|lb|")
+    v=$(bcm_get_web_vrid 2>/dev/null || echo "")
+    [[ -n "$v" ]] && rows+=("Cron/lsyncd (VI_${v})|${v}|127.0.0.254|web|")
+    local sec
+    for sec in session push cache; do
+        local svip sport svrid
+        svip=$(bcm_conf_get "$sec" redis_vip 2>/dev/null || echo "")
+        sport=$(bcm_conf_get "$sec" redis_port 2>/dev/null || echo "")
+        svrid=$(bcm_conf_get "$sec" keepalived_vrid 2>/dev/null || echo "")
+        [[ -n "$svip" && -n "$sport" ]] && rows+=("Redis ${sec} (:${sport})|${svrid}|${svip}|web|/run/bcm-vrrp-fault-${sport}")
     done
+    local tvip tvrid
+    tvip=$(bcm_conf_get transformer vip 2>/dev/null || echo "")
+    tvrid=$(bcm_conf_get transformer vrid 2>/dev/null || echo "")
+    [[ -n "$tvip" ]] && rows+=("Transformer|${tvrid}|${tvip}|web|/run/bcm-vrrp-fault-transformer")
+
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        bcm_warn "Ни одного VIP не задано в cluster.conf."; bcm_any_key; return
+    fi
+
+    # Текущие держатели
+    echo "  Инстансы и держатели:"
+    local -a holders=()
+    local i=0 row label vrid vip layer marker holder
+    for row in "${rows[@]}"; do
+        IFS='|' read -r label vrid vip layer marker <<< "$row"
+        holder=$(_kp_holder_of "$vip" "$layer")
+        holders+=("$holder")
+        i=$((i+1))
+        printf "    %d. %-26s VIP %-15s держит: %s\n" "$i" "$label" "$vip" "${holder:-—}"
+    done
+    echo "    0. Назад"
     echo
 
-    bcm_info "Восстанавливаем приоритет ${orig_priority}..."
-    bcm_ssh_exec_timeout "$master_ip" 10 \
-        "sed -i 's/^\(\s*priority\s\+\)[0-9]\+/\1${orig_priority}/' /etc/keepalived/keepalived.conf && \
-         systemctl reload-or-restart keepalived" 2>/dev/null || true
+    local idx
+    bcm_read_choice "Какой инстанс переместить (1-${i}, 0 — отмена)" idx
+    [[ "$idx" == "0" || -z "$idx" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    [[ "$idx" =~ ^[0-9]+$ ]] && [[ "$idx" -ge 1 && "$idx" -le "$i" ]] || { bcm_error "Неверный выбор."; bcm_any_key; return; }
 
-    bcm_ok "Приоритет восстановлен на ${master_node}."
+    IFS='|' read -r label vrid vip layer marker <<< "${rows[$((idx-1))]}"
+    holder="${holders[$((idx-1))]}"
+    [[ -z "$holder" ]] && { bcm_error "Держатель не определён — переезжать не от кого."; bcm_any_key; return; }
+    local hip="${BCM_NODE_IP[$holder]:-}"
+    [[ -z "$hip" ]] && { bcm_error "Не найден IP узла ${holder}."; bcm_any_key; return; }
 
-    local new_holder
-    new_holder=$(bcm_get_vip_holder "$vip" 2>/dev/null || echo "?")
-    bcm_info "Текущий держатель VIP: ${new_holder}"
+    bcm_info "${label}: держит ${holder} (${hip})"
+    if [[ -n "$marker" ]]; then
+        bcm_warn "Инстанс с nopreempt → уводим в FAULT маркером ${marker}. Сервисы не трогаем."
+        bcm_warn "VIP уедет к пиру и ОСТАНЕТСЯ там: nopreempt не вернёт его автоматически."
+    else
+        bcm_warn "Инстанс без nopreempt → временно понижаем его priority, затем возвращаем."
+    fi
+    bcm_confirm "Выполнить переезд?" || { bcm_info "Отменено."; bcm_any_key; return; }
 
+    if [[ -n "$marker" ]]; then
+        bcm_ssh_exec_timeout "$hip" 10 "touch '${marker}'" 2>/dev/null
+        bcm_ok "Маркер выставлен, ждём переезда..."
+        _kp_wait_holder_change "$vip" "$layer" "$holder" 25
+        bcm_ssh_exec_timeout "$hip" 10 "rm -f '${marker}'" 2>/dev/null
+        bcm_info "Маркер снят — инстанс на ${holder} снова здоров (останется BACKUP)."
+    else
+        local orig
+        orig=$(bcm_ssh_exec_timeout "$hip" 8 \
+            "awk '/^vrrp_instance/{n=\$2} n!=\"\" && /^[[:space:]]*priority/ && (\"${vrid}\"==\"-\" || n ~ /_${vrid}\$|^VI_${vrid}\$/){print \$2; exit}' /etc/keepalived/keepalived.conf" 2>/dev/null | tr -d '[:space:]')
+        orig="${orig:-110}"
+        bcm_info "Исходный priority: ${orig} → 90"
+        _kp_set_priority "$hip" "$vrid" 90
+        _kp_wait_holder_change "$vip" "$layer" "$holder" 25
+        bcm_info "Возвращаем priority ${orig}..."
+        _kp_set_priority "$hip" "$vrid" "$orig"
+    fi
+
+    sleep 3
+    local now
+    now=$(_kp_holder_of "$vip" "$layer")
+    if [[ -n "$now" && "$now" != "$holder" ]]; then
+        bcm_ok "${label}: VIP перешёл ${holder} → ${now}."
+    elif [[ "$now" == "$holder" ]]; then
+        bcm_warn "${label}: VIP остался на ${holder}. Проверьте состояние пира (keepalived, health-check)."
+    else
+        bcm_warn "${label}: держатель не определяется — проверьте keepalived на обеих нодах."
+    fi
     bcm_any_key
+}
+
+# Кто держит адрес: для lb-VIP — штатный хелпер, для web-инстансов ищем адрес на узле
+# (у крона это маркерный 127.0.0.254 на lo).
+_kp_holder_of() {
+    local vip="$1" layer="$2" node ip
+    if [[ "$layer" == "lb" ]]; then
+        bcm_get_vip_holder "$vip" 2>/dev/null || echo ""
+        return
+    fi
+    for node in $(bcm_get_nodes "$layer" 2>/dev/null); do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        if [[ "$(bcm_ssh_exec_timeout "$ip" 5 "ip -4 addr 2>/dev/null | grep -q 'inet ${vip}[/ ]' && echo YES" 2>/dev/null | tr -d '[:space:]')" == "YES" ]]; then
+            echo "$node"; return
+        fi
+    done
+    echo ""
+}
+
+# priority ТОЛЬКО у блока нужного инстанса (vrid='-' → единственный инстанс на узле).
+_kp_set_priority() {
+    local ip="$1" vrid="$2" val="$3"
+    bcm_ssh_exec_timeout "$ip" 15 "
+        awk -v vrid='${vrid}' -v val='${val}' '
+            /^vrrp_instance/ { inb = (vrid == \"-\" || \$2 ~ (\"_\" vrid \"\$\")) }
+            inb && /^[[:space:]]*priority[[:space:]]/ { sub(/[0-9]+[[:space:]]*\$/, val) }
+            /^}/ { inb = 0 }
+            { print }
+        ' /etc/keepalived/keepalived.conf > /tmp/bcm-kp.new && mv /tmp/bcm-kp.new /etc/keepalived/keepalived.conf
+        systemctl reload keepalived 2>/dev/null || systemctl restart keepalived" 2>/dev/null
+}
+
+# Ждать смены держателя (или таймаут).
+_kp_wait_holder_change() {
+    local vip="$1" layer="$2" was="$3" secs="${4:-25}" i now
+    for ((i=0; i<secs; i++)); do
+        sleep 1
+        now=$(_kp_holder_of "$vip" "$layer")
+        [[ -n "$now" && "$now" != "$was" ]] && { bcm_ok "  VIP уехал на ${now} (за ${i}с)."; return 0; }
+    done
+    bcm_warn "  За ${secs}с держатель не сменился."
+    return 1
 }
 
 # Показать keepalived.conf на каждом lb-узле
@@ -413,7 +495,7 @@ _kp_menu() {
             "1.  Статус VIP: кто держит, приоритеты VRRP"
             "2.  Состояние VRRP на всех lb-узлах (MASTER/BACKUP)"
             "3.  Изменить VRRP приоритет на узле"
-            "4.  Принудительный failover (MASTER → BACKUP на 30с)"
+            "4.  Принудительный переезд VIP (по одному инстансу)"
             "5.  Показать keepalived.conf на lb-узлах"
             "6.  Перезапустить keepalived на всех lb-узлах"
             "7.  Логи VRRP (journalctl keepalived)"
