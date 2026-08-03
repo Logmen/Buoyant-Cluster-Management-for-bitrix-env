@@ -1514,8 +1514,8 @@ SQL
     # (BX:Main:Uploader) держит состояние догрузки node-local → без аффинности
     # round-robin рвёт finalize/resume («Could not resume file transfer», дубли-
     # сироты в S3, нет Disk-объекта). Bitrix-кластер требует sticky. web_cache_backend
-    # (контент-хэш ассеты, retry-on 404) — БЕЗ cookie (аффинность не нужна, покрыто
-    # ретраем). Аналогично admin (balance first → всегда primary).
+    # — БЕЗ cookie, у него своя схема (см. ниже). Аналогично admin (balance first →
+    # всегда primary).
     local web_backends="" web_backends_sticky=""
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
@@ -1523,8 +1523,22 @@ SQL
         web_backends_sticky="${web_backends_sticky}    server ${name} ${ip}:80 cookie ${name} check inter 2s fall 3 rise 2\n"
     done
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_NODES_BACKENDS__" "$web_backends_sticky"
-    # web_cache_backend (CSS/JS-кэш, retry-on 404) — те же web-ноды, БЕЗ cookie.
-    render_multiline "$local_haproxy_cfg" "__BCM_WEB_CACHE_BACKENDS__" "$web_backends"
+
+    # ⚠️ web_cache_backend (CSS/JS-кэш) — ОДИН источник: первый web (источник lsyncd
+    # и admin-primary) primary, остальные backup. Часть бандлов имеет фиксированное
+    # имя без контент-хэша (kernel_*_v1.js), нода собирает его лениво как снимок
+    # своего состояния, и после обновления модулей на нодах под одним именем лежат
+    # РАЗНЫЕ файлы. Round-robin отдавал бы браузеру то один, то другой (обе ноды —
+    # 200, retry-on 404 не спасает) → часть компонентов не инициализируется, портал
+    # рисуется без стилей. Подробности — в шапке бэкенда в haproxy.cfg.tmpl.
+    local cache_src="${WEB_NODES[0]}"
+    local web_cache_backends=""
+    web_cache_backends="${web_cache_backends}    server ${cache_src} ${WEB_IPS[$cache_src]}:80 check inter 2s fall 3 rise 2\n"
+    for name in "${WEB_NODES[@]}"; do
+        [[ "$name" == "$cache_src" ]] && continue
+        web_cache_backends="${web_cache_backends}    server ${name} ${WEB_IPS[$name]}:80 check inter 2s fall 3 rise 2 backup\n"
+    done
+    render_multiline "$local_haproxy_cfg" "__BCM_WEB_CACHE_BACKENDS__" "$web_cache_backends"
 
     # Admin/запись (/bitrix/admin) — только на источник lsyncd (первый web),
     # остальные ноды как backup (берутся лишь при падении источника). Так
