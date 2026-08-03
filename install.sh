@@ -1797,6 +1797,14 @@ EOF
 
         bcm_ssh_copy_file "$local_proxysql_cfg" "$ip" "/etc/proxysql.cnf"
 
+        # ⚠️ Несвежий pid-файл ProxySQL после аварийного ребута не даёт ему стартовать
+        # (подробности — в самом шаблоне). Без этого drop-in web-нода после жёсткого
+        # сброса ВСЕГДА поднимается без ProxySQL: портал отдаёт 500 и выпадает из
+        # HAProxy по L7-проверке. Ловили вживую на обеих web-нодах.
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/systemd/system/proxysql.service.d"
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/templates/proxysql_stale_pid.conf.tmpl" \
+            "$ip" "/etc/systemd/system/proxysql.service.d/zz-bcm-stale-pid.conf"
+
         local local_keepalived_web="/tmp/keepalived_web.conf"
         cp "${BCM_BASE_DIR}/templates/keepalived_web.conf.tmpl" "$local_keepalived_web"
 

@@ -1,0 +1,14 @@
+# BCM: снятие несвежего pid-файла ProxySQL перед стартом.
+#
+# Юнит proxysql — Type=forking с PIDFile=/var/lib/proxysql/proxysql.pid.
+# ProxySQL при старте читает этот файл и, если записанный в нём PID жив,
+# печатает "Daemon already running on PID file <N>" и выходит с ошибкой.
+# При жёстком сбросе ноды файл остаётся с PID прошлой загрузки, а на раннем
+# этапе следующей загрузки тот же номер уже занят чужим процессом (воркеры
+# nginx получают PID из того же диапазона) → ProxySQL не поднимается ВСЕГДА:
+# web-нода отдаёт 500 и выпадает из HAProxy по L7-проверке.
+#
+# Файл удаляется, только если в нём НЕ живой proxysql, — работающий экземпляр
+# не трогаем. Префикс "-" у ExecStartPre: отсутствие pid-файла не ошибка.
+[Service]
+ExecStartPre=-/bin/sh -c "pgrep -F /var/lib/proxysql/proxysql.pid -x proxysql >/dev/null 2>&1 || rm -f /var/lib/proxysql/proxysql.pid"
