@@ -502,6 +502,69 @@ _st_repoint_settings() {
     bcm_any_key
 }
 
+# /etc/hosts на web-ноде обязан содержать домен портала (→127.0.0.1, иначе
+# self-запросы Bitrix уходят через VIP на соседнюю ноду и ловят 404) и алиас
+# 'default' на TRANSFORMER_VIP (по нему модуль и воркеры находят RabbitMQ).
+# Обе записи периодически сносит ansible bitrix-env — проверяем и чиним по месту.
+_st_check_portal_hosts() {
+    bcm_section_header "Записи /etc/hosts на web-нодах (портал, генератор документов)"
+
+    local -a web_nodes=()
+    mapfile -t web_nodes < <(bcm_get_nodes web)
+
+    local -a broken=()
+    local node ip out line
+    for node in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "$node")
+        [[ -z "$ip" ]] && continue
+        out=$(bcm_ssh_exec_timeout "$ip" 15 \
+            "[ -x /opt/bcm/bin/lib/bcm_portal_hosts.sh ] && /opt/bcm/bin/lib/bcm_portal_hosts.sh show 2>&1 || echo 'НЕТ СКРИПТА (раскатайте BCM на ноды)'" 2>/dev/null)
+        echo "  $(bcm_pad "$node" 10)"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == OK:* ]]; then
+                bcm_ok "    ${line#OK: }"
+            else
+                bcm_warn "    ${line}"
+                broken+=("${node}:${ip}")
+            fi
+        done <<< "$out"
+    done
+
+    if [[ ${#broken[@]} -eq 0 ]]; then
+        echo
+        bcm_ok "Все обязательные записи на месте."
+        bcm_any_key
+        return
+    fi
+
+    echo
+    bcm_warn "Без домена портала «Проверка системы» отдаёт 404 через раз; без 'default' не работает генератор документов."
+    local ans
+    bcm_read_choice "Прописать запись на перечисленных нодах? (y/N, 0 — отмена)" ans
+    if [[ "$ans" == "0" || -z "$ans" ]] || [[ ! "$ans" =~ ^[YyДд]$ ]]; then
+        bcm_info "Отменено."
+        bcm_any_key
+        return
+    fi
+
+    # У ноды может не хватать сразу нескольких записей — чиним её один раз.
+    local -a targets=()
+    mapfile -t targets < <(printf '%s\n' "${broken[@]}" | sort -u)
+
+    local entry
+    for entry in "${targets[@]}"; do
+        node="${entry%%:*}"; ip="${entry##*:}"
+        if bcm_ssh_exec_timeout "$ip" 20 \
+            "[ -x /opt/bcm/bin/lib/bcm_portal_hosts.sh ] && /opt/bcm/bin/lib/bcm_portal_hosts.sh assert && /opt/bcm/bin/lib/bcm_portal_hosts.sh check" >/dev/null 2>&1; then
+            bcm_ok "  ${node}: записи восстановлены."
+        else
+            bcm_error "  ${node}: не удалось (нет /opt/bcm/bin/lib/bcm_portal_hosts.sh? раскатайте BCM на ноды)."
+        fi
+    done
+    bcm_any_key
+}
+
 _st_menu() {
     while true; do
         bcm_section_header "Управление сайтами"
@@ -515,6 +578,7 @@ _st_menu() {
             "6.  Показать подключение к БД (проверка ProxySQL)"
             "7.  Запустить синхронизацию нового каталога (lsyncd)"
             "8.  Перенастроить .settings.php перенесённого портала (DB+Redis+Push)"
+            "9.  Проверить домен портала в /etc/hosts на web-нодах"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -531,6 +595,7 @@ _st_menu() {
             6) _st_show_db_connection ;;
             7) _st_trigger_lsyncd     ;;
             8) _st_repoint_settings   ;;
+            9) _st_check_portal_hosts ;;
             0) return 0               ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

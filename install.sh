@@ -2989,22 +2989,31 @@ configure_portal_hosts() {
         return 0
     fi
     log_info "Прописываю домен портала ${PORTAL_DOMAIN} → 127.0.0.1 на web-нодах (self-check'и)..."
-    local dom_re="${PORTAL_DOMAIN//./\\.}"   # экранируем точки для sed
     local name
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
         if [[ "$DRY_RUN" -eq 1 ]]; then
-            log_info "[DRY RUN] $name ($ip): 127.0.0.1 ${PORTAL_DOMAIN} в /etc/hosts"
+            log_info "[DRY RUN] $name ($ip): 127.0.0.1 ${PORTAL_DOMAIN} в /etc/hosts + guard"
             continue
         fi
-        # Идемпотентно: удалить прежние записи домена, вставить 127.0.0.1 ПЕРЕД
-        # ANSIBLE-блоком (иначе ansible bitrix-env затрёт запись после маркера).
-        bcm_ssh_exec "$ip" "cp -n /etc/hosts /etc/hosts.bcm-bak 2>/dev/null; \
-            sed -i '/${dom_re}/d' /etc/hosts; \
-            if grep -q '# ANSIBLE MANAGED BLOCK' /etc/hosts; then \
-                sed -i '/# ANSIBLE MANAGED BLOCK/i 127.0.0.1 ${PORTAL_DOMAIN}' /etc/hosts; \
-            else echo '127.0.0.1 ${PORTAL_DOMAIN}' >> /etc/hosts; fi"
-        log_ok "  $name: ${PORTAL_DOMAIN} → 127.0.0.1"
+        # Сама правка /etc/hosts — в bcm_portal_hosts.sh (одна реализация на
+        # установку, guard и меню). Скрипт кладём сразу, не дожидаясь deploy_bcm:
+        # запись нужна ещё до того, как портал начнёт себя проверять.
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /opt/bcm/bin/lib"
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/bin/lib/bcm_portal_hosts.sh" "$ip" "/opt/bcm/bin/lib/bcm_portal_hosts.sh"
+        bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/bcm_portal_hosts.sh"
+
+        # ⚠️ Одной записи мало: ansible bitrix-env перезаписывает /etc/hosts (ловили
+        # вживую — на боевых web-нодах файл оказался сброшен к дистрибутивному виду,
+        # запись домена исчезла). Guard раз в 10 минут переприменяет её, как
+        # bcm-ha-cron-guard для роли HA-Cron.
+        bcm_ssh_exec_logged "$name" "$ip" "printf '*/10 * * * * root /opt/bcm/bin/lib/bcm_portal_hosts.sh assert >/dev/null 2>&1\n' > /etc/cron.d/bcm-portal-hosts-guard && chmod 644 /etc/cron.d/bcm-portal-hosts-guard"
+
+        if bcm_ssh_exec "$ip" "/opt/bcm/bin/lib/bcm_portal_hosts.sh assert && /opt/bcm/bin/lib/bcm_portal_hosts.sh check" >/dev/null 2>&1; then
+            log_ok "  $name: ${PORTAL_DOMAIN} → 127.0.0.1 (+ guard каждые 10 мин)"
+        else
+            log_warn "  $name: не удалось прописать ${PORTAL_DOMAIN} → 127.0.0.1 в /etc/hosts."
+        fi
     done
 }
 
@@ -3447,6 +3456,9 @@ finalize_web_nodes() {
         fi
         bcm_ssh_exec "$ip" "systemctl restart proxysql 2>/dev/null || true" >/dev/null 2>&1
         bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/cron_notify.sh ] && /opt/bcm/bin/lib/cron_notify.sh assert 2>/dev/null || true" >/dev/null 2>&1
+        # Домен портала → 127.0.0.1: ansible bitrix-env мог перезаписать /etc/hosts
+        # уже после configure_portal_hosts, поэтому переприменяем последним шагом.
+        bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/bcm_portal_hosts.sh ] && /opt/bcm/bin/lib/bcm_portal_hosts.sh assert 2>/dev/null || true" >/dev/null 2>&1
         if [[ "$fz_db_ok" == "0" ]]; then
             log_warn "  $name: mysqld ОСТАВЛЕН включённым (БД портала не на ProxySQL); ProxySQL/HA-Cron переприменены."
         else
