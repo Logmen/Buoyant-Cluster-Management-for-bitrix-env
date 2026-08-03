@@ -3003,11 +3003,18 @@ configure_portal_hosts() {
         bcm_ssh_copy_file "${BCM_BASE_DIR}/bin/lib/bcm_portal_hosts.sh" "$ip" "/opt/bcm/bin/lib/bcm_portal_hosts.sh"
         bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/bcm_portal_hosts.sh"
 
-        # ⚠️ Одной записи мало: ansible bitrix-env перезаписывает /etc/hosts (ловили
-        # вживую — на боевых web-нодах файл оказался сброшен к дистрибутивному виду,
-        # запись домена исчезла). Guard раз в 10 минут переприменяет её, как
-        # bcm-ha-cron-guard для роли HA-Cron.
+        # ⚠️⚠️ Одной записи мало — /etc/hosts затирается двумя путями, поэтому и
+        # защиты две. (1) cloud-init переписывает файл на КАЖДОЙ загрузке (модуль
+        # update_etc_hosts в cloud_init_modules) → boot-юнит переприменяет записи
+        # сразу после cloud-init и ДО сервисов, которым они нужны. (2) ansible
+        # bitrix-env может переписать файл в произвольный момент → guard раз в 10
+        # минут, как bcm-ha-cron-guard для роли HA-Cron. Без boot-юнита после
+        # каждой перезагрузки оставалось окно до 10 минут, в котором генератор
+        # документов не находил RabbitMQ, а воркеры уходили в крэш-луп.
         bcm_ssh_exec_logged "$name" "$ip" "printf '*/10 * * * * root /opt/bcm/bin/lib/bcm_portal_hosts.sh assert >/dev/null 2>&1\n' > /etc/cron.d/bcm-portal-hosts-guard && chmod 644 /etc/cron.d/bcm-portal-hosts-guard"
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/templates/bcm-portal-hosts.service.tmpl" \
+            "$ip" "/etc/systemd/system/bcm-portal-hosts.service"
+        bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable bcm-portal-hosts.service"
 
         if bcm_ssh_exec "$ip" "/opt/bcm/bin/lib/bcm_portal_hosts.sh assert && /opt/bcm/bin/lib/bcm_portal_hosts.sh check" >/dev/null 2>&1; then
             log_ok "  $name: ${PORTAL_DOMAIN} → 127.0.0.1 (+ guard каждые 10 мин)"

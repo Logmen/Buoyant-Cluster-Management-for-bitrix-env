@@ -1,0 +1,26 @@
+[Unit]
+# Переприменение обязательных записей /etc/hosts при загрузке.
+#
+# cloud-init переписывает /etc/hosts на КАЖДОЙ загрузке: модуль update_etc_hosts
+# входит в cloud_init_modules, то есть отрабатывает в cloud-init.service и
+# возвращает файл к шаблону — унося и домен портала, и алиас 'default' на
+# TRANSFORMER_VIP. Периодического guard'а в /etc/cron.d недостаточно: он тикает
+# раз в 10 минут, поэтому после каждой перезагрузки остаётся окно, в котором
+# генератор документов не находит RabbitMQ (воркеры не подключаются и уходят в
+# крэш-луп), а self-check'и Bitrix ловят 404. Ловили вживую на тесте отказа.
+#
+# Порядок важен: After=cloud-init.service — иначе нашу правку затрёт сам
+# cloud-init; Before=... — чтобы зависящие сервисы стартовали уже с записями.
+Description=BCM: обязательные записи /etc/hosts (домен портала, брокер конвертера)
+After=cloud-init.service network-online.target
+Wants=network-online.target
+Before=httpd.service transformer.service push-server.service
+ConditionPathExists=/opt/bcm/bin/lib/bcm_portal_hosts.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/bcm/bin/lib/bcm_portal_hosts.sh assert
+
+[Install]
+WantedBy=multi-user.target
