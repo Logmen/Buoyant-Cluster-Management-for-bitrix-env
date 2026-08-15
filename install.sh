@@ -186,6 +186,7 @@ PORTAL_DOMAIN=""
 LE_EMAIL=""
 FORCE_HTTPS="0"
 ACME_HTTP_PORT="8402"   # порт standalone-ответчика acme.sh на LB (acme_backend)
+HAPROXY_STATS_PORT="8404" # порт статистики HAProxy (bind в haproxy.cfg, метка SELinux)
 # Резервное копирование в MinIO кластера (бакет с versioning + lifecycle).
 # Первая линия — свой S3 (защита от ошибок оператора/отказа ноды); offsite-копия
 # на внешний сервер — отдельным шагом (см. CLAUDE.md / меню 13).
@@ -392,7 +393,7 @@ validate_secrets() {
 _bcm_web_timezone() {
     local tz=""
     if [[ ${#WEB_NODES[@]} -gt 0 ]]; then
-        tz=$(bcm_ssh_exec "${WEB_IPS[${WEB_NODES[0]}]}" "date +%z" 2>/dev/null | tr -d '[:space:]')
+        tz=$(bcm_ssh_exec "${WEB_IPS[${WEB_NODES[0]}]}" "date +%z" 2>/dev/null | tr -d '[:space:]') || true
     fi
     if [[ "$tz" =~ ^[+-][0-9]{4}$ ]]; then
         printf '%s:%s' "${tz:0:3}" "${tz:3:2}"
@@ -1118,9 +1119,38 @@ install_packages() {
         else
             bcm_ssh_exec_logged "$name" "$ip" "dnf install -y curl wget rsync || yum install -y curl wget rsync"
 
-            if bcm_ssh_exec "$ip" "[ -f /opt/webdir/bin/bitrix_menu.sh ] && echo 'installed'" | grep -q 'installed'; then
+            # ⚠️ Признак «bitrix-env уже стоит» — НЕ только bitrix_menu.sh: этот файл кладёт
+            # rpm-пакет bitrix-env в САМОМ НАЧАЛЕ работы bitrix-env-9.sh. Если вендорский
+            # установщик оборвался позже (мы ловили обрыв на его `rpm -Uvh` и на требовании
+            # перезагрузки из-за SELinux), маркер остаётся, а стека нет — повторный install.sh
+            # тогда МОЛЧА пропускал установку, и падение всплывало через несколько шагов, на
+            # копировании nginx-сниппета. Проверяем реально работающий набор: nginx + httpd.
+            # ⚠️ Проверяем bx-nginx, а НЕ nginx: bitrix-env ставит СВОЮ сборку nginx
+            # (пакет bx-nginx, юнит тот же nginx.service). `rpm -q nginx` на нормально
+            # установленной ноде отвечает «not installed» — с ним условие никогда не
+            # выполнялось бы и вендорский установщик перезапускался бы на каждом прогоне.
+            if bcm_ssh_exec "$ip" "[ -f /opt/webdir/bin/bitrix_menu.sh ] && rpm -q bx-nginx >/dev/null 2>&1 && rpm -q httpd >/dev/null 2>&1 && echo 'installed'" | grep -q 'installed'; then
                 log_ok "  bitrix-env уже установлен на $name"
             else
+                # ⚠️ PHP на web-нодах приходит ТОЛЬКО из remi (так устроен bitrix-env), но в
+                # ol9_appstream лежат php-pecl-* под системный PHP 8.0 с БОЛЬШИМ release
+                # (напр. php-pecl-rrd-2.0.3-3.el9 против remi-шного -2.el9.remi.8.2). Полный
+                # `dnf update`, который делает bitrix-env-9.sh, считает их кандидатами на
+                # обновление и упирается в «cannot install both php-common-8.0…and 8.2…»,
+                # после чего печатает «Error updating the system» и выходит. Исключаем php-*
+                # из appstream — remi остаётся единственным источником PHP.
+                bcm_ssh_exec_logged "$name" "$ip" "dnf config-manager --save '--setopt=ol9_appstream.excludepkgs=php-*' >/dev/null 2>&1 || true; true"
+
+                # ⚠️ bitrix-env-9.sh в конце ставит свои сборки одной командой
+                # `rpm -Uvh mariadb-connector-c perl-DBD-MySQL`. Если ЛЮБОЙ из них той же
+                # версии уже стоит (остался от прерванного прогона или пришёл зависимостью),
+                # rpm отвечает «already installed», возвращает ненулевой код, и вендорский
+                # установщик падает с «rpm error» — уже ПОСЛЕ того, как поставил весь стек.
+                # Снимаем оба заранее: они не тянут за собой зависимостей и возвращаются
+                # через секунды из набора bitrix-env. Ветка выполняется только когда стек
+                # ещё не установлен, поэтому рабочей ноде удаление не грозит.
+                bcm_ssh_exec_logged "$name" "$ip" "rpm -e --nodeps mariadb-connector-c perl-DBD-MySQL >/dev/null 2>&1; true"
+
                 log_info "  Скачивание и запуск bitrix-env-9.sh на $name (это займет некоторое время)..."
                 bcm_ssh_exec_logged "$name" "$ip" "wget -qO /tmp/bitrix-env-9.sh https://repos.1c-bitrix.ru/dnf/bitrix-env-9.sh || wget -qO /tmp/bitrix-env-9.sh https://repo.bitrix.info/dnf/bitrix-env-9.sh"
                 bcm_ssh_exec_logged "$name" "$ip" "chmod +x /tmp/bitrix-env-9.sh"
@@ -1396,7 +1426,7 @@ configure_services() {
         # → pool = 0.75*RAM − 500*2M − 128M (прочие global). Floor 256M; fallback 1024M.
         # max_connections=500 задан в pxc.cnf.tmpl — при его изменении поправить и тут.
         local node_mem_mb pool_mb
-        node_mem_mb=$(bcm_ssh_exec "$ip" "awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo" 2>/dev/null | tr -d '[:space:]')
+        node_mem_mb=$(bcm_ssh_exec "$ip" "awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo" 2>/dev/null | tr -d '[:space:]') || true
         if [[ "$node_mem_mb" =~ ^[0-9]+$ && "$node_mem_mb" -ge 1024 ]]; then
             pool_mb=$(( node_mem_mb * 75 / 100 - 500 * 2 - 128 ))
             [[ "$pool_mb" -lt 256 ]] && pool_mb=256
@@ -1508,6 +1538,7 @@ SQL
     local local_haproxy_cfg="/tmp/haproxy.cfg"
     cp "${BCM_BASE_DIR}/templates/haproxy.cfg.tmpl" "$local_haproxy_cfg"
     render_value "$local_haproxy_cfg" "__BCM_STATS_PASSWORD__" "$stats_pass"
+    render_value "$local_haproxy_cfg" "__STATS_PORT__" "$HAPROXY_STATS_PORT"
 
     # web_backend — со sticky-cookie (server-line `cookie <name>` + директива
     # `cookie ... insert` в стансе): многошаговый протокол загрузчика Bitrix
@@ -1624,7 +1655,7 @@ SQL
         peer_ip=$(_bcm_peers_ml "$name" "${lb_pairs[@]}")
 
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]') || true
         [[ -z "$iface" ]] && iface="ens18"
 
         sed -i "s/__NODE_NAME__/${name}/g" "$local_keepalived_cfg"
@@ -1638,6 +1669,13 @@ SQL
 
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived"
         bcm_ssh_copy_file "$local_keepalived_cfg" "$ip" "/etc/keepalived/keepalived.conf"
+
+        # ⚠️⚠️ SELinux (Enforcing по умолчанию на Oracle/Alma 9): haproxy_t умеет биндить
+        # только порты типа http_port_t (80, 443, 8443, 9000…), а порта статистики 8404
+        # в этом списке НЕТ → bind падает с «cannot bind socket (Permission denied)»,
+        # причём `haproxy -c` конфиг считает валидным, и в логе установки виден лишь
+        # exit code сервиса. Метку ставим ДО старта; шаг идемпотентен (-a, иначе -m).
+        bcm_ssh_exec_logged "$name" "$ip" "if command -v getenforce >/dev/null 2>&1 && [ \"\$(getenforce)\" != Disabled ]; then command -v semanage >/dev/null 2>&1 || dnf install -y -q policycoreutils-python-utils >/dev/null 2>&1; semanage port -a -t http_port_t -p tcp ${HAPROXY_STATS_PORT} 2>/dev/null || semanage port -m -t http_port_t -p tcp ${HAPROXY_STATS_PORT} 2>/dev/null; fi; true"
 
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable haproxy keepalived && systemctl restart haproxy keepalived"
     done
@@ -1833,7 +1871,7 @@ EOF
         peer_ip=$(_bcm_peers_ml "$name" "${web_pairs[@]}")
 
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]') || true
         [[ -z "$iface" ]] && iface="ens18"
 
         sed -i "s/__NODE_NAME__/${name}/g" "$local_keepalived_web"
@@ -1897,6 +1935,16 @@ if [[ ! -x "$SITES" || ! -x "$WRAP" ]]; then
     exit 0
 fi
 
+# ⚠️ Портал ещё не развёрнут: ansible-роль push пишет секцию pull в .settings.php,
+# и без него play заканчивается с error:1 (сам push-сервер при этом ставится и
+# работает). На чистом кластере это НОРМА — портал приезжает миграцией позже,
+# push подключается из BCM (меню 9). Ведём себя как configure_portal_db: мягкий
+# пропуск с понятным сообщением, а не отказ установки.
+if [[ ! -f /home/bitrix/www/bitrix/.settings.php ]]; then
+    echo "PUSH_SKIP_NOPORTAL"
+    exit 0
+fi
+
 # Имя хоста в пуле (строка host:<name>:<ip>:<groups>:...)
 host_line=$("$WRAP" 2>/dev/null | grep '^host:' | head -1)
 pool_host=$(echo "$host_line" | awk -F: '{print $2}')
@@ -1944,7 +1992,10 @@ PUSH_SCRIPT
 
         log_info "Настройка push на $name ($ip) (установка пакетов/redis/nodejs — может занять пару минут)..."
         local result
-        result=$(printf '%s\n' "$remote_script" | bcm_ssh_script "$ip" 2>/dev/null)
+        # ⚠️ || true ОБЯЗАТЕЛЕН: без него ненулевой код удалённого скрипта убивает
+        # install.sh прямо на присваивании (set -e), и разбор результата ниже —
+        # с его аккуратными ветками PUSH_OK/PUSH_SKIP/предупреждение — не выполняется.
+        result=$(printf '%s\n' "$remote_script" | bcm_ssh_script "$ip" 2>/dev/null || true)
 
         # Логируем подробности на узловой лог
         mkdir -p "$NODE_LOGS_DIR" 2>/dev/null || true
@@ -1955,6 +2006,9 @@ PUSH_SCRIPT
             log_ok "  $name: Push & Pull подключён (sub 8010-8015, pub 9010-9011)."
         elif echo "$result" | grep -q 'PUSH_ALREADY_ENABLED'; then
             log_ok "  $name: Push & Pull уже подключён — пропуск."
+        elif echo "$result" | grep -q 'PUSH_SKIP_NOPORTAL'; then
+            log_warn "  $name: портал не развёрнут (.settings.php нет) — push пропущен."
+            log_warn "    Подключите его после переноса портала: BCM меню 9."
         elif echo "$result" | grep -q 'PUSH_SKIP'; then
             log_warn "  $name: bitrix-env не найден, push пропущен."
         else
@@ -2043,7 +2097,7 @@ UNIT
 
         # 4. VRRP-инстанс keepalived для VIP сессий (добавляем к keepalived.conf)
         local iface
-        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]') || true
         [[ -z "$iface" ]] && iface="ens18"
 
         local state="BACKUP" priority="100" peer_ip=""
@@ -2120,7 +2174,7 @@ PHPSNIP
         rm -f "$local_php"
 
         local php_res
-        php_res=$(bcm_ssh_exec "$ip" "php /tmp/bcm-session-settings.php 2>&1; rm -f /tmp/bcm-session-settings.php")
+        php_res=$(bcm_ssh_exec "$ip" "php /tmp/bcm-session-settings.php 2>&1; rm -f /tmp/bcm-session-settings.php") || true
         if echo "$php_res" | grep -q 'SETTINGS_OK'; then
             bcm_ssh_exec "$ip" "chown bitrix:bitrix ${docroot}/bitrix/.settings.php 2>/dev/null || true"
             log_ok "  $name: redis-сессии настроены, .settings.php обновлён."
@@ -2161,7 +2215,7 @@ configure_portal_db() {
     # 1. Прочитать подключение скелета bitrix-env на источнике
     bcm_ssh_copy_file "$repoint_php" "$src_ip" "/tmp/bcm_db_repoint.php"
     local rd db_name db_host res
-    rd=$(bcm_ssh_exec "$src_ip" "BX_DOCROOT='${docroot}' BX_MODE=read php /tmp/bcm_db_repoint.php 2>&1")
+    rd=$(bcm_ssh_exec "$src_ip" "BX_DOCROOT='${docroot}' BX_MODE=read php /tmp/bcm_db_repoint.php 2>&1") || true
     db_name=$(echo "$rd" | sed -n 's/^DB_NAME=//p' | head -1)
     db_host=$(echo "$rd" | sed -n 's/^DB_HOST=//p' | head -1)
     res=$(echo "$rd" | sed -n 's/^RESULT=//p' | head -1)
@@ -2208,7 +2262,7 @@ PT=\$(mysql --default-auth=mysql_native_password -p'${BITRIX_DB_PASS}' -h127.0.0
 echo "PROXY_OK=\$PT"
 RS
 )
-    result=$(printf '%s\n' "$rscript" | bcm_ssh_script "$src_ip" 2>/dev/null)
+    result=$(printf '%s\n' "$rscript" | bcm_ssh_script "$src_ip" 2>/dev/null) || true
     mig=$(echo "$result" | sed -n 's/^MIG=//p' | head -1)
     pt=$(echo "$result" | sed -n 's/^PROXY_OK=//p' | head -1)
     log_info "  Миграция: ${mig:-?}; ProxySQL-роутинг: ${pt:-?}"
@@ -2224,7 +2278,7 @@ RS
         local ip="${WEB_IPS[$name]}"
         bcm_ssh_copy_file "$repoint_php" "$ip" "/tmp/bcm_db_repoint.php"
         local w
-        w=$(bcm_ssh_exec "$ip" "BX_DOCROOT='${docroot}' BX_MODE=write BX_DB_HOST='${proxy_host}' BX_DB_LOGIN='${BITRIX_DB_USER}' BX_DB_PASS='${BITRIX_DB_PASS}' BX_DB_NAME='${db_name}' php /tmp/bcm_db_repoint.php 2>&1; chown bitrix:bitrix '${docroot}/bitrix/.settings.php' 2>/dev/null; rm -f /tmp/bcm_db_repoint.php")
+        w=$(bcm_ssh_exec "$ip" "BX_DOCROOT='${docroot}' BX_MODE=write BX_DB_HOST='${proxy_host}' BX_DB_LOGIN='${BITRIX_DB_USER}' BX_DB_PASS='${BITRIX_DB_PASS}' BX_DB_NAME='${db_name}' php /tmp/bcm_db_repoint.php 2>&1; chown bitrix:bitrix '${docroot}/bitrix/.settings.php' 2>/dev/null; rm -f /tmp/bcm_db_repoint.php") || true
         if echo "$w" | grep -q 'RESULT=OK'; then
             log_ok "  $name: .settings.php → ProxySQL (${proxy_host}, user ${BITRIX_DB_USER}, db ${db_name})."
         elif echo "$w" | grep -q 'RESULT=NO_SETTINGS'; then
@@ -2313,6 +2367,81 @@ configure_local_logrotate() {
 }
 EOF
     log_ok "Локальная ротация логов установки настроена."
+}
+
+# ⚠️⚠️ SELinux ОБЯЗАН быть Disabled на всех узлах, и это НЕ вопрос вкуса:
+# установщик bitrix-env (bitrix-env-9.sh) при включённом SELinux переписывает
+# /etc/selinux/config, печатает «Please reboot the system!» и ВЫХОДИТ С КОДОМ 0,
+# ничего не установив. install.sh считал шаг успешным и шёл дальше — web-ноды
+# оставались без nginx/httpd/php, а падало потом на копировании nginx-сниппета
+# (ловили вживую на Oracle Linux 9). Поэтому шаг обязателен ДО install_packages.
+# ⚠️ В EL9 одного SELINUX=disabled в конфиге мало — ядро всё равно грузит политику;
+# полное отключение даёт только параметр ядра selinux=0 (grubby) + перезагрузка.
+_selinux_state() {
+    bcm_ssh_exec "$1" "getenforce 2>/dev/null || echo Disabled" </dev/null | tr -d '[:space:]'
+}
+
+_selinux_wait_node() {
+    local ip="$1" name="$2" i
+    for ((i = 0; i < 60; i++)); do
+        sleep 5
+        bcm_ssh_exec "$ip" "true" </dev/null 2>/dev/null && return 0
+    done
+    log_error "Узел ${name} (${ip}) не вернулся после перезагрузки."
+    return 1
+}
+
+configure_selinux_disabled() {
+    log_info "Отключение SELinux на узлах кластера..."
+    local name ip state local_pending=""
+    for name in "${LB_NODES[@]}" "${WEB_NODES[@]}" "${PXC_NODES[@]}" "${S3_NODES[@]}"; do
+        ip=""
+        [[ -n "${LB_IPS[$name]:-}" ]]  && ip="${LB_IPS[$name]}"
+        [[ -n "${WEB_IPS[$name]:-}" ]] && ip="${WEB_IPS[$name]}"
+        [[ -n "${PXC_IPS[$name]:-}" ]] && ip="${PXC_IPS[$name]}"
+        [[ -n "${S3_IPS[$name]:-}" ]]  && ip="${S3_IPS[$name]}"
+        [[ -z "$ip" ]] && continue
+
+        if [[ "$(_selinux_state "$ip")" == "Disabled" ]]; then
+            log_ok "  ${name}: SELinux уже отключён"
+            continue
+        fi
+
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/selinux/config ] && sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config; [ -f /etc/sysconfig/selinux ] && sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/sysconfig/selinux; command -v grubby >/dev/null 2>&1 && { grubby --update-kernel ALL --args selinux=0; grubby --update-kernel ALL --remove-args enforcing; }; setenforce 0 2>/dev/null; true"
+
+        # Перезагрузка обязательна: Permissive не спасает — bitrix-env смотрит конфиг
+        # и всё равно требует reboot. Узел, с которого запущен install.sh, перезагрузить
+        # нельзя (убьёт сам установщик) — о нём сообщаем и выходим fail-closed.
+        if _is_local_ip "$ip"; then
+            local_pending="${name} (${ip})"
+            continue
+        fi
+
+        log_info "  ${name}: перезагрузка для применения (SELinux был $(_selinux_state "$ip"))..."
+        bcm_ssh_exec "$ip" "systemd-run --on-active=2 --timer-property=AccuracySec=1s /sbin/reboot >/dev/null 2>&1 || (sleep 2; reboot) &" </dev/null 2>/dev/null || true
+        _selinux_wait_node "$ip" "$name" || exit 1
+        state="$(_selinux_state "$ip")"
+        if [[ "$state" != "Disabled" ]]; then
+            log_error "  ${name}: после перезагрузки SELinux всё ещё ${state}. Проверьте параметры ядра (grubby --info=DEFAULT)."
+            exit 1
+        fi
+        log_ok "  ${name}: SELinux отключён"
+    done
+
+    if [[ -n "$local_pending" ]]; then
+        log_error "На управляющем узле ${local_pending} SELinux ещё включён."
+        log_error "Перезагрузите его вручную (reboot) и повторите install.sh — сам себя установщик перезагрузить не может."
+        exit 1
+    fi
+    log_ok "SELinux отключён на всех узлах."
+}
+
+_is_local_ip() {
+    local target="$1" lip
+    for lip in $(hostname -I 2>/dev/null); do
+        [[ "$lip" == "$target" ]] && return 0
+    done
+    return 1
 }
 
 configure_remote_logging() {
@@ -2679,7 +2808,7 @@ $s=@include '/home/bitrix/www/bitrix/.settings.php';
 echo is_array($s) ? ($s['pull']['value']['signature_key'] ?? '') : '';
 PHPSNIP
         bcm_ssh_copy_file /tmp/bcm-push-getsig.php "$master_ip" /tmp/bcm-push-getsig.php
-        push_sig=$(bcm_ssh_exec "$master_ip" "php /tmp/bcm-push-getsig.php 2>/dev/null; rm -f /tmp/bcm-push-getsig.php")
+        push_sig=$(bcm_ssh_exec "$master_ip" "php /tmp/bcm-push-getsig.php 2>/dev/null; rm -f /tmp/bcm-push-getsig.php") || true
         rm -f /tmp/bcm-push-getsig.php
     fi
 
@@ -2742,7 +2871,7 @@ UNIT
 
         # 4. keepalived push-инстанс (добавить идемпотентно по VRID)
         local iface peer_ip="" state="BACKUP" priority="100"
-        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]') || true
         [[ -z "$iface" ]] && iface="ens18"
         if [[ "$name" == "$master_node" ]]; then state="MASTER"; priority="110"; fi
         local web_pairs=() _wn
@@ -2799,7 +2928,7 @@ echo "REPOINT_OK changed=$changed sig=".($sig!==''?substr($sig,0,8):'NONE')."\n"
 PHPSNIP
         bcm_ssh_copy_file "$local_repoint" "$ip" "/tmp/bcm-push-repoint.php"
         local rp
-        rp=$(bcm_ssh_exec "$ip" "php /tmp/bcm-push-repoint.php '${PUSH_REDIS_VIP}' '${PUSH_REDIS_PORT}' '${push_sig}' 2>&1; rm -f /tmp/bcm-push-repoint.php")
+        rp=$(bcm_ssh_exec "$ip" "php /tmp/bcm-push-repoint.php '${PUSH_REDIS_VIP}' '${PUSH_REDIS_PORT}' '${push_sig}' 2>&1; rm -f /tmp/bcm-push-repoint.php") || true
         rm -f "$local_repoint"   # после exec: на src-ноде local==remote путь (см. cache/pubpath)
         bcm_ssh_exec_logged "$name" "$ip" "systemctl restart push-server 2>/dev/null || true"
         log_info "  $name: push-server storage → ${PUSH_REDIS_VIP}:${PUSH_REDIS_PORT} (${rp})"
@@ -2828,7 +2957,7 @@ echo "PUB_OK\n";
 PHPSNIP
         bcm_ssh_copy_file "$local_pub" "$src_ip" "/tmp/bcm-push-pubpath.php"
         local pubres
-        pubres=$(bcm_ssh_exec "$src_ip" "php /tmp/bcm-push-pubpath.php 2>&1; rm -f /tmp/bcm-push-pubpath.php")
+        pubres=$(bcm_ssh_exec "$src_ip" "php /tmp/bcm-push-pubpath.php 2>&1; rm -f /tmp/bcm-push-pubpath.php") || true
         log_info "  path_to_publish (node-local) на ${src}: ${pubres}"
         rm -f "$local_pub"
     fi
@@ -2914,7 +3043,7 @@ UNIT
 
         # 4. keepalived cache-инстанс (добавить идемпотентно по VRID)
         local iface peer_ip="" state="BACKUP" priority="100"
-        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]')
+        iface=$(bcm_ssh_exec "$ip" "ip route | awk '/default/{print \$5; exit}'" | tr -d '[:space:]') || true
         [[ -z "$iface" ]] && iface="ens18"
         if [[ "$name" == "$master_node" ]]; then state="MASTER"; priority="110"; fi
         local web_pairs=() _wn
@@ -2975,7 +3104,7 @@ echo "CACHE_OK\n";
 PHPSNIP
         bcm_ssh_copy_file "$local_php" "$src_ip" "/tmp/bcm-cache-settings.php"
         local cres
-        cres=$(bcm_ssh_exec "$src_ip" "php /tmp/bcm-cache-settings.php '${CACHE_REDIS_VIP}' '${CACHE_REDIS_PORT}' 2>&1; rm -f /tmp/bcm-cache-settings.php")
+        cres=$(bcm_ssh_exec "$src_ip" "php /tmp/bcm-cache-settings.php '${CACHE_REDIS_VIP}' '${CACHE_REDIS_PORT}' 2>&1; rm -f /tmp/bcm-cache-settings.php") || true
         # rm локального файла ТОЛЬКО после exec: при запуске install с самой src-ноды
         # локальный и удалённый путь совпадают (scp сам-в-себя), и ранний rm удалил бы
         # файл до php → «Could not open input file» (как в push-pubpath ниже).
@@ -3132,13 +3261,17 @@ NGX
                 sed -i 's|proxy_set_header Host \$host:80;|proxy_set_header Host \$host:\$bcm_backend_port;|' \"\$f\"
             done
             if nginx -t 2>/dev/null; then
-                systemctl reload nginx
+                # ⚠️ Перезагружаем конфиг ТОЛЬКО у запущенного nginx: на свежей ноде
+                # (портал ещё не развёрнут) bitrix-env держит nginx.service в
+                # disabled/inactive, и безусловный reload возвращает ошибку, роняя
+                # весь шаг. Сниппет уже на месте — стартующий позже nginx его подхватит.
+                systemctl is-active --quiet nginx && systemctl reload nginx || true
             else
                 rm -f /etc/nginx/bx/settings/zz-bcm-lb.conf
                 for f in /etc/nginx/bx/site_enabled/*.conf.bcm-bak-lb; do
                     [ -f \"\$f\" ] && cp \"\$f\" \"\${f%.bcm-bak-lb}\"
                 done
-                nginx -t && systemctl reload nginx
+                nginx -t && { systemctl is-active --quiet nginx && systemctl reload nginx || true; }
                 echo 'BCM_NGINX_ROLLBACK'
             fi"
         log_ok "  $name: nginx настроен для работы за LB."
@@ -3439,7 +3572,7 @@ finalize_web_nodes() {
     if [[ -f "$repoint_php" ]]; then
         bcm_ssh_copy_file "$repoint_php" "$fz_src_ip" "/tmp/bcm_db_repoint.php"
         local fz_rd fz_res fz_dbn fz_dbh
-        fz_rd=$(bcm_ssh_exec "$fz_src_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=read php /tmp/bcm_db_repoint.php 2>&1")
+        fz_rd=$(bcm_ssh_exec "$fz_src_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=read php /tmp/bcm_db_repoint.php 2>&1") || true
         fz_res=$(echo "$fz_rd" | sed -n 's/^RESULT=//p' | head -1)
         fz_dbn=$(echo "$fz_rd" | sed -n 's/^DB_NAME=//p' | head -1)
         fz_dbh=$(echo "$fz_rd" | sed -n 's/^DB_HOST=//p' | head -1)
@@ -3450,14 +3583,14 @@ finalize_web_nodes() {
             else
                 # БД сброшена не на ProxySQL — репойнтим, но только если ProxySQL реально к ней маршрутизирует.
                 local fz_pt
-                fz_pt=$(bcm_ssh_exec "$fz_src_ip" "mysql --default-auth=mysql_native_password -p'${BITRIX_DB_PASS}' -h127.0.0.1 -P'${PROXYSQL_PORT}' -u'${BITRIX_DB_USER}' '${fz_dbn}' -N -e 'SELECT 1' 2>/dev/null || echo ERR" | tr -d '[:space:]')
+                fz_pt=$(bcm_ssh_exec "$fz_src_ip" "mysql --default-auth=mysql_native_password -p'${BITRIX_DB_PASS}' -h127.0.0.1 -P'${PROXYSQL_PORT}' -u'${BITRIX_DB_USER}' '${fz_dbn}' -N -e 'SELECT 1' 2>/dev/null || echo ERR" | tr -d '[:space:]') || true
                 if [[ "$fz_pt" == "1" ]]; then
                     log_warn "  Подключение БД портала сброшено на '${fz_dbh}' (ansible/скелет) — восстанавливаю → ProxySQL на всех web."
                     local fz_n fz_ip fz_w
                     for fz_n in "${WEB_NODES[@]}"; do
                         fz_ip="${WEB_IPS[$fz_n]}"
                         bcm_ssh_copy_file "$repoint_php" "$fz_ip" "/tmp/bcm_db_repoint.php"
-                        fz_w=$(bcm_ssh_exec "$fz_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=write BX_DB_HOST='${fz_proxy_host}' BX_DB_LOGIN='${BITRIX_DB_USER}' BX_DB_PASS='${BITRIX_DB_PASS}' BX_DB_NAME='${fz_dbn}' php /tmp/bcm_db_repoint.php 2>&1; chown bitrix:bitrix '${fz_docroot}/bitrix/.settings.php' 2>/dev/null; rm -f /tmp/bcm_db_repoint.php")
+                        fz_w=$(bcm_ssh_exec "$fz_ip" "BX_DOCROOT='${fz_docroot}' BX_MODE=write BX_DB_HOST='${fz_proxy_host}' BX_DB_LOGIN='${BITRIX_DB_USER}' BX_DB_PASS='${BITRIX_DB_PASS}' BX_DB_NAME='${fz_dbn}' php /tmp/bcm_db_repoint.php 2>&1; chown bitrix:bitrix '${fz_docroot}/bitrix/.settings.php' 2>/dev/null; rm -f /tmp/bcm_db_repoint.php") || true
                         echo "$fz_w" | grep -q 'RESULT=OK' && log_ok "    ${fz_n}: .settings.php → ProxySQL." || log_warn "    ${fz_n}: репойнт БД не удался (${fz_w})."
                     done
                     fz_db_ok=1
@@ -3532,8 +3665,11 @@ main() {
 
     # Ключ шифрования conf-бэкапов: при повторном install сохраняем существующий
     # (новый ключ сделал бы старые архивы нерасшифровываемыми).
+    # ⚠️ || true ОБЯЗАТЕЛЕН: на ЧИСТОЙ управляющей машине cluster.conf ещё нет →
+    # sed выходит с 2, pipefail отдаёт этот код всей подстановке, и под set -e
+    # install.sh умирает БЕЗ сообщения (stderr sed уже отброшен в /dev/null).
     if [[ -z "$BACKUP_ENC_KEY" ]]; then
-        BACKUP_ENC_KEY=$(sed -n 's/^enc_key = //p' /etc/bitrix-cluster/cluster.conf 2>/dev/null | head -1)
+        BACKUP_ENC_KEY=$(sed -n 's/^enc_key = //p' /etc/bitrix-cluster/cluster.conf 2>/dev/null | head -1 || true)
     fi
     [[ -z "$BACKUP_ENC_KEY" ]] && BACKUP_ENC_KEY=$(_bcm_rand_hex 16)
 
@@ -3546,6 +3682,8 @@ main() {
     configure_local_logrotate
 
     deploy_ssh_keys
+
+    configure_selinux_disabled
 
     install_packages
 

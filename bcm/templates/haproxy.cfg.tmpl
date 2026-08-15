@@ -37,14 +37,14 @@ defaults
 
 # ──── Статистика HAProxy ─────────────────────────────────────────────────────
 listen stats
-    bind *:8404
+    bind *:__STATS_PORT__
     stats enable
     stats uri /stats
     stats refresh 10s
     stats auth bcm:__BCM_STATS_PASSWORD__
     # admin (enable/disable backend через HTTP) — только с localhost. BCM управляет
     # бэкендами через admin-сокет /run/haproxy-admin.sock, удалённый HTTP-admin не нужен;
-    # `if TRUE` открывало бы управление любому, кто знает stats-пароль на :8404.
+    # `if TRUE` открывало бы управление любому, кто знает stats-пароль на порту статистики.
     stats admin if LOCALHOST
 
 # ──── Frontend: HTTP :80 → web-ноды ─────────────────────────────────────────

@@ -255,9 +255,13 @@ _deploy_to_webs() {
                 [ -f '$WEB_CERT' ] && cp -n '$WEB_CERT' '${WEB_CERT}.bcm-bak'
                 cp /tmp/bcm-ssl-web.pem '$WEB_CERT' && chmod 600 '$WEB_CERT'
                 if nginx -t 2>/dev/null; then
-                    systemctl reload nginx
+                    # ⚠️ reload только у ЗАПУЩЕННОГО nginx: пока портал не развёрнут,
+                    # bitrix-env держит nginx.service остановленным, и безусловный
+                    # reload вернул бы ошибку — серт считался бы неустановленным.
+                    systemctl is-active --quiet nginx && systemctl reload nginx || true
                 else
-                    [ -f '${WEB_CERT}.bcm-bak' ] && cp '${WEB_CERT}.bcm-bak' '$WEB_CERT' && systemctl reload nginx
+                    [ -f '${WEB_CERT}.bcm-bak' ] && cp '${WEB_CERT}.bcm-bak' '$WEB_CERT' \
+                        && { systemctl is-active --quiet nginx && systemctl reload nginx || true; }
                     exit 1
                 fi
                 rm -f /tmp/bcm-ssl-web.pem" \
