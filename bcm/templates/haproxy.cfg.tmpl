@@ -22,8 +22,17 @@ defaults
     option  dontlognull
     option  http-server-close
     timeout connect 5s
-    timeout client  50s
-    timeout server  50s
+    # ⚠️ 50s было мало: операции админки Битрикса (обновление модулей, маркетплейс,
+    # выгрузки, тяжёлые отчёты CRM) идут минутами и обрывались 504-й, а медленные
+    # загрузки файлов в Диск рвались по client-таймауту.
+    timeout client  300s
+    timeout server  300s
+    # Защита от медленных заголовков и залипших очередей; keep-alive держим коротким,
+    # чтобы простаивающие соединения не занимали слоты.
+    timeout http-request 15s
+    timeout queue        60s
+    timeout http-keep-alive 15s
+    timeout check        5s
     # WebSocket (push-server wss через :443) и long-poll: после апгрейда соединение
     # живёт под timeout tunnel, иначе ws-коннекты рвались бы каждые 50s (timeout server).
     timeout tunnel  1h
@@ -102,7 +111,17 @@ backend web_backend
     balance roundrobin
     cookie BXSRV insert indirect nocache
     option httpchk GET /
-    http-check expect status 200
+    # ⚠️ НЕ «expect status 200»: портал отдаёт 3xx анонимному посетителю (редирект на
+    # страницу входа), и строгая проверка помечала бы живые ноды как DOWN.
+    http-check expect rstatus ^[23][0-9][0-9]
+    # ⚠️ redispatch ОБЯЗАТЕЛЕН: без него отказавшая нода отдаёт клиенту 503 всё то
+    # время, пока health-check её не пометит DOWN (до fall*inter секунд) — запрос
+    # уже привязан к ней sticky-cookie, а retries по умолчанию бьются в ТУ ЖЕ ноду.
+    # Ловили вживую на проверке отказоустойчивости: остановка nginx на web02 → 503.
+    # Ретраится только conn-failure (соединение не установлено, запрос сервером не
+    # обработан) — POST'ы не дублируются.
+    retries 3
+    option redispatch 1
     # Строки для каждой web-ноды добавляются генератором (с `cookie <name>`):
     # server __NODE_NAME__ __NODE_IP__:80 cookie __NODE_NAME__ check inter 2s fall 3 rise 2
 __BCM_WEB_NODES_BACKENDS__
@@ -130,13 +149,19 @@ backend web_cache_backend
     option redispatch 1
     retry-on 404
     option httpchk GET /
-    http-check expect status 200
+    # ⚠️ НЕ «expect status 200»: портал отдаёт 3xx анонимному посетителю (редирект на
+    # страницу входа), и строгая проверка помечала бы живые ноды как DOWN.
+    http-check expect rstatus ^[23][0-9][0-9]
 __BCM_WEB_CACHE_BACKENDS__
 
 # ──── Backend: админка/запись — только источник lsyncd (остальные backup) ────
 backend web_admin_backend
     balance first
     option httpchk GET /
+    # Тот же довод, что и в web_backend: без redispatch отказ primary отдаёт 503,
+    # пока health-check не переключит на backup-ноду.
+    retries 3
+    option redispatch 1
     # Источник lsyncd идёт первым (primary), остальные — с ключом backup.
     # Генератор добавляет строки server ... [backup]:
 __BCM_WEB_ADMIN_BACKENDS__
