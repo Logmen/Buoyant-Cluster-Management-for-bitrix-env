@@ -1,0 +1,20 @@
+# BCM: журнал запросов HAProxy → /var/log/haproxy.log
+#
+# ⚠️ HAProxy работает в chroot (`chroot /var/lib/haproxy` в global), поэтому его
+# `log /dev/log local0` — это сокет ВНУТРИ chroot: /var/lib/haproxy/dev/log.
+# Штатный сокет rsyslog (/dev/log) процессу недоступен, и без отдельного input
+# записи запросов просто некуда девать — они теряются молча, без ошибок в логах.
+input(type="imuxsock" Socket="/var/lib/haproxy/dev/log" CreatePath="on")
+
+# local0 — журнал запросов (`option httplog`: клиент, бэкенд, выбранный сервер,
+# тайминги, код, флаги завершения сессии), local1 — смены состояния бэкендов.
+# Держим оба в одном файле: при разборе отказа важно видеть запросы и переходы
+# серверов UP/DOWN на одной временной шкале.
+#
+# ⚠️ `stop` ОБЯЗАТЕЛЕН: правило `*.info` из основного rsyslog.conf иначе положит
+# те же строки ещё и в /var/log/messages. Каталог /etc/rsyslog.d подключается
+# ДО секции RULES, поэтому stop здесь срабатывает раньше общего правила.
+if ($syslogfacility-text == "local0") or ($syslogfacility-text == "local1") then {
+    action(type="omfile" file="/var/log/haproxy.log")
+    stop
+}

@@ -1677,6 +1677,14 @@ SQL
         # exit code сервиса. Метку ставим ДО старта; шаг идемпотентен (-a, иначе -m).
         bcm_ssh_exec_logged "$name" "$ip" "if command -v getenforce >/dev/null 2>&1 && [ \"\$(getenforce)\" != Disabled ]; then command -v semanage >/dev/null 2>&1 || dnf install -y -q policycoreutils-python-utils >/dev/null 2>&1; semanage port -a -t http_port_t -p tcp ${HAPROXY_STATS_PORT} 2>/dev/null || semanage port -m -t http_port_t -p tcp ${HAPROXY_STATS_PORT} 2>/dev/null; fi; true"
 
+        # Журнал запросов HAProxy. ⚠️ Ставится ДО старта haproxy: rsyslog создаёт сокет
+        # /var/lib/haproxy/dev/log (haproxy в chroot и штатный /dev/log ему недоступен),
+        # а haproxy подключается к нему при старте — если сокета ещё нет, записи молча
+        # теряются до следующего рестарта. Без этого шага на LB вообще нет журнала
+        # запросов: `log /dev/log local0` в конфиге есть, а принимать некому.
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/templates/rsyslog-haproxy.conf.tmpl" "$ip" "/etc/rsyslog.d/49-haproxy.conf"
+        bcm_ssh_exec_logged "$name" "$ip" "chmod 644 /etc/rsyslog.d/49-haproxy.conf && systemctl restart rsyslog"
+
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable haproxy keepalived && systemctl restart haproxy keepalived"
     done
     rm -f "${local_haproxy_cfg:-}" "${local_keepalived_cfg:-}" 2>/dev/null
