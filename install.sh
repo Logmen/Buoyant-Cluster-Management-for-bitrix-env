@@ -3434,11 +3434,20 @@ ENV
 # момент запуска (Synced-реплика для БД, источник lsyncd для файлов) — см.
 # bcm_backup.sh. Вызывать ПОСЛЕ deploy_bcm (нужен /opt/bcm/bin/lib/bcm_backup.sh).
 configure_backup() {
-    # Цель бэкапов — MinIO кластера. Без слоя S3 хранить копии негде: env, таймеры
-    # и бакет не создаются (иначе таймеры ежедневно падали бы на несуществующий S3).
-    if ! s3_enabled; then
+    # Куда складывать копии: бакет MinIO кластера или сетевой каталог NFS.
+    # ⚠️ Кластер БЕЗ слоя S3 — не повод отказываться от бэкапов: при BACKUP_TARGET=nfs
+    # хранилище внешнее, и S3 не нужен вовсе. Отказываемся только когда цель — S3,
+    # а слоя нет: иначе таймеры ежедневно падали бы на несуществующий endpoint.
+    local bk_target="${BACKUP_TARGET:-s3}"
+    if [[ "$bk_target" == "nfs" ]]; then
+        if [[ -z "${NFS_SERVER:-}" || -z "${NFS_EXPORT:-}" ]]; then
+            log_warn "BACKUP_TARGET=nfs, но NFS_SERVER/NFS_EXPORT не заданы — копирование НЕ настроено."
+            log_info "Задайте их в файле ответов либо настройте хранилище через меню 13."
+            return 0
+        fi
+    elif ! s3_enabled; then
         log_warn "Слой S3 не развёрнут — резервное копирование НЕ настроено."
-        log_info "Настройте внешнее хранилище копий или добавьте 2+ S3-нод и повторите install.sh."
+        log_info "Укажите BACKUP_TARGET=nfs с параметрами NFS, либо добавьте 2+ S3-нод и повторите install.sh."
         return 0
     fi
 
@@ -3448,13 +3457,17 @@ configure_backup() {
     local s3_ak="${S3_ACCESS_KEY:-minioadmin}"
     local s3_sk="${S3_SECRET_KEY}"
 
-    # 1. Бакет: versioning + lifecycle (на первой s3-ноде, mc там уже есть)
-    local s3_01_name="${S3_NODES[0]}"
-    local s3_01_ip="${S3_IPS[$s3_01_name]}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log_info "[DRY RUN] бакет ${BACKUP_BUCKET}: mb + versioning + ilm; env+таймеры на ноды"
+        log_info "[DRY RUN] цель ${bk_target}: подготовка хранилища; env+таймеры на ноды"
         return 0
     fi
+
+    # 1. Подготовка хранилища. Для NFS её нет: каталог экспортирует внешний сервер,
+    # монтирование и проверку делает сам bcm_backup.sh при каждом запуске.
+    if [[ "$bk_target" == "s3" ]]; then
+    # Бакет: versioning + lifecycle (на первой s3-ноде, mc там уже есть)
+    local s3_01_name="${S3_NODES[0]}"
+    local s3_01_ip="${S3_IPS[$s3_01_name]}"
     bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc mb --ignore-existing site1/${BACKUP_BUCKET} && \
         mc version enable site1/${BACKUP_BUCKET}"
     # История версий www/ и срок жизни db/ и conf/ — чистится сам MinIO
@@ -3465,6 +3478,7 @@ configure_backup() {
     # удаления/перезаписи; история версий + lifecycle закрывают эту дыру.
     bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc version enable site1/${S3_UPLOAD_BUCKET} && \
         mc ilm rule add --noncurrent-expire-days ${BACKUP_RETENTION_DAYS} site1/${S3_UPLOAD_BUCKET} 2>/dev/null; true"
+    fi
 
     # 2. Порядок PXC-кандидатов: реплики (по возрастанию IP) раньше writer'а
     local db_candidates=() name
@@ -3492,12 +3506,21 @@ configure_backup() {
                 s3)  ip="${S3_IPS[$name]}" ;;
             esac
 
-            # mc нужен всем (на s3 уже есть); ⚠️ /usr/local/bin/mc — на web
-            # /usr/bin/mc занят Midnight Commander'ом из bitrix-env!
-            bcm_ssh_exec_logged "$name" "$ip" "[ -x /usr/local/bin/mc ] || (wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc) || true"
-            # Доверенный CA серта MinIO (S3 теперь по https) — чтобы mc верифицировал
-            # S3_ENDPOINT без --insecure; на web заодно чинит php-curl облачной отдачи.
-            _bcm_install_s3_ca "$ip"
+            if [[ "$bk_target" == "s3" ]]; then
+                # mc нужен всем (на s3 уже есть); ⚠️ /usr/local/bin/mc — на web
+                # /usr/bin/mc занят Midnight Commander'ом из bitrix-env!
+                bcm_ssh_exec_logged "$name" "$ip" "[ -x /usr/local/bin/mc ] || (wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc) || true"
+                # Доверенный CA серта MinIO (S3 теперь по https) — чтобы mc верифицировал
+                # S3_ENDPOINT без --insecure; на web заодно чинит php-curl облачной отдачи.
+                _bcm_install_s3_ca "$ip"
+            else
+                # NFS-клиент и rsync (снимки кода делаются им же).
+                bcm_ssh_exec_logged "$name" "$ip" "rpm -q nfs-utils >/dev/null 2>&1 || dnf install -y -q nfs-utils; rpm -q rsync >/dev/null 2>&1 || dnf install -y -q rsync; true"
+                # ⚠️ fstab с _netdev: без записи каталог не смонтируется после
+                # перезагрузки, и таймер бэкапа отработает вхолостую (bcm_backup.sh
+                # это заметит и откажется писать, но копий за этот день не будет).
+                bcm_ssh_exec_logged "$name" "$ip" "mkdir -p '${NFS_MOUNT:-/mnt/bcm-backup}'; grep -q ' ${NFS_MOUNT:-/mnt/bcm-backup} ' /etc/fstab || echo '${NFS_SERVER}:${NFS_EXPORT} ${NFS_MOUNT:-/mnt/bcm-backup} nfs ${NFS_BACKUP_OPTIONS:-rw,hard,timeo=600,retrans=2,noatime,_netdev} 0 0' >> /etc/fstab; mountpoint -q '${NFS_MOUNT:-/mnt/bcm-backup}' || mount '${NFS_MOUNT:-/mnt/bcm-backup}' || true"
+            fi
             # xtrabackup — только PXC
             if [[ "$layer" == "pxc" ]]; then
                 bcm_ssh_exec_logged "$name" "$ip" "rpm -q percona-xtrabackup-84 >/dev/null 2>&1 || (percona-release enable pxb-84-lts release; dnf install -y percona-xtrabackup-84)"
@@ -3530,6 +3553,11 @@ DB_STAGGER='180'
 SITE_PATH='/home/bitrix/www'
 MC_BIN='/usr/local/bin/mc'
 LOG_FILE='/var/log/bcm/backup.log'
+BACKUP_TARGET='${bk_target}'
+NFS_SERVER='${NFS_SERVER:-}'
+NFS_EXPORT='${NFS_EXPORT:-}'
+NFS_MOUNT='${NFS_MOUNT:-/mnt/bcm-backup}'
+NFS_SUBDIR='${NFS_SUBDIR:-}'
 ENV
             bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/bitrix-cluster /var/log/bcm"
             bcm_ssh_copy_file "$local_env" "$ip" "/etc/bitrix-cluster/backup.env"
@@ -3541,6 +3569,10 @@ ENV
             local types=("conf:02:10") t
             [[ "$layer" == "pxc" ]] && types+=("db:03:10")
             [[ "$layer" == "web" ]] && types+=("files:04:30")
+            # ⚠️ Ротация нужна ТОЛЬКО для NFS: на S3 старое удаляет lifecycle бакета.
+            # Ставим её на одну ноду (первую web), иначе каждая нода чистила бы общее
+            # хранилище параллельно.
+            [[ "$bk_target" == "nfs" && "$name" == "${WEB_NODES[0]}" ]] && types+=("prune:05:30")
             for t in "${types[@]}"; do
                 local typ="${t%%:*}" at="${t#*:}"
                 cat > "$local_svc" <<UNIT

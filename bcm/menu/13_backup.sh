@@ -26,18 +26,91 @@ if ! bcm_conf_exists; then
 fi
 bcm_load_topology
 
-# Хранилище копий — MinIO кластера; слой S3 опционален, и без него install.sh не
-# настраивает ни бакет, ни таймеры. Показывать статус/запуски было бы обманом.
-if ! bcm_s3_enabled; then
-    bcm_section_header "Резервное копирование"
-    bcm_error "Слой S3 в кластере не развёрнут — резервное копирование не настроено."
-    bcm_info "Хранилище копий (бакет с versioning + lifecycle) живёт в MinIO кластера:"
-    bcm_info "без S3-нод ни бакета, ни таймеров bcm-backup-* не существует."
-    bcm_info "Чтобы включить: добавьте 2+ S3-нод в файл ответов и повторите install.sh."
-    bcm_warn "До этого копии портала и БД делайте внешними средствами."
+# ──── Настройка хранилища копий на NFS ──────────────────────────────────────
+# Реквизиты внешнего хранилища в файле ответов не хранятся, поэтому цель nfs
+# настраивается отсюда: пишем [backup] в cluster.conf, раскатываем backup.env,
+# fstab и таймеры на все ноды. Проверка записи делается ДО раскатки — бессмысленно
+# ставить таймеры на недоступный экспорт.
+_bk_setup_nfs() {
+    bcm_section_header "Хранилище резервных копий на NFS"
+
+    local srv exp mnt sub ret
+    read -r -p "  Сервер NFS (хост или IP, 0 — отмена): " srv
+    [[ "$srv" == "0" || -z "$srv" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    read -r -p "  Экспортируемый путь (напр. /export/backup): " exp
+    [[ "$exp" == "0" || -z "$exp" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    read -r -p "  Точка монтирования на нодах [/mnt/bcm-backup]: " mnt
+    [[ "$mnt" == "0" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    [[ -z "$mnt" ]] && mnt="/mnt/bcm-backup"
+    read -r -p "  Подкаталог под этот кластер (пусто — корень экспорта): " sub
+    [[ "$sub" == "0" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    read -r -p "  Хранить копий, дней [14]: " ret
+    [[ "$ret" == "0" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
+    [[ -z "$ret" ]] && ret=14
+
+    echo
+    bcm_info "Проверяю доступность экспорта с этой ноды..."
+    local probe="/tmp/bcm-nfs-probe.$$"
+    # ⚠️ soft+timeo здесь ОСОЗНАННО (в бэкапах — hard): проверка не должна
+    # зависнуть навсегда на недоступном хранилище прямо в меню.
+    # ⚠️ Подоболочка ( ), а НЕ группа { }: exit внутри группы завершил бы всё меню.
+    if ! (
+            rpm -q nfs-utils >/dev/null 2>&1 || dnf install -y -q nfs-utils >/dev/null 2>&1
+            mkdir -p "$probe"
+            mount -t nfs -o rw,soft,timeo=100,retrans=2 "${srv}:${exp}" "$probe" 2>/dev/null || exit 1
+            r=1; ( : > "${probe}/.bcm-probe" ) 2>/dev/null && r=0
+            rm -f "${probe}/.bcm-probe"
+            umount "$probe" 2>/dev/null; rmdir "$probe" 2>/dev/null
+            exit $r
+        ) 2>/dev/null; then
+        bcm_error "Экспорт ${srv}:${exp} недоступен или смонтирован только для чтения."
+        bcm_info "Проверьте, что хранилище разрешает запись с адресов нод кластера."
+        bcm_any_key; return
+    fi
+    bcm_ok "Экспорт доступен и пишется."
+
+    echo
+    bcm_warn "На все ноды будут раскатаны: запись в /etc/fstab, backup.env и таймеры."
+    bcm_confirm "Продолжить?" || { bcm_info "Отменено."; bcm_any_key; return; }
+
+    bcm_conf_set backup target "nfs"
+    bcm_conf_set backup nfs_server "$srv"
+    bcm_conf_set backup nfs_export "$exp"
+    bcm_conf_set backup nfs_mount "$mnt"
+    bcm_conf_set backup nfs_subdir "$sub"
+    bcm_conf_set backup retention_days "$ret"
+
+    bcm_info "Параметры записаны в cluster.conf."
+    bcm_warn "⚠ Раскатку env, fstab и таймеров на ноды делает install.sh:"
+    bcm_info "  sudo bash install.sh --answers-file <ваш файл>"
+    bcm_info "  (шаг configure_backup увидит target=nfs и настроит все ноды)."
     bcm_any_key
-    exit 0
+}
+
+# Хранилище копий: бакет MinIO кластера ИЛИ сетевой каталог NFS.
+# ⚠️ Раньше меню целиком блокировалось при отсутствии слоя S3. Это неверно для
+# кластеров с внешним хранилищем: цель nfs своего S3 не требует вовсе. Блокируем
+# только когда не настроено НИЧЕГО.
+BK_TARGET="$(bcm_conf_get backup target 2>/dev/null || echo '')"
+[[ -z "$BK_TARGET" ]] && { bcm_s3_enabled && BK_TARGET="s3" || BK_TARGET=""; }
+
+if [[ -z "$BK_TARGET" ]]; then
+    bcm_section_header "Резервное копирование"
+    bcm_error "Хранилище копий не настроено."
+    bcm_info "Доступны две цели:"
+    bcm_info "  • S3 — бакет MinIO кластера (нужны 2+ S3-нод в файле ответов);"
+    bcm_info "  • NFS — сетевой каталог внешнего хранилища (слой S3 не нужен)."
+    bcm_info "Настроить NFS можно прямо отсюда — пункт «Настроить хранилище копий»."
+    echo
+    if bcm_confirm "Настроить хранилище на NFS сейчас?"; then
+        _bk_setup_nfs
+    else
+        bcm_warn "До настройки копии портала и БД делайте внешними средствами."
+        bcm_any_key
+        exit 0
+    fi
 fi
+
 
 BK_LIB="/opt/bcm/bin/lib/bcm_backup.sh"
 BK_BUCKET="$(bcm_conf_get backup bucket 2>/dev/null || echo bitrix-backups)"
@@ -200,6 +273,7 @@ _bk_menu() {
             "4.  Бэкап файлов портала сейчас (источник lsyncd)"
             "5.  Восстановление (копии и процедуры)"
             "6.  Offsite-копия (вторая линия)"
+            "7.  Настроить хранилище копий (S3 / NFS)"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -213,6 +287,7 @@ _bk_menu() {
             4) _bk_run_files ;;
             5) _bk_restore_help ;;
             6) _bk_offsite_help ;;
+            7) _bk_setup_nfs ;;
             0) return 0 ;;
             *) bcm_warn "Неверный выбор." ;;
         esac

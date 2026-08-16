@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034,SC1091,SC2155,SC2015,SC2181,SC2206
 # =============================================================================
-# bcm_backup.sh — резервное копирование кластера в S3 (MinIO) с учётом HA.
+# bcm_backup.sh — резервное копирование кластера с учётом HA.
 #
-# Первая линия — MinIO кластера (бакет с versioning + lifecycle), вторая
-# (offsite) — отдельным этапом. Запускается systemd-таймерами НА нодах,
+# Хранилище выбирается параметром BACKUP_TARGET в backup.env:
+#   s3   — бакет MinIO/совместимого хранилища (versioning + lifecycle);
+#   nfs  — смонтированный сетевой каталог.
+# Различия, о которых нужно помнить при выборе:
+#   • S3 сам чистит старое по lifecycle бакета; для NFS ротацию делаем мы
+#     (`--prune`, по RETENTION_DAYS), поэтому таймеры её и вызывают.
+#   • История правок на S3 — versioning бакета. На NFS его нет, поэтому копия
+#     кода портала кладётся ДАТИРОВАННЫМИ снимками через rsync --link-dest:
+#     неизменившиеся файлы связываются жёсткими ссылками, место занимает только
+#     разница. Это возвращает свойство, ради которого на S3 включён versioning —
+#     удаление в портале не уничтожает вчерашнюю копию.
+#   • ⚠️ Перед записью на NFS проверяется, что каталог РЕАЛЬНО является точкой
+#     монтирования. Иначе отвалившийся NFS превращает бэкап в тихую заливку
+#     копий на системный диск ноды до его переполнения.
+#
+# Запускается systemd-таймерами НА нодах,
 # привязки к конкретной ноде нет — только к РОЛИ в момент запуска:
 #
 #   --conf   на КАЖДОЙ ноде: tar конфигов/состояния (cluster.conf, серты,
 #            acme-учётка, .settings.php, proxysql.db…) → openssl enc → S3.
 #            Внутри секреты, поэтому ШИФРУЕТСЯ (aes-256, ключ в backup.env).
-#   --db     на PXC-нодах: xtrabackup --stream | gzip | mc pipe → S3.
+#   --db     на PXC-нодах: xtrabackup --stream | gzip → хранилище.
 #            HA-гейты: (1) только Synced; (2) кандидаты упорядочены — реплики
 #            раньше writer'а, стартовый sleep RANK*STAGGER разводит их во
 #            времени; (3) идемпотентный маркер db/<дата>/.done в S3 — кто
@@ -19,11 +33,13 @@
 #            дубль); (4) wsrep_desync=ON на время бэкапа, иначе flow control
 #            Galera тормозит ВЕСЬ кластер (сброс по trap при любом исходе).
 #   --files  на web-нодах: только ТЕКУЩИЙ источник lsyncd (lsyncd active —
-#            тот же признак, что в lsyncd_role.sh) → mc mirror кода в S3.
-#            История правок/защита от rm -rf — versioning бакета (lsyncd —
-#            репликация, НЕ бэкап: удаление разъезжается по нодам).
-#            /upload не трогаем — он уже в S3 (бакет bitrix-upload, его
-#            история — versioning, включается в configure_backup).
+#            тот же признак, что в lsyncd_role.sh) → копия кода в хранилище.
+#            Защита от rm -rf: на S3 — versioning бакета, на NFS — датированные
+#            снимки (lsyncd — репликация, НЕ бэкап: удаление разъезжается).
+#            ⚠️ /upload исключён: при развёрнутом S3 он уже лежит в бакете
+#            bitrix-upload. В кластере БЕЗ S3 (файлы на дисках web-нод) его
+#            нужно бэкапить отдельно — сюда он не попадает.
+#   --prune  ротация по RETENTION_DAYS (нужна только для nfs).
 #   --status машинно-читаемый статус последних копий (для меню 13).
 #
 # ⚠️ mc — ТОЛЬКО /usr/local/bin/mc: на web-нодах /usr/bin/mc — это Midnight
@@ -55,6 +71,16 @@ XB_TMP="${XB_TMP:-/tmp/bcm-xtrabackup}"
 ALIAS="bcmbk"
 DATE_TAG="$(date +%Y-%m-%d)"
 
+# ──── Выбор хранилища ────────────────────────────────────────────────────────
+BACKUP_TARGET="${BACKUP_TARGET:-s3}"          # s3 | nfs
+NFS_SERVER="${NFS_SERVER:-}"                  # хост NFS (пусто = каталог монтируют вне BCM)
+NFS_EXPORT="${NFS_EXPORT:-}"                  # экспортируемый путь на сервере
+NFS_MOUNT="${NFS_MOUNT:-/mnt/bcm-backup}"     # точка монтирования на ноде
+# hard+intr: при недоступности сервера операция ждёт, а не отдаёт битую копию;
+# _netdev откладывает монтирование до поднятия сети.
+NFS_OPTIONS="${NFS_OPTIONS:-rw,hard,timeo=600,retrans=2,noatime,_netdev}"
+NFS_SUBDIR="${NFS_SUBDIR:-}"                  # подкаталог под кластер (напр. имя портала)
+
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [${SELF_NODE}] $*"
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -77,12 +103,135 @@ _mc_setup() {
         || { log "ОШИБКА: mc alias ${ALIAS} → ${S3_ENDPOINT} не работает (креды/доступность S3?)."; return 1; }
 }
 
-_require_tools() {
-    [[ -x "$MC_BIN" ]] || { log "ОШИБКА: ${MC_BIN} не найден (MinIO Client)."; return 1; }
-    [[ -n "$S3_ENDPOINT" && -n "$S3_ACCESS" && -n "$S3_SECRET" ]] \
-        || { log "ОШИБКА: S3-параметры не заданы в ${ENV_FILE}."; return 1; }
-    _mc_setup || return 1
+# ──── NFS: монтирование и проверка ──────────────────────────────────────────
+# ⚠️ Ключевая проверка — mountpoint. Без неё отвалившийся или несмонтированный
+# NFS означает запись копий в обычный каталог системного диска: место кончится
+# молча, а оператор будет уверен, что бэкапы уезжают на хранилище.
+_nfs_setup() {
+    if ! mountpoint -q "$NFS_MOUNT" 2>/dev/null; then
+        if [[ -z "$NFS_SERVER" || -z "$NFS_EXPORT" ]]; then
+            log "ОШИБКА: ${NFS_MOUNT} не смонтирован, а NFS_SERVER/NFS_EXPORT не заданы."
+            return 1
+        fi
+        mkdir -p "$NFS_MOUNT"
+        log "nfs: монтирую ${NFS_SERVER}:${NFS_EXPORT} → ${NFS_MOUNT}"
+        mount -t nfs -o "$NFS_OPTIONS" "${NFS_SERVER}:${NFS_EXPORT}" "$NFS_MOUNT" 2>>"$LOG_FILE" \
+            || { log "ОШИБКА: не удалось смонтировать NFS."; return 1; }
+    fi
+    mountpoint -q "$NFS_MOUNT" 2>/dev/null \
+        || { log "ОШИБКА: ${NFS_MOUNT} не является точкой монтирования — запись отменена."; return 1; }
+    # Право на запись проверяем делом, а не по флагам: экспорт может быть ro.
+    local probe="${NFS_MOUNT}/.bcm-write-probe.$$"
+    if ! ( : > "$probe" ) 2>/dev/null; then
+        log "ОШИБКА: нет записи в ${NFS_MOUNT} (экспорт только для чтения?)."
+        return 1
+    fi
+    rm -f "$probe"
     return 0
+}
+
+# Корень хранилища для NFS: точка монтирования + необязательный подкаталог.
+_nfs_root() { printf '%s' "${NFS_MOUNT}${NFS_SUBDIR:+/$NFS_SUBDIR}"; }
+
+_require_tools() {
+    case "$BACKUP_TARGET" in
+        s3)
+            [[ -x "$MC_BIN" ]] || { log "ОШИБКА: ${MC_BIN} не найден (MinIO Client)."; return 1; }
+            [[ -n "$S3_ENDPOINT" && -n "$S3_ACCESS" && -n "$S3_SECRET" ]] \
+                || { log "ОШИБКА: S3-параметры не заданы в ${ENV_FILE}."; return 1; }
+            _mc_setup || return 1
+            ;;
+        nfs)
+            command -v rsync >/dev/null 2>&1 || { log "ОШИБКА: rsync не установлен."; return 1; }
+            _nfs_setup || return 1
+            ;;
+        *)  log "ОШИБКА: неизвестный BACKUP_TARGET='${BACKUP_TARGET}' (ожидается s3 или nfs)."; return 1 ;;
+    esac
+    return 0
+}
+
+# ──── Операции над хранилищем (одинаковый интерфейс для s3 и nfs) ───────────
+# Путь всюду ОТНОСИТЕЛЬНЫЙ: conf/<нода>/<дата>.tar.gz.enc и т.п.
+
+# stdin → объект/файл
+_bk_put() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc pipe "${ALIAS}/${BUCKET}/${rel}"
+    else
+        local dst; dst="$(_nfs_root)/${rel}"
+        mkdir -p "$(dirname "$dst")" || return 1
+        cat > "$dst"
+    fi
+}
+
+_bk_exists() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc stat "${ALIAS}/${BUCKET}/${rel}" >/dev/null 2>&1
+    else
+        [[ -e "$(_nfs_root)/${rel}" ]]
+    fi
+}
+
+_bk_size() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc stat "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | sed -n 's/^Size *: *//p' | head -1
+    else
+        du -h "$(_nfs_root)/${rel}" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+_bk_list() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc ls "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | tail -1 | tr -s ' '
+    else
+        local d; d="$(_nfs_root)/${rel}"
+        [[ -d "$d" ]] && ls -1t "$d" 2>/dev/null | head -1
+    fi
+}
+
+# Зеркало каталога. На S3 — mc mirror в один префикс (история = versioning),
+# на NFS — датированный снимок с жёсткими ссылками на предыдущий (история есть,
+# место занимает только разница).
+_bk_mirror_site() {
+    local src="$1"; shift
+    local -a ex=("$@")
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        local -a mcex=(); local e
+        for e in "${ex[@]}"; do mcex+=(--exclude "$e"); done
+        _mc mirror --overwrite --remove "${mcex[@]}" "$src" "${ALIAS}/${BUCKET}/www" 2>>"$LOG_FILE"
+    else
+        local root; root="$(_nfs_root)/www"
+        local dst="${root}/${DATE_TAG}"
+        mkdir -p "$root" || return 1
+        # Предыдущий снимок — донор жёстких ссылок.
+        local prev; prev=$(ls -1 "$root" 2>/dev/null | grep -vx "$DATE_TAG" | sort | tail -1)
+        local -a rex=(); local e
+        for e in "${ex[@]}"; do rex+=(--exclude "$e"); done
+        local -a link=()
+        [[ -n "$prev" ]] && link=(--link-dest="../${prev}")
+        rsync -a --delete "${rex[@]}" "${link[@]}" "${src}/" "${dst}/" 2>>"$LOG_FILE"
+    fi
+}
+
+# Ротация (только NFS: на S3 её делает lifecycle бакета).
+prune() {
+    [[ "$BACKUP_TARGET" == "nfs" ]] || { log "prune: цель ${BACKUP_TARGET} чистится сама (lifecycle) — пропуск."; return 0; }
+    _require_tools || return 1
+    local root; root="$(_nfs_root)"
+    local n=0
+    # conf/db — датированные артефакты, www — датированные каталоги-снимки.
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        rm -rf -- "$p" && n=$((n+1))
+    done < <(
+        find "${root}/conf" "${root}/db" -mindepth 1 -maxdepth 2 -mtime "+${RETENTION_DAYS}" -print 2>/dev/null
+        find "${root}/www" -mindepth 1 -maxdepth 1 -type d -mtime "+${RETENTION_DAYS}" -print 2>/dev/null
+    )
+    log "prune: удалено устаревших копий: ${n} (старше ${RETENTION_DAYS} дней)"
 }
 
 # ──── conf: конфиги/состояние этой ноды (шифрованный tar) ────────────────────
@@ -107,13 +256,13 @@ backup_conf() {
     for p in "${want[@]}"; do [[ -e "$p" ]] && paths+=("$p"); done
     [[ ${#paths[@]} -gt 0 ]] || { log "conf: нечего бэкапить (пути не найдены)."; return 1; }
 
-    local dst="${ALIAS}/${BUCKET}/conf/${SELF_NODE}/${DATE_TAG}.tar.gz.enc"
-    log "conf: ${#paths[@]} путей → ${dst}"
+    local rel="conf/${SELF_NODE}/${DATE_TAG}.tar.gz.enc"
+    log "conf: ${#paths[@]} путей → ${BACKUP_TARGET}:${rel}"
     export BCM_ENC_KEY="$ENC_KEY"
     if tar -czf - "${paths[@]}" 2>>"$LOG_FILE" \
         | openssl enc -aes-256-cbc -pbkdf2 -pass env:BCM_ENC_KEY 2>>"$LOG_FILE" \
-        | _mc pipe "$dst" 2>>"$LOG_FILE"; then
-        log "conf: ок ($(_mc stat "$dst" 2>/dev/null | sed -n 's/^Size *: *//p' | head -1))"
+        | _bk_put "$rel" 2>>"$LOG_FILE"; then
+        log "conf: ок ($(_bk_size "$rel"))"
     else
         log "conf: ОШИБКА (см. ${LOG_FILE})."
         return 1
@@ -131,13 +280,13 @@ backup_db() {
     command -v xtrabackup >/dev/null 2>&1 \
         || { log "ОШИБКА: xtrabackup не установлен (dnf install -y percona-xtrabackup-84)."; return 1; }
 
-    local marker="${ALIAS}/${BUCKET}/db/${DATE_TAG}/.done"
+    local marker="db/${DATE_TAG}/.done"
 
     # Слоты кандидатов: реплики раньше writer'а; --force (ручной запуск) — без слота.
     if [[ "$force" != "--force" ]]; then
         local slot=$((DB_RANK * DB_STAGGER))
         [[ $slot -gt 0 ]] && { log "db: кандидат rank=${DB_RANK} — жду слот ${slot}с..."; sleep "$slot"; }
-        if _mc stat "$marker" >/dev/null 2>&1; then
+        if _bk_exists "$marker"; then
             log "db: копия за ${DATE_TAG} уже сделана другим кандидатом — выход."
             return 0
         fi
@@ -147,9 +296,9 @@ backup_db() {
     local st; st=$(_wsrep_state)
     [[ "$st" == "Synced" ]] || { log "db: состояние '${st:-нет mysql}' != Synced — пропуск."; return 1; }
 
-    local dst="${ALIAS}/${BUCKET}/db/${DATE_TAG}/${SELF_NODE}.xbstream.gz"
+    local rel="db/${DATE_TAG}/${SELF_NODE}.xbstream.gz"
     mkdir -p "$XB_TMP"
-    log "db: wsrep_desync=ON, xtrabackup → ${dst}"
+    log "db: wsrep_desync=ON, xtrabackup → ${BACKUP_TARGET}:${rel}"
     _desync ON || { log "db: не удалось включить desync — стоп."; return 1; }
     # desync ОБЯЗАН сняться при любом исходе (иначе нода навсегда вне flow control)
     trap '_desync OFF' EXIT
@@ -159,10 +308,10 @@ backup_db() {
     if xtrabackup --backup --stream=xbstream --galera-info \
             --target-dir="$XB_TMP" 2>>"$LOG_FILE" \
         | gzip -1 \
-        | _mc pipe "$dst" 2>>"$LOG_FILE"; then
+        | _bk_put "$rel" 2>>"$LOG_FILE"; then
         printf 'node=%s date=%s duration=%ss\n' "$SELF_NODE" "$DATE_TAG" "$((SECONDS - t0))" \
-            | _mc pipe "$marker" 2>>"$LOG_FILE"
-        log "db: ок за $((SECONDS - t0))с ($(_mc stat "$dst" 2>/dev/null | sed -n 's/^Size *: *//p' | head -1))"
+            | _bk_put "$marker" 2>>"$LOG_FILE"
+        log "db: ок за $((SECONDS - t0))с ($(_bk_size "$rel"))"
     else
         rc=1
         log "db: ОШИБКА xtrabackup/выгрузки (см. ${LOG_FILE}); маркер НЕ ставлю."
@@ -184,32 +333,23 @@ backup_files() {
         return 0
     fi
 
-    local marker="${ALIAS}/${BUCKET}/files/${DATE_TAG}.done"
-    if [[ "$force" != "--force" ]] && _mc stat "$marker" >/dev/null 2>&1; then
+    local marker="files/${DATE_TAG}.done"
+    if [[ "$force" != "--force" ]] && _bk_exists "$marker"; then
         log "files: копия за ${DATE_TAG} уже есть — выход."
         return 0
     fi
 
     # Исключения = списку lsyncd (кэш per-node, /upload уже в S3).
-    local dst="${ALIAS}/${BUCKET}/www"
-    log "files: mirror ${SITE_PATH} → ${dst} (история — versioning бакета)"
+    log "files: копия ${SITE_PATH} → ${BACKUP_TARGET}:www ($([[ "$BACKUP_TARGET" == s3 ]] && echo 'история — versioning бакета' || echo "снимок ${DATE_TAG}, ссылки на предыдущий"))"
     local t0=$SECONDS
     # Маркер — часть условия успеха: mc mirror умеет выходить с кодом 0 при
     # частичных ошибках записи (ловили вживую), а заливка маркера — честная
     # проверка, что доступ на запись в бакет действительно работает.
-    if _mc mirror --overwrite --remove \
-        --exclude "upload/*" \
-        --exclude "bitrix/cache/*" \
-        --exclude "bitrix/managed_cache/*" \
-        --exclude "bitrix/stack_cache/*" \
-        --exclude "bitrix/html_pages/*" \
-        --exclude "bitrix/tmp/*" \
-        --exclude "bitrix/backup/*" \
-        --exclude "*.tmp" \
-        --exclude ".git/*" \
-        "$SITE_PATH" "$dst" 2>>"$LOG_FILE" \
+    if _bk_mirror_site "$SITE_PATH" \
+        "upload/*" "bitrix/cache/*" "bitrix/managed_cache/*" "bitrix/stack_cache/*" \
+        "bitrix/html_pages/*" "bitrix/tmp/*" "bitrix/backup/*" "*.tmp" ".git/*" \
         && printf 'node=%s date=%s duration=%ss\n' "$SELF_NODE" "$DATE_TAG" "$((SECONDS - t0))" \
-            | _mc pipe "$marker" 2>>"$LOG_FILE"; then
+            | _bk_put "$marker" 2>>"$LOG_FILE"; then
         log "files: ок за $((SECONDS - t0))с."
     else
         log "files: ОШИБКА mirror/маркера (см. ${LOG_FILE})."
@@ -220,10 +360,11 @@ backup_files() {
 # ──── status: последние копии (для меню 13; формат key|...) ──────────────────
 status() {
     _require_tools || return 1
-    echo "conf|$(_mc ls "${ALIAS}/${BUCKET}/conf/${SELF_NODE}/" 2>/dev/null | tail -1 | tr -s ' ')"
-    echo "db|$(_mc ls "${ALIAS}/${BUCKET}/db/" 2>/dev/null | tail -1 | tr -s ' ')"
-    echo "files_marker|$(_mc ls "${ALIAS}/${BUCKET}/files/" 2>/dev/null | tail -1 | tr -s ' ')"
-    echo "www_size|$(_mc du "${ALIAS}/${BUCKET}/www" 2>/dev/null | tr -s ' ')"
+    echo "target|${BACKUP_TARGET}$([[ "$BACKUP_TARGET" == nfs ]] && echo " ($(_nfs_root))")"
+    echo "conf|$(_bk_list "conf/${SELF_NODE}/")"
+    echo "db|$(_bk_list "db/")"
+    echo "files_marker|$(_bk_list "files/")"
+    echo "www_size|$(_bk_size "www")"
     return 0
 }
 
@@ -232,5 +373,6 @@ case "${1:-}" in
     --db)     shift; backup_db "${1:-}" ;;
     --files)  shift; backup_files "${1:-}" ;;
     --status) status ;;
-    *) echo "usage: $0 {--conf|--db [--force]|--files [--force]|--status}" >&2; exit 2 ;;
+    --prune)  prune ;;
+    *) echo "usage: $0 {--conf|--db [--force]|--files [--force]|--prune|--status}" >&2; exit 2 ;;
 esac
