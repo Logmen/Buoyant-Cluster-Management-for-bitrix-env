@@ -114,7 +114,11 @@ _validate_pem() {
 
 # ──── Проверить конфиг и бесшовно перечитать HAProxy ─────────────────────────
 _reload_haproxy() {
-    if ! haproxy -c -f "$HAPROXY_CFG" -q 2>>"$LOG_FILE"; then
+    # ⚠️ Проверяем ТАК ЖЕ, как читает юнит: базовый файл ВМЕСТЕ с conf.d. Проверка
+    # одного haproxy.cfg даёт ложную ошибку, если он ссылается на бэкенд из conf.d
+    # (`unable to find required use_backend`) → reload отменялся бы на исправном
+    # конфиге, и продление сертификата тихо не доезжало бы до HAProxy.
+    if ! haproxy -c -f "$HAPROXY_CFG" -f /etc/haproxy/conf.d/ -q 2>>"$LOG_FILE"; then
         log "ОШИБКА: haproxy -c не прошёл — reload отменён."
         return 1
     fi

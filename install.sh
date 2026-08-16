@@ -1637,7 +1637,13 @@ SQL
 
         configure_firewall_for_node "$name" "$ip" "lb"
 
-        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/haproxy /etc/haproxy/certs"
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/haproxy /etc/haproxy/certs /etc/haproxy/conf.d /etc/haproxy/backups"
+        # Слой настроек оператора. ⚠️ Кладём ТОЛЬКО если его ещё нет: этот файл
+        # принадлежит человеку, и повторный install.sh не имеет права его тронуть.
+        # Каталог conf.d подключает сам юнит (`-f $CFGDIR`), правки переживают
+        # регенерацию базового haproxy.cfg.
+        bcm_ssh_copy_file "${BCM_BASE_DIR}/templates/haproxy-custom.cfg.tmpl" "$ip" "/tmp/bcm-haproxy-custom.cfg"
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/haproxy/conf.d/90-custom.cfg ] || cp /tmp/bcm-haproxy-custom.cfg /etc/haproxy/conf.d/90-custom.cfg; rm -f /tmp/bcm-haproxy-custom.cfg"
         bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/haproxy/certs/localhost.pem ] || (openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -subj '/C=US/ST=State/L=City/O=Organization/CN=localhost' -keyout /tmp/localhost.key -out /tmp/localhost.crt && cat /tmp/localhost.key /tmp/localhost.crt > /etc/haproxy/certs/localhost.pem && rm -f /tmp/localhost.key /tmp/localhost.crt)"
         bcm_ssh_copy_file "$local_haproxy_cfg" "$ip" "/etc/haproxy/haproxy.cfg"
 

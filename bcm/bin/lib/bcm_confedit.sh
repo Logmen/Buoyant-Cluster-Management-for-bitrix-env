@@ -6,9 +6,12 @@
 # Общий цикл: скачать эталон с доступной ноды слоя → открыть в $EDITOR →
 # валидация нативным тулом → бэкап + push на ВСЕ ноды слоя → применить.
 #
-#   bcm_confedit_haproxy  — /etc/haproxy/haproxy.cfg (LB, файл одинаков на всех LB).
-#                           Валидация `haproxy -c`, rolling reload (VIP-холдер последним).
-#                           ⚠ файл генерируется install.sh — правки теряются при его повторе.
+#   bcm_confedit_haproxy  — /etc/haproxy/conf.d/90-custom.cfg (LB, ОБЩИЙ слой).
+#                           Базовый /etc/haproxy/haproxy.cfg НЕ трогается: он
+#                           генерируется install.sh из шаблона, и правки в нём
+#                           терялись бы при следующем прогоне. Валидация —
+#                           связкой (базовый + весь conf.d), rolling reload
+#                           (VIP-холдер последним, откат на бэкап при ошибке).
 #   bcm_confedit_mysql    — /etc/my.cnf.d/zz-bcm-custom.cnf (PXC, ОБЩИЙ drop-in).
 #                           Базовый /etc/my.cnf (server-id, wsrep_node_* — идентичность
 #                           ноды) НЕ трогается; drop-in переопределяет тюнинг и одинаков
@@ -20,6 +23,12 @@
 # =============================================================================
 
 MYSQL_DROPIN="/etc/my.cnf.d/zz-bcm-custom.cnf"
+HAPROXY_CUSTOM="/etc/haproxy/conf.d/90-custom.cfg"
+# ⚠️ Проверять конфиг нужно ТАК ЖЕ, как его читает юнит: `-f базовый -f каталог`.
+# Проверка одного базового файла даёт ложную ошибку, как только он ссылается на
+# бэкенд из conf.d (`unable to find required use_backend`) — ловили вживую, из-за
+# этого редактор и раскатка сертификата откатывались на исправном конфиге.
+HAPROXY_CHECK="haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/"
 
 # ──── Открыть файл в $EDITOR (на терминале пользователя) ─────────────────────
 # Возвращает 0, если содержимое изменилось.
@@ -70,7 +79,7 @@ _ce_lb_ordered() {
 # HAProxy
 # =============================================================================
 bcm_confedit_haproxy() {
-    bcm_section_header "Редактирование haproxy.cfg (все LB)"
+    bcm_section_header "Свои настройки HAProxy (все LB)"
 
     if [[ ${#BCM_NODES_LB[@]} -eq 0 ]]; then
         bcm_error "LB-узлы не заданы в cluster.conf."; bcm_any_key; return
@@ -85,25 +94,43 @@ bcm_confedit_haproxy() {
     [[ -z "$ref" ]] && { bcm_error "Нет доступных LB-нод."; bcm_any_key; return; }
     read -r ref_node ref_ip <<< "$ref"
 
-    bcm_warn "⚠ haproxy.cfg генерируется install.sh — ручные правки ТЕРЯЮТСЯ при повторном install.sh."
+    bcm_info "Редактируется ${HAPROXY_CUSTOM} — ваш слой, BCM его не перезаписывает."
+    bcm_info "Базовый haproxy.cfg собирается из шаблона и остаётся нетронутым."
+    bcm_warn "⚠ Слой ДОПОЛНЯЮЩИЙ: заводите НОВЫЕ frontend/backend. Переоткрыть существующую"
+    bcm_warn "  секцию (напр. backend web_backend) нельзя — HAProxy отвергнет как duplicate."
     bcm_info "Эталон берётся с ${ref_node}; после сохранения раскатывается на ВСЕ LB (reload по очереди, VIP-холдер последним)."
     bcm_confirm "Открыть редактор (\${EDITOR:-vi})?" || { bcm_any_key; return; }
 
     local tmp; tmp=$(mktemp /tmp/bcm-haproxy.XXXXXX)
-    if ! bcm_ssh_fetch_file "$ref_ip" "/etc/haproxy/haproxy.cfg" "$tmp"; then
-        bcm_error "Не удалось скачать haproxy.cfg с ${ref_node}."; rm -f "$tmp"; bcm_any_key; return
+    # Файла может не быть (кластер поставлен до появления слоя) — тогда начинаем
+    # с шаблона-заготовки, чтобы оператор видел контракт и пример.
+    if ! bcm_ssh_fetch_file "$ref_ip" "$HAPROXY_CUSTOM" "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+        if [[ -f "${BCM_BASE_DIR}/templates/haproxy-custom.cfg.tmpl" ]]; then
+            cp "${BCM_BASE_DIR}/templates/haproxy-custom.cfg.tmpl" "$tmp"
+            bcm_info "Слой ещё не создан — открываю заготовку."
+        else
+            : > "$tmp"
+        fi
     fi
 
     if ! _ce_open_editor "$tmp"; then
         bcm_info "Изменений нет — ничего не применяю."; rm -f "$tmp"; bcm_any_key; return
     fi
 
-    # Валидация на эталонной LB (там есть бинарь haproxy)
-    bcm_info "Проверка конфига (haproxy -c) на ${ref_node}..."
-    bcm_ssh_copy_file "$tmp" "$ref_ip" "/tmp/bcm-haproxy-validate.cfg"
+    # Валидация на эталонной LB (там есть бинарь haproxy).
+    # ⚠️ Проверяем СВЯЗКУ, а не один файл: собираем во временном каталоге копию
+    # conf.d с подставленным кандидатом и скармливаем её вместе с базовым
+    # конфигом. Живой conf.d при этом не трогаем — если конфиг окажется битым,
+    # на ноде ничего не изменится.
+    bcm_info "Проверка конфига (haproxy -c, базовый + conf.d) на ${ref_node}..."
+    bcm_ssh_copy_file "$tmp" "$ref_ip" "/tmp/bcm-haproxy-candidate.cfg"
     local vout
-    vout=$(bcm_ssh_exec_timeout "$ref_ip" 15 \
-        "haproxy -c -f /tmp/bcm-haproxy-validate.cfg 2>&1; rm -f /tmp/bcm-haproxy-validate.cfg" 2>/dev/null)
+    vout=$(bcm_ssh_exec_timeout "$ref_ip" 20 "
+        d=\$(mktemp -d /tmp/bcm-hacheck.XXXXXX)
+        cp /etc/haproxy/conf.d/*.cfg \"\$d\"/ 2>/dev/null
+        cp /tmp/bcm-haproxy-candidate.cfg \"\$d\"/90-custom.cfg
+        haproxy -c -f /etc/haproxy/haproxy.cfg -f \"\$d\" 2>&1
+        rm -rf \"\$d\" /tmp/bcm-haproxy-candidate.cfg" 2>/dev/null)
     if ! echo "$vout" | grep -qi "valid"; then
         bcm_error "Конфиг НЕ валиден — изменения НЕ применены:"
         echo "$vout" | sed 's/^/    /' | tail -15
@@ -127,23 +154,28 @@ bcm_confedit_haproxy() {
         [[ -z "$i" ]] && continue
         if bcm_ssh_copy_file "$tmp" "$i" "/tmp/bcm-haproxy-new.cfg" && \
            bcm_ssh_exec_timeout "$i" 20 "
-                cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bcm-bak-${ts}
-                cp /tmp/bcm-haproxy-new.cfg /etc/haproxy/haproxy.cfg
-                if haproxy -c -f /etc/haproxy/haproxy.cfg -q && systemctl reload haproxy; then
+                mkdir -p /etc/haproxy/conf.d /etc/haproxy/backups
+                [ -f ${HAPROXY_CUSTOM} ] && cp ${HAPROXY_CUSTOM} /etc/haproxy/backups/90-custom.cfg.bcm-bak-${ts}
+                cp /tmp/bcm-haproxy-new.cfg ${HAPROXY_CUSTOM}
+                if ${HAPROXY_CHECK} -q && systemctl reload haproxy; then
                     rm -f /tmp/bcm-haproxy-new.cfg
                 else
-                    cp /etc/haproxy/haproxy.cfg.bcm-bak-${ts} /etc/haproxy/haproxy.cfg
+                    if [ -f /etc/haproxy/backups/90-custom.cfg.bcm-bak-${ts} ]; then
+                        cp /etc/haproxy/backups/90-custom.cfg.bcm-bak-${ts} ${HAPROXY_CUSTOM}
+                    else
+                        rm -f ${HAPROXY_CUSTOM}
+                    fi
                     systemctl reload haproxy 2>/dev/null
                     exit 1
                 fi" 2>/dev/null; then
-            bcm_ok "  ${n}: применён, reload (бэкап: haproxy.cfg.bcm-bak-${ts})."
+            bcm_ok "  ${n}: применён, reload (бэкап: backups/90-custom.cfg.bcm-bak-${ts})."
         else
             bcm_error "  ${n}: ошибка — выполнен откат на бэкап."
             ok=0
         fi
     done
     rm -f "$tmp"
-    [[ $ok -eq 1 ]] && bcm_ok "haproxy.cfg обновлён на всех LB." || bcm_warn "Применено с ошибками (см. выше)."
+    [[ $ok -eq 1 ]] && bcm_ok "Слой настроек обновлён на всех LB." || bcm_warn "Применено с ошибками (см. выше)."
     bcm_any_key
 }
 

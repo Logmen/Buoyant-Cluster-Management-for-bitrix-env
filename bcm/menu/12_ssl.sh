@@ -388,7 +388,7 @@ _ssl_toggle_https() {
         read -r node ip <<< "$_l"
         [[ -z "${ip:-}" ]] && continue
         if bcm_ssh_exec_timeout "$ip" 20 \
-            "sed -i '${sed_cmd}' /etc/haproxy/haproxy.cfg && haproxy -c -f /etc/haproxy/haproxy.cfg -q && systemctl reload haproxy" 2>/dev/null; then
+            "sed -i '${sed_cmd}' /etc/haproxy/haproxy.cfg && haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ -q && systemctl reload haproxy" 2>/dev/null; then
             bcm_ok "  ${node}: применено."
         else
             bcm_error "  ${node}: ошибка (конфиг без маркера bcm:force_https? пересоздайте конфиг HAProxy)."
