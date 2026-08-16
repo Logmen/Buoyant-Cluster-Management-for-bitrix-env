@@ -588,6 +588,7 @@ _psql_print_menu() {
         "4.  Статистика connection pool"
         "5.  Перезапустить ProxySQL на всех web-нодах"
         "6.  Синхронизировать конфиг между web-нодами"
+        "9.  Свои настройки ProxySQL (${EDITOR:-vi}, SQL к admin)"
         "0.  Назад"
     )
     bcm_print_menu items
@@ -640,6 +641,7 @@ main() {
             4) _psql_show_stats ;;
             5) _psql_restart_all ;;
             6) _psql_sync_config ;;
+            9) bcm_confedit_proxysql ;;
             0) break ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 6." ;;

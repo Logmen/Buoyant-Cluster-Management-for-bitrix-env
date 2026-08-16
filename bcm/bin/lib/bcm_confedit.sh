@@ -513,3 +513,187 @@ bcm_confedit_keepalived() {
                     || bcm_warn "Применено с ошибками — остальные узлы НЕ тронуты."
     bcm_any_key
 }
+
+# =============================================================================
+# nginx на web-нодах (слой в контексте http)
+# =============================================================================
+# ⚠️ Файл называется zzz-bcm-custom.conf, чтобы сортироваться ПОСЛЕ
+# zz-bcm-lb.conf: nginx подключает каталог по алфавиту (`include
+# bx/settings/*.conf`), и для простых директив побеждает последняя.
+# ⚠️ Каталог /etc/nginx/bx/settings ansible синхронизирует с delete:yes при
+# добавлении web-ноды, поэтому эталон дублируется в /etc/bitrix-cluster и его
+# стережёт bcm_settings_guard.sh.
+NGINX_CUSTOM="/etc/nginx/bx/settings/zzz-bcm-custom.conf"
+NGINX_CUSTOM_REF="/etc/bitrix-cluster/nginx-custom.conf"
+
+bcm_confedit_nginx() {
+    bcm_section_header "Свои настройки nginx (все web-ноды)"
+
+    if [[ ${#BCM_NODES_WEB[@]} -eq 0 ]]; then
+        bcm_error "Web-узлы не заданы в cluster.conf."; bcm_any_key; return
+    fi
+    local ref ref_node ref_ip
+    ref=$(_ce_reachable_nodes BCM_NODES_WEB | head -1) || true
+    [[ -z "$ref" ]] && { bcm_error "Нет доступных web-нод."; bcm_any_key; return; }
+    read -r ref_node ref_ip <<< "$ref"
+
+    bcm_info "Редактируется ${NGINX_CUSTOM} — ваш слой, BCM его не перезаписывает."
+    bcm_warn "⚠ Только директивы уровня http: файл включается из блока http nginx.conf."
+    bcm_warn "⚠ Подключается ПОСЛЕ zz-bcm-lb.conf, поэтому простые директивы отсюда побеждают."
+    bcm_confirm "Открыть редактор (\${EDITOR:-vi})?" || { bcm_any_key; return; }
+
+    local tmp; tmp=$(mktemp /tmp/bcm-nginx.XXXXXX)
+    bcm_ssh_fetch_file "$ref_ip" "$NGINX_CUSTOM" "$tmp" 2>/dev/null || : > "$tmp"
+
+    if ! _ce_open_editor "$tmp"; then
+        bcm_info "Изменений нет — ничего не применяю."; rm -f "$tmp"; bcm_any_key; return
+    fi
+
+    # Валидация на эталонной ноде: подставляем кандидата, проверяем nginx -t и
+    # СРАЗУ возвращаем прежний файл — живой конфиг не остаётся изменённым.
+    bcm_info "Проверка конфига (nginx -t) на ${ref_node}..."
+    bcm_ssh_copy_file "$tmp" "$ref_ip" "/tmp/bcm-nginx-candidate.conf"
+    local vout
+    vout=$(bcm_ssh_exec_timeout "$ref_ip" 25 "
+        [ -f ${NGINX_CUSTOM} ] && cp ${NGINX_CUSTOM} /tmp/bcm-nginx-prev.conf
+        cp /tmp/bcm-nginx-candidate.conf ${NGINX_CUSTOM}
+        nginx -t 2>&1
+        if [ -f /tmp/bcm-nginx-prev.conf ]; then cp /tmp/bcm-nginx-prev.conf ${NGINX_CUSTOM}; else rm -f ${NGINX_CUSTOM}; fi
+        rm -f /tmp/bcm-nginx-prev.conf /tmp/bcm-nginx-candidate.conf" 2>/dev/null)
+    if ! echo "$vout" | grep -qi "syntax is ok"; then
+        bcm_error "Конфиг НЕ валиден — изменения НЕ применены:"
+        echo "$vout" | sed 's/^/    /' | tail -10
+        rm -f "$tmp"; bcm_any_key; return
+    fi
+    bcm_ok "nginx -t: конфиг валиден."
+    echo
+    bcm_confirm "Раскатать на все web-ноды и перечитать nginx?" || {
+        bcm_info "Отменено."; rm -f "$tmp"; bcm_any_key; return; }
+
+    local ts; ts=$(date +%Y%m%d-%H%M%S) ok=1 node ip
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        if bcm_ssh_copy_file "$tmp" "$ip" "/tmp/bcm-nginx-new.conf" && \
+           bcm_ssh_exec_timeout "$ip" 30 "
+                [ -f ${NGINX_CUSTOM} ] && cp ${NGINX_CUSTOM} ${NGINX_CUSTOM}.bcm-bak-${ts}
+                cp /tmp/bcm-nginx-new.conf ${NGINX_CUSTOM}
+                rm -f /tmp/bcm-nginx-new.conf
+                if nginx -t >/dev/null 2>&1 && systemctl reload nginx; then
+                    # Обновляем эталон сторожа, иначе он вернёт прежнюю версию.
+                    cp ${NGINX_CUSTOM} ${NGINX_CUSTOM_REF}; chmod 600 ${NGINX_CUSTOM_REF}
+                else
+                    [ -f ${NGINX_CUSTOM}.bcm-bak-${ts} ] && cp ${NGINX_CUSTOM}.bcm-bak-${ts} ${NGINX_CUSTOM}
+                    systemctl reload nginx 2>/dev/null
+                    exit 1
+                fi" 2>/dev/null; then
+            bcm_ok "  ${node}: применено, nginx перечитан."
+        else
+            bcm_error "  ${node}: ошибка — выполнен откат на бэкап."
+            ok=0; break
+        fi
+    done
+    rm -f "$tmp"
+    [[ $ok -eq 1 ]] && bcm_ok "Слой nginx обновлён на всех web-нодах." \
+                    || bcm_warn "Применено с ошибками — остальные ноды НЕ тронуты."
+    bcm_any_key
+}
+
+# =============================================================================
+# ProxySQL (слой = SQL, применяемый к admin-интерфейсу)
+# =============================================================================
+# ⚠️ У ProxySQL файлового слоя быть НЕ может: /etc/proxysql.cnf читается только
+# при ПЕРВОМ старте (пустая sqlite), дальше источник правды — /var/lib/proxysql.
+# Поэтому слой оператора — это SQL-файл, применяемый к admin :6032.
+#
+# ⚠️ Откат делается родными средствами и не требует возни с файлами: изменения
+# сначала уходят в RUNTIME, и только после успешной проверки — SAVE TO DISK.
+# Если проверка не прошла, `LOAD ... FROM DISK` возвращает последнее сохранённое
+# (заведомо рабочее) состояние.
+PROXYSQL_CUSTOM="/etc/bitrix-cluster/proxysql-custom.sql"
+
+bcm_confedit_proxysql() {
+    bcm_section_header "Свои настройки ProxySQL (все web-ноды)"
+
+    if [[ ${#BCM_NODES_WEB[@]} -eq 0 ]]; then
+        bcm_error "Web-узлы не заданы в cluster.conf."; bcm_any_key; return
+    fi
+    local ref ref_node ref_ip
+    ref=$(_ce_reachable_nodes BCM_NODES_WEB | head -1) || true
+    [[ -z "$ref" ]] && { bcm_error "Нет доступных web-нод."; bcm_any_key; return; }
+    read -r ref_node ref_ip <<< "$ref"
+
+    bcm_info "Редактируется ${PROXYSQL_CUSTOM} — ваш SQL, применяется к admin-интерфейсу."
+    bcm_warn "⚠ ProxySQL хранит живую конфигурацию в своей БД, а не в файле:"
+    bcm_warn "  правки /etc/proxysql.cnf на работающем узле не действуют вовсе."
+    bcm_warn "⚠ Пишите идемпотентный SQL (INSERT OR REPLACE / UPDATE) — он применяется"
+    bcm_warn "  на каждой web-ноде, у каждой свой экземпляр ProxySQL."
+    bcm_info "Порядок: применить в RUNTIME → проверить маршрутизацию → SAVE TO DISK."
+    bcm_confirm "Открыть редактор (\${EDITOR:-vi})?" || { bcm_any_key; return; }
+
+    local tmp; tmp=$(mktemp /tmp/bcm-proxysql.XXXXXX)
+    if ! bcm_ssh_fetch_file "$ref_ip" "$PROXYSQL_CUSTOM" "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+        printf '%s\n' \
+            '-- Ваш слой настроек ProxySQL. Применяется к admin :6032 на каждой web-ноде.' \
+            '-- BCM этот файл не перезаписывает. Меню BCM: 4 → 9.' \
+            '--' \
+            '-- ⚠️ SQL должен быть идемпотентным: он выполняется при каждом применении' \
+            '--    и на каждой ноде. Пример — поднять лимит соединений к бэкендам:' \
+            '--' \
+            '-- UPDATE global_variables SET variable_value=2000' \
+            "--   WHERE variable_name='mysql-max_connections';" \
+            '--' \
+            '-- LOAD/SAVE делать НЕ нужно — их выполняет BCM после проверки.' \
+            > "$tmp"
+        bcm_info "Слой ещё не создан — открываю заготовку."
+    fi
+
+    if ! _ce_open_editor "$tmp"; then
+        bcm_info "Изменений нет — ничего не применяю."; rm -f "$tmp"; bcm_any_key; return
+    fi
+
+    echo
+    bcm_confirm "Применить на всех web-нодах (по одной, с откатом при сбое)?" || {
+        bcm_info "Отменено."; rm -f "$tmp"; bcm_any_key; return; }
+
+    local au ap bu bp pport
+    au=$(bcm_conf_get proxysql admin_user);        ap=$(bcm_conf_get proxysql admin_password)
+    bu=$(bcm_conf_get proxysql bitrix_db_user);    bp=$(bcm_conf_get proxysql bitrix_db_password)
+    pport=$(bcm_conf_get proxysql port); [[ -z "$pport" ]] && pport=6033
+    if [[ -z "$au" || -z "$ap" ]]; then
+        bcm_error "В cluster.conf нет реквизитов admin ProxySQL."; rm -f "$tmp"; bcm_any_key; return
+    fi
+
+    local ok=1 node ip
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        bcm_ssh_copy_file "$tmp" "$ip" "$PROXYSQL_CUSTOM"
+        # ⚠️ Пароль инлайном в команду (-p'...'): вынесенный в переменную и
+        # ре-экспандированный, он приезжает вместе с кавычками и даёт Access denied
+        # (ловили дважды). MYSQL_PWD и --defaults-extra-file клиент 8 отвергает.
+        # ⚠️ Каждый вызов mysql пишется ЦЕЛИКОМ, без сборки команды в переменную:
+        # `A="mysql … -p'pass'"; eval $A -e "SQL"` ломается дважды — кавычки вокруг
+        # пароля становятся его частью (Access denied), а многословный SQL после
+        # -e разлетается на отдельные аргументы, и клиент печатает справку.
+        # Ловили обоими способами, поэтому здесь только инлайн.
+        if bcm_ssh_exec_timeout "$ip" 60 "
+                mysql -h127.0.0.1 -P6032 -u'${au}' -p'${ap}' -N < ${PROXYSQL_CUSTOM} || exit 1
+                mysql -h127.0.0.1 -P6032 -u'${au}' -p'${ap}' -N -e 'LOAD MYSQL VARIABLES TO RUNTIME; LOAD MYSQL SERVERS TO RUNTIME; LOAD MYSQL QUERY RULES TO RUNTIME; LOAD MYSQL USERS TO RUNTIME;' || exit 1
+                # Проверка: ходит ли запрос через прокси к базе.
+                if mysql -h127.0.0.1 -P${pport} -u'${bu}' -p'${bp}' --default-auth=mysql_native_password -N -e 'SELECT 1' >/dev/null 2>&1; then
+                    mysql -h127.0.0.1 -P6032 -u'${au}' -p'${ap}' -N -e 'SAVE MYSQL VARIABLES TO DISK; SAVE MYSQL SERVERS TO DISK; SAVE MYSQL QUERY RULES TO DISK; SAVE MYSQL USERS TO DISK;'
+                else
+                    # Возврат к последнему сохранённому состоянию — SAVE ещё не делали.
+                    mysql -h127.0.0.1 -P6032 -u'${au}' -p'${ap}' -N -e 'LOAD MYSQL VARIABLES FROM DISK; LOAD MYSQL SERVERS FROM DISK; LOAD MYSQL QUERY RULES FROM DISK; LOAD MYSQL USERS FROM DISK; LOAD MYSQL VARIABLES TO RUNTIME; LOAD MYSQL SERVERS TO RUNTIME; LOAD MYSQL QUERY RULES TO RUNTIME; LOAD MYSQL USERS TO RUNTIME;'
+                    exit 1
+                fi" 2>/dev/null; then
+            bcm_ok "  ${node}: применено и сохранено (маршрутизация проверена)."
+        else
+            bcm_error "  ${node}: сбой — состояние возвращено к сохранённому на диске."
+            ok=0; break
+        fi
+    done
+    rm -f "$tmp"
+    [[ $ok -eq 1 ]] && bcm_ok "Слой ProxySQL применён на всех web-нодах." \
+                    || bcm_warn "Применено с ошибками — остальные ноды НЕ тронуты."
+    bcm_any_key
+}

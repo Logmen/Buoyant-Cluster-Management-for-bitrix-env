@@ -319,6 +319,7 @@ _ws_menu() {
             "7.  Проверить конфигурацию nginx (nginx -t)"
             "8.  Текущие соединения (ss -tuln, порты 80/443)"
             "9.  PHP info (версия, модули, mod_php)"
+            "10. Свои настройки nginx (${EDITOR:-vi}, все web)"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -336,6 +337,7 @@ _ws_menu() {
             7) _ws_test_nginx_config              ;;
             8) _ws_show_connections               ;;
             9) _ws_show_php_info                  ;;
+            10) bcm_confedit_nginx                ;;
             0) return 0                           ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

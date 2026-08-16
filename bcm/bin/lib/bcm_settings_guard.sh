@@ -53,6 +53,21 @@ UNIT_SERVICE="/etc/systemd/system/bcm-settings-guard.service"
 # push-сервера и должен оставаться под управлением bitrix-env.
 GUARDED_SECTIONS="connections cache session"
 
+# ──── Файлы nginx, которые тоже сносит ansible ──────────────────────────────
+# ⚠️ Роль web (`sites_synchronize.yml`) синхронизирует /etc/nginx/bx/settings
+# модулем synchronize с `delete: yes` при добавлении web-ноды: посторонние для
+# мастера пула файлы там удаляются. Под удар попадают и слой оператора, и наш
+# zz-bcm-lb.conf (real_ip от LB + Host с портом бэкенда) — без него портал за
+# терминатором строит ссылки с :80 и не видит настоящий IP клиента.
+NGINX_DIR="/etc/nginx/bx/settings"
+# Слой оператора назван zzz-, чтобы сортироваться ПОСЛЕ zz-bcm-lb.conf: nginx
+# подключает каталог по алфавиту (`include bx/settings/*.conf`), и для простых
+# директив побеждает последняя.
+NGINX_CUSTOM="${NGINX_DIR}/zzz-bcm-custom.conf"
+NGINX_CUSTOM_REF="/etc/bitrix-cluster/nginx-custom.conf"
+NGINX_LB="${NGINX_DIR}/zz-bcm-lb.conf"
+NGINX_LB_REF="/etc/bitrix-cluster/nginx-bcm-lb.conf"
+
 _sg_log() {
     mkdir -p "$(dirname "$LOG")" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
@@ -101,10 +116,62 @@ _sg_make_reference() {
     _sg_log "эталон снят с $SETTINGS (секции: $GUARDED_SECTIONS)"
 }
 
+# Эталоны файлов nginx снимаем с текущих (рабочих) — они уже приведены
+# install.sh к нужному виду. Слой оператора при первом запуске создаём пустым:
+# он должен существовать, чтобы сторожу было что восстанавливать.
+_sg_make_nginx_reference() {
+    if [[ ! -f "$NGINX_CUSTOM" ]]; then
+        mkdir -p "$NGINX_DIR"
+        printf '%s\n' \
+            '# Ваш слой настроек nginx (контекст http). BCM этот файл не перезаписывает.' \
+            '# Редактируется через меню BCM (8 → 9).' \
+            '#' \
+            '# Подключается ПОСЛЕ zz-bcm-lb.conf (каталог читается по алфавиту), поэтому' \
+            '# простые директивы, заданные здесь, побеждают.' \
+            '# ⚠️ Только директивы уровня http: файл включается из блока http nginx.conf.' \
+            > "$NGINX_CUSTOM"
+        chmod 644 "$NGINX_CUSTOM"
+    fi
+    cp -f "$NGINX_CUSTOM" "$NGINX_CUSTOM_REF" && chmod 600 "$NGINX_CUSTOM_REF"
+    [[ -f "$NGINX_LB" ]] && { cp -f "$NGINX_LB" "$NGINX_LB_REF"; chmod 600 "$NGINX_LB_REF"; }
+    _sg_log "эталоны nginx сняты ($NGINX_CUSTOM, $NGINX_LB)"
+}
+
 # ──── Сверка и восстановление ───────────────────────────────────────────────
 # ⚠️ Пишем ТОЛЬКО при расхождении. Иначе inotify зациклится: запись файла
 # порождает событие, событие — новый запуск сторожа, и так далее.
 _sg_assert() {
+    _sg_assert_settings
+    _sg_assert_nginx
+}
+
+# Файлы nginx: восстанавливаем из эталонов и перечитываем nginx, но ТОЛЬКО если
+# что-то реально поменялось и конфиг проходит проверку — иначе reload на битом
+# конфиге уронил бы отдачу сайта.
+_sg_assert_nginx() {
+    local changed=0 pair target ref
+    for pair in "${NGINX_CUSTOM}|${NGINX_CUSTOM_REF}" "${NGINX_LB}|${NGINX_LB_REF}"; do
+        target="${pair%%|*}"; ref="${pair##*|}"
+        [[ -f "$ref" ]] || continue
+        if [[ -f "$target" ]] && cmp -s "$ref" "$target"; then continue; fi
+        local reason="файл отсутствует"
+        [[ -f "$target" ]] && reason="содержимое разошлось с эталоном"
+        mkdir -p "$(dirname "$target")" 2>/dev/null
+        cp -f "$ref" "$target" || { _sg_log "НЕ УДАЛОСЬ восстановить $target"; continue; }
+        chmod 644 "$target" 2>/dev/null
+        _sg_log "ВОССТАНОВЛЕНО: $target ($reason)"
+        changed=1
+    done
+    if [[ $changed -eq 1 ]]; then
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx >/dev/null 2>&1 && _sg_log "nginx перечитан"
+        else
+            _sg_log "ВНИМАНИЕ: nginx -t не прошёл — reload НЕ выполнен, конфиг требует внимания"
+        fi
+    fi
+}
+
+_sg_assert_settings() {
     [[ -f "$REFERENCE" ]] || { _sg_log "эталона нет ($REFERENCE) — сторож бездействует, нужен --install"; return 0; }
 
     if [[ -f "$EXTRA" ]] && cmp -s "$REFERENCE" "$EXTRA"; then
@@ -157,6 +224,8 @@ Description=BCM: слежение за настройками портала (.s
 # с последующим переименованием — событие приходит именно на замену.
 PathChanged=${SETTINGS}
 PathChanged=${EXTRA}
+PathChanged=${NGINX_CUSTOM}
+PathChanged=${NGINX_LB}
 Unit=bcm-settings-guard.service
 
 [Install]
@@ -189,6 +258,7 @@ case "${1:---status}" in
     --install)
         [[ $EUID -eq 0 ]] || _sg_die "нужны права root"
         _sg_make_reference
+        _sg_make_nginx_reference
         _sg_assert
         _sg_install_units
         echo "Сторож настроек портала установлен."
