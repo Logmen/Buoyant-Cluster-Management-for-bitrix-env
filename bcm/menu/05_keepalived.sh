@@ -527,7 +527,9 @@ _kp_menu() {
             "6.  Перезапустить keepalived на всех lb-узлах"
             "7.  Логи VRRP (journalctl keepalived)"
             "8.  Статус VRRP VRID web-узлов (HA Cron Keepalived)"
-            "9.  Редактировать haproxy.cfg (${EDITOR:-vi}, все LB)"
+            "9.  Свои настройки HAProxy (${EDITOR:-vi}, все LB)"
+            "10. Свои настройки Redis (${EDITOR:-vi}, все web)"
+            "11. Свои настройки keepalived (${EDITOR:-vi})"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -544,7 +546,9 @@ _kp_menu() {
             6) _kp_restart_all       ;;
             7) _kp_show_logs         ;;
             8) _kp_show_web_vrid     ;;
-            9) bcm_confedit_haproxy  ;;
+            9) bcm_confedit_haproxy    ;;
+            10) bcm_confedit_redis     ;;
+            11) bcm_confedit_keepalived ;;
             0) return 0              ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

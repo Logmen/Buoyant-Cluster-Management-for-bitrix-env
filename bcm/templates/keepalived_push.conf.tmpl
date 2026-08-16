@@ -51,3 +51,4 @@ vrrp_instance VI_PUSH___PUSH_VRID__ {
     notify_backup "/opt/bcm/bin/lib/redis_session_notify.sh BACKUP __PUSH_VIP__ __PUSH_PORT__ allkeys-lru"
     notify_fault  "/opt/bcm/bin/lib/redis_session_notify.sh FAULT  __PUSH_VIP__ __PUSH_PORT__ allkeys-lru"
 }
+

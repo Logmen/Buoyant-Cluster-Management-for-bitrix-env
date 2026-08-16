@@ -34,3 +34,14 @@ maxmemory-policy allkeys-lru
 # Роль (master/replica) управляется keepalived через redis_session_notify.sh:
 #   notify_master → REPLICAOF NO ONE + maxmemory-policy allkeys-lru
 #   notify_backup → REPLICAOF <PUSH_VIP> <port>
+
+# ──── Слой настроек оператора ────────────────────────────────────────────────
+# BCM этот файл не перезаписывает; базовый конфиг собирается из шаблона заново
+# при каждом install.sh. Редактируется через меню BCM (5 → 10).
+#
+# ⚠️ include СТОИТ ПОСЛЕДНИМ ОСОЗНАННО: в redis побеждает последнее вхождение
+# параметра, поэтому слой реально ПЕРЕОПРЕДЕЛЯЕТ значения выше (проверено).
+# ⚠️ Файл обязан существовать: при отсутствии подключаемого файла redis не
+# стартует вовсе («Fatal error, can't open config file»). install.sh создаёт
+# его пустым, удалять нельзя.
+include /etc/redis/redis-push-custom.conf

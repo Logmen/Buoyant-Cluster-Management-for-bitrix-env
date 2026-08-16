@@ -51,3 +51,4 @@ vrrp_instance VI_CACHE___CACHE_VRID__ {
     notify_backup "/opt/bcm/bin/lib/redis_session_notify.sh BACKUP __CACHE_VIP__ __CACHE_PORT__ allkeys-lru"
     notify_fault  "/opt/bcm/bin/lib/redis_session_notify.sh FAULT  __CACHE_VIP__ __CACHE_PORT__ allkeys-lru"
 }
+

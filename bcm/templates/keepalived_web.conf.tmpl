@@ -51,3 +51,14 @@ vrrp_instance VI___VRID__ {
     notify_master "/opt/bcm/bin/lib/cron_notify.sh MASTER"
     notify_backup "/opt/bcm/bin/lib/cron_notify.sh BACKUP"
 }
+
+# ──── Слой настроек оператора ────────────────────────────────────────────────
+# BCM этот каталог не перезаписывает; базовый конфиг собирается из шаблона
+# заново при каждом install.sh. Редактируется через меню BCM (5 → 11).
+#
+# ⚠️ Слой ДОПОЛНЯЮЩИЙ: здесь заводят НОВЫЕ vrrp_script/vrrp_instance, а параметры
+# существующих инстансов (priority, unicast_peer, notify) задаются шаблоном —
+# повторное объявление того же имени конфликтует.
+# ⚠️ Отсутствующие файлы keepalived терпит молча (ошибкой это становится только
+# с ключом --all-config), поэтому пустой каталог безопасен.
+include /etc/keepalived/conf.d/*.conf

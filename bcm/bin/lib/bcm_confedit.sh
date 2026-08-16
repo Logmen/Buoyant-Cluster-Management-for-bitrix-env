@@ -325,3 +325,191 @@ SEED
     fi
     bcm_any_key
 }
+
+# =============================================================================
+# Redis (слой поверх базового конфига инстанса)
+# =============================================================================
+# Базовые /etc/redis/redis-{session,push,cache}.conf генерируются install.sh и
+# ПОДКЛЮЧАЮТ этот слой последней строкой. В redis побеждает последнее вхождение
+# параметра, поэтому слой реально ПЕРЕОПРЕДЕЛЯЕТ базовые значения.
+#
+# ⚠️ Применение — рестарт инстанса, а он держит роль master/replica по VRRP.
+# Поэтому идём ПО ОДНОЙ ноде и начинаем с реплик: рестарт мастера уронил бы
+# запись на время старта. Роль определяем опросом самого redis.
+bcm_confedit_redis() {
+    bcm_section_header "Свои настройки Redis (все web-ноды)"
+
+    if [[ ${#BCM_NODES_WEB[@]} -eq 0 ]]; then
+        bcm_error "Web-узлы не заданы в cluster.conf."; bcm_any_key; return
+    fi
+
+    echo "  Инстанс:"
+    echo "    1. сессии (6380)"
+    echo "    2. push (6381)"
+    echo "    3. кэш (6382)"
+    echo "    0. Назад"
+    local ch; read -r -p "  Выбор: " ch
+    local inst port
+    case "$ch" in
+        1) inst="session"; port=6380 ;;
+        2) inst="push";    port=6381 ;;
+        3) inst="cache";   port=6382 ;;
+        0|"") bcm_info "Отменено."; bcm_any_key; return ;;
+        *) bcm_error "Неверный выбор."; bcm_any_key; return ;;
+    esac
+
+    local custom="/etc/redis/redis-${inst}-custom.conf"
+    local ref ref_node ref_ip
+    ref=$(_ce_reachable_nodes BCM_NODES_WEB | head -1) || true
+    [[ -z "$ref" ]] && { bcm_error "Нет доступных web-нод."; bcm_any_key; return; }
+    read -r ref_node ref_ip <<< "$ref"
+
+    bcm_info "Редактируется ${custom} — ваш слой, BCM его не перезаписывает."
+    bcm_warn "⚠ Файл подключается последним и ПЕРЕОПРЕДЕЛЯЕТ базовый конфиг."
+    bcm_warn "⚠ Удалять его нельзя: без подключаемого файла redis не стартует."
+    bcm_confirm "Открыть редактор (\${EDITOR:-vi})?" || { bcm_any_key; return; }
+
+    local tmp; tmp=$(mktemp /tmp/bcm-redis.XXXXXX)
+    bcm_ssh_fetch_file "$ref_ip" "$custom" "$tmp" 2>/dev/null || : > "$tmp"
+
+    if ! _ce_open_editor "$tmp"; then
+        bcm_info "Изменений нет — ничего не применяю."; rm -f "$tmp"; bcm_any_key; return
+    fi
+
+    echo
+    bcm_confirm "Раскатать на все web-ноды и перезапустить redis-${inst}?" || {
+        bcm_info "Отменено."; rm -f "$tmp"; bcm_any_key; return; }
+
+    # Порядок: реплики, мастер последним (роль спрашиваем у самого redis).
+    local -a order_master=() order_replica=() node ip role
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        role=$(bcm_ssh_exec_timeout "$ip" 8 \
+            "redis-cli -p ${port} info replication 2>/dev/null | awk -F: '/^role/{print \$2}' | tr -d '\r'" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$role" == "master" ]]; then order_master+=("$node"); else order_replica+=("$node"); fi
+    done
+
+    local ts; ts=$(date +%Y%m%d-%H%M%S) ok=1
+    for node in "${order_replica[@]}" "${order_master[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        if bcm_ssh_copy_file "$tmp" "$ip" "/tmp/bcm-redis-new.conf" && \
+           bcm_ssh_exec_timeout "$ip" 30 "
+                [ -f ${custom} ] && cp ${custom} ${custom}.bcm-bak-${ts}
+                cp /tmp/bcm-redis-new.conf ${custom}
+                rm -f /tmp/bcm-redis-new.conf
+                if systemctl restart redis-${inst}; then
+                    sleep 2; redis-cli -p ${port} ping >/dev/null 2>&1
+                else
+                    [ -f ${custom}.bcm-bak-${ts} ] && cp ${custom}.bcm-bak-${ts} ${custom}
+                    systemctl restart redis-${inst} 2>/dev/null
+                    exit 1
+                fi" 2>/dev/null; then
+            bcm_ok "  ${node}: применено, redis-${inst} перезапущен."
+        else
+            bcm_error "  ${node}: ошибка — выполнен откат на бэкап."
+            ok=0; break
+        fi
+    done
+    rm -f "$tmp"
+    [[ $ok -eq 1 ]] && bcm_ok "Слой redis-${inst} обновлён на всех web-нодах." \
+                    || bcm_warn "Применено с ошибками — остальные ноды НЕ тронуты."
+    bcm_any_key
+}
+
+# =============================================================================
+# Keepalived (слой поверх базового конфига)
+# =============================================================================
+# ⚠️ Валидация — по ТЕКСТУ вывода `keepalived -t`, а не по коду возврата: сборка
+# 2.2.8 отдаёт rc=0 даже при «Unknown keyword» (проверено вживую).
+# ⚠️ Применяем ПО ОДНОЙ ноде, держатель VIP последним: неудачный конфиг на всех
+# сразу увёл бы адрес совсем.
+bcm_confedit_keepalived() {
+    bcm_section_header "Свои настройки keepalived"
+
+    echo "  Слой узлов:"
+    echo "    1. LB (балансировщики)"
+    echo "    2. WEB"
+    echo "    0. Назад"
+    local ch; read -r -p "  Выбор: " ch
+    local -a nodes=()
+    case "$ch" in
+        1) nodes=("${BCM_NODES_LB[@]}") ;;
+        2) nodes=("${BCM_NODES_WEB[@]}") ;;
+        0|"") bcm_info "Отменено."; bcm_any_key; return ;;
+        *) bcm_error "Неверный выбор."; bcm_any_key; return ;;
+    esac
+    [[ ${#nodes[@]} -eq 0 ]] && { bcm_error "Узлы слоя не заданы."; bcm_any_key; return; }
+
+    local custom="/etc/keepalived/conf.d/90-custom.conf"
+    local ref_ip="${BCM_NODE_IP[${nodes[0]}]:-}"
+    [[ -z "$ref_ip" ]] && { bcm_error "Нет IP у ${nodes[0]}."; bcm_any_key; return; }
+
+    bcm_info "Редактируется ${custom} — ваш слой, BCM его не перезаписывает."
+    bcm_warn "⚠ Слой ДОПОЛНЯЮЩИЙ: заводите НОВЫЕ vrrp_script/vrrp_instance."
+    bcm_warn "  Параметры существующих (priority, unicast_peer, notify) задаёт шаблон."
+    bcm_confirm "Открыть редактор (\${EDITOR:-vi})?" || { bcm_any_key; return; }
+
+    local tmp; tmp=$(mktemp /tmp/bcm-keepalived.XXXXXX)
+    bcm_ssh_fetch_file "$ref_ip" "$custom" "$tmp" 2>/dev/null || : > "$tmp"
+
+    if ! _ce_open_editor "$tmp"; then
+        bcm_info "Изменений нет — ничего не применяю."; rm -f "$tmp"; bcm_any_key; return
+    fi
+
+    # Валидация связки на эталонной ноде, живой conf.d не трогаем.
+    bcm_info "Проверка конфига (keepalived -t) на ${nodes[0]}..."
+    bcm_ssh_copy_file "$tmp" "$ref_ip" "/tmp/bcm-ka-candidate.conf"
+    local vout
+    vout=$(bcm_ssh_exec_timeout "$ref_ip" 20 "
+        d=\$(mktemp -d /tmp/bcm-kacheck.XXXXXX)
+        cp /etc/keepalived/conf.d/*.conf \"\$d\"/ 2>/dev/null
+        cp /tmp/bcm-ka-candidate.conf \"\$d\"/90-custom.conf
+        sed 's#include /etc/keepalived/conf.d/\*.conf#include '\"\$d\"'/*.conf#' /etc/keepalived/keepalived.conf > \"\$d\"/base.conf
+        keepalived -t -f \"\$d\"/base.conf 2>&1
+        rm -rf \"\$d\" /tmp/bcm-ka-candidate.conf" 2>/dev/null)
+    if echo "$vout" | grep -qiE "unknown keyword|invalid|error"; then
+        bcm_error "Конфиг НЕ валиден — изменения НЕ применены:"
+        echo "$vout" | grep -iE "unknown keyword|invalid|error" | sed 's/^/    /' | head -10
+        rm -f "$tmp"; bcm_any_key; return
+    fi
+    bcm_ok "keepalived -t: замечаний нет."
+    echo
+    bcm_confirm "Раскатать на все узлы слоя и перезапустить keepalived?" || {
+        bcm_info "Отменено."; rm -f "$tmp"; bcm_any_key; return; }
+
+    # Держатель VIP — последним (для LB порядок уже умеет _ce_lb_ordered).
+    local -a order=()
+    if [[ "$ch" == "1" ]]; then
+        local -a _lines=(); mapfile -t _lines < <(_ce_lb_ordered)
+        local _l n i; for _l in "${_lines[@]}"; do read -r n i <<< "$_l"; [[ -n "$n" ]] && order+=("$n"); done
+    else
+        order=("${nodes[@]}")
+    fi
+
+    local ts; ts=$(date +%Y%m%d-%H%M%S) ok=1 node ip
+    for node in "${order[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -z "$ip" ]] && continue
+        if bcm_ssh_copy_file "$tmp" "$ip" "/tmp/bcm-ka-new.conf" && \
+           bcm_ssh_exec_timeout "$ip" 30 "
+                mkdir -p /etc/keepalived/conf.d
+                [ -f ${custom} ] && cp ${custom} ${custom}.bcm-bak-${ts}
+                cp /tmp/bcm-ka-new.conf ${custom}
+                rm -f /tmp/bcm-ka-new.conf
+                if systemctl restart keepalived; then
+                    sleep 3; systemctl is-active --quiet keepalived
+                else
+                    [ -f ${custom}.bcm-bak-${ts} ] && cp ${custom}.bcm-bak-${ts} ${custom}
+                    systemctl restart keepalived 2>/dev/null
+                    exit 1
+                fi" 2>/dev/null; then
+            bcm_ok "  ${node}: применено, keepalived перезапущен."
+        else
+            bcm_error "  ${node}: ошибка — выполнен откат на бэкап."
+            ok=0; break
+        fi
+    done
+    rm -f "$tmp"
+    [[ $ok -eq 1 ]] && bcm_ok "Слой keepalived обновлён." \
+                    || bcm_warn "Применено с ошибками — остальные узлы НЕ тронуты."
+    bcm_any_key
+}

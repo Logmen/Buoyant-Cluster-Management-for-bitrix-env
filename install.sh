@@ -1673,7 +1673,9 @@ SQL
         sed -i "s/__NODE_IP__/${ip}/g" "$local_keepalived_cfg"
         render_multiline "$local_keepalived_cfg" "__PEER_IP__" "$peer_ip"
 
-        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived"
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived /etc/keepalived/conf.d"
+        # Слой оператора: создаём заготовку ОДИН раз, повторный install не трогает.
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/keepalived/conf.d/90-custom.conf ] || printf '%s\n' '# Ваш слой настроек keepalived. BCM этот файл не перезаписывает.' '# Редактируется через меню BCM (5 → 11).' '#' '# ⚠️ Слой ДОПОЛНЯЮЩИЙ: заводите НОВЫЕ vrrp_script/vrrp_instance. Параметры' '#    существующих инстансов (priority, unicast_peer, notify) задаёт шаблон —' '#    повторное объявление того же имени конфликтует.' > /etc/keepalived/conf.d/90-custom.conf"
         bcm_ssh_copy_file "$local_keepalived_cfg" "$ip" "/etc/keepalived/keepalived.conf"
 
         # ⚠️⚠️ SELinux (Enforcing по умолчанию на Oracle/Alma 9): haproxy_t умеет биндить
@@ -1908,7 +1910,9 @@ EOF
         bcm_ssh_copy_file "${BCM_BASE_DIR}/bin/lib/cron_notify.sh" "$ip" "/opt/bcm/bin/lib/cron_notify.sh"
         bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/cron_notify.sh"
 
-        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived"
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/keepalived /etc/keepalived/conf.d"
+        # Слой оператора: создаём заготовку ОДИН раз, повторный install не трогает.
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/keepalived/conf.d/90-custom.conf ] || printf '%s\n' '# Ваш слой настроек keepalived. BCM этот файл не перезаписывает.' '# Редактируется через меню BCM (5 → 11).' '#' '# ⚠️ Слой ДОПОЛНЯЮЩИЙ: заводите НОВЫЕ vrrp_script/vrrp_instance. Параметры' '#    существующих инстансов (priority, unicast_peer, notify) задаёт шаблон —' '#    повторное объявление того же имени конфликтует.' > /etc/keepalived/conf.d/90-custom.conf"
         bcm_ssh_copy_file "$local_keepalived_web" "$ip" "/etc/keepalived/keepalived.conf"
 
         # Guard HA Cron: ansible bitrix-env может перезаписать /etc/crontab свежей
@@ -2094,6 +2098,11 @@ UNIT
         fi
 
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/lib/redis-session /var/log/redis && chown redis:bitrix /var/lib/redis-session && chmod 750 /var/lib/redis-session"
+        # ⚠️ Слой оператора создаём ДО базового конфига: базовый подключает его
+        # через include, а при отсутствующем include-файле redis НЕ стартует
+        # вовсе («Fatal error, can't open config file»). Заготовка ставится один
+        # раз — повторный install.sh её не трогает.
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/redis/redis-session-custom.conf ] || printf '%s\n' '# Ваш слой настроек redis (session). BCM этот файл не перезаписывает.' '# Редактируется через меню BCM (5 → 10).' '#' '# Подключается ПОСЛЕДНИМ, поэтому заданное здесь ПЕРЕОПРЕДЕЛЯЕТ базовый конфиг.' '# ⚠️ Файл удалять нельзя: без него redis не стартует.' > /etc/redis/redis-session-custom.conf"
         bcm_ssh_copy_file "$local_redis_cfg" "$ip" "/etc/redis/redis-session.conf"
         bcm_ssh_exec "$ip" "chown redis:root /etc/redis/redis-session.conf && chmod 640 /etc/redis/redis-session.conf"
         bcm_ssh_copy_file "$local_unit" "$ip" "/etc/systemd/system/redis-session.service"
@@ -2880,6 +2889,11 @@ UNIT
             echo "replicaof ${master_ip} ${PUSH_REDIS_PORT}" >> "$local_redis_cfg"
         fi
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/lib/redis-push /var/log/redis && chown redis:bitrix /var/lib/redis-push && chmod 750 /var/lib/redis-push"
+        # ⚠️ Слой оператора создаём ДО базового конфига: базовый подключает его
+        # через include, а при отсутствующем include-файле redis НЕ стартует
+        # вовсе («Fatal error, can't open config file»). Заготовка ставится один
+        # раз — повторный install.sh её не трогает.
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/redis/redis-push-custom.conf ] || printf '%s\n' '# Ваш слой настроек redis (push). BCM этот файл не перезаписывает.' '# Редактируется через меню BCM (5 → 10).' '#' '# Подключается ПОСЛЕДНИМ, поэтому заданное здесь ПЕРЕОПРЕДЕЛЯЕТ базовый конфиг.' '# ⚠️ Файл удалять нельзя: без него redis не стартует.' > /etc/redis/redis-push-custom.conf"
         bcm_ssh_copy_file "$local_redis_cfg" "$ip" "/etc/redis/redis-push.conf"
         bcm_ssh_exec "$ip" "chown redis:root /etc/redis/redis-push.conf && chmod 640 /etc/redis/redis-push.conf"
         bcm_ssh_copy_file "$local_unit" "$ip" "/etc/systemd/system/redis-push.service"
@@ -3052,6 +3066,11 @@ UNIT
             echo "replicaof ${master_ip} ${CACHE_REDIS_PORT}" >> "$local_redis_cfg"
         fi
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/lib/redis-cache /var/log/redis && chown redis:bitrix /var/lib/redis-cache && chmod 750 /var/lib/redis-cache"
+        # ⚠️ Слой оператора создаём ДО базового конфига: базовый подключает его
+        # через include, а при отсутствующем include-файле redis НЕ стартует
+        # вовсе («Fatal error, can't open config file»). Заготовка ставится один
+        # раз — повторный install.sh её не трогает.
+        bcm_ssh_exec_logged "$name" "$ip" "[ -f /etc/redis/redis-cache-custom.conf ] || printf '%s\n' '# Ваш слой настроек redis (cache). BCM этот файл не перезаписывает.' '# Редактируется через меню BCM (5 → 10).' '#' '# Подключается ПОСЛЕДНИМ, поэтому заданное здесь ПЕРЕОПРЕДЕЛЯЕТ базовый конфиг.' '# ⚠️ Файл удалять нельзя: без него redis не стартует.' > /etc/redis/redis-cache-custom.conf"
         bcm_ssh_copy_file "$local_redis_cfg" "$ip" "/etc/redis/redis-cache.conf"
         bcm_ssh_exec "$ip" "chown redis:root /etc/redis/redis-cache.conf && chmod 640 /etc/redis/redis-cache.conf"
         bcm_ssh_copy_file "$local_unit" "$ip" "/etc/systemd/system/redis-cache.service"
