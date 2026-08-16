@@ -2164,7 +2164,12 @@ $cfg['session'] = array(
             ),
         ),
     ),
-    'readonly' => false,
+    // ⚠️ readonly=true: секция кластерная, менять её из админки нельзя. Ядро
+    // (Configuration::add/setValue) молча пропускает запись в readonly-секцию,
+    // поэтому случайная правка настроек сессий через UI не собьёт VIP и persistent.
+    // ⚠️ От регенерации .settings.php ansible'ом bitrix-env НЕ защищает — это
+    // внешняя перезапись файла целиком; её лечит повторный прогон install.sh.
+    'readonly' => true,
 );
 // Бэкап наследует владельца и режим оригинала: сниппет исполняется от root с umask 022,
 // а .settings.php — bitrix:bitrix 0640. Без наследования рядом остаётся root:root 0644:
@@ -3120,7 +3125,13 @@ $s['cache']=array(
     'persistent'=>0,
     'timeout'=>1,
   ),
-  'readonly'=>false,
+  // ⚠️ readonly=true: см. довод в секции 'session' — ядро (Configuration::add/
+  // setValue) молча пропускает запись в readonly-секцию, поэтому правка настроек
+  // кэша из админки не собьёт кластерные значения.
+  // ⚠️ НО .settings_extra.php перекрывает секции БЕЗ проверки этого флага (в
+  // loadConfiguration проверки readonly нет) — класть туда настройки кэша нельзя,
+  // именно так и получали CacheEngineNone вместо redis.
+  'readonly'=>true,
 );
 // Бэкап наследует владельца/режим оригинала (сниппет от root, umask 022) — иначе
 // root:root 0644 рядом с bitrix:bitrix 0640, и «Проверка системы» Bitrix ругается.
