@@ -2146,6 +2146,13 @@ $cfg['session'] = array(
                 'type' => 'redis',
                 'host' => '__VIP__',
                 'port' => __PORT__,
+                // ⚠️ persistent=0 при плавающем VIP — см. довод в секции 'cache'
+                // (configure_cache_redis): постоянные соединения превращают переезд
+                // VIP в многосекундный отказ обеих web-нод. Здесь ключи читаются из
+                // САМОГО обработчика (RedisSessionHandler передаёт их в пул), а не с
+                // верхнего уровня, как в 'cache' — уровни у секций РАЗНЫЕ.
+                'persistent' => 0,
+                'timeout' => 1,
             ),
         ),
     ),
@@ -3092,6 +3099,18 @@ $s['cache']=array(
       'scale_mode'=>'single',
     ),
     'sid'=>'/home/bitrix/www#bcmcache01',
+    // ⚠️⚠️ persistent/timeout ЧИТАЮТСЯ С ВЕРХНЕГО УРОВНЯ секции cache, НЕ из
+    // подмассива 'redis' (CacheEngineRedis::configure берёт Configuration::getValue
+    // ('cache') и смотрит $cacheConfig['persistent']). Положенные рядом с host/port
+    // они молча игнорируются.
+    // ⚠️ persistent=0 ОБЯЗАТЕЛЕН при плавающем VIP: с постоянными соединениями
+    // каждый PHP-воркер держит в пуле сокет к redis-мастеру, и при переезде VIP
+    // ВСЕ они разом становятся мёртвыми. Следующий запрос переиспользует такой
+    // сокет и виснет на неограниченном чтении (readTimeout по умолчанию 0), обе
+    // web-ноды перестают проходить health-check и HAProxy отдаёт 503. Ловили
+    // вживую: переезд VIP = 19–25 с недоступности портала, с persistent=0 — 0 с.
+    'persistent'=>0,
+    'timeout'=>1,
   ),
   'readonly'=>false,
 );
