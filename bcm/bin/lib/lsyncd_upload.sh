@@ -146,6 +146,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${bin} -nodaemon -pidfile /run/lsyncd-upload.pid ${UPLOAD_CONF}
+# lsyncd на SIGTERM выходит с 143 — без этого штатный systemctl stop оставляет
+# юнит в состоянии failed, и «зеркало сломано» не отличить от «его выключили».
+SuccessExitStatus=143
 Restart=always
 RestartSec=5
 
