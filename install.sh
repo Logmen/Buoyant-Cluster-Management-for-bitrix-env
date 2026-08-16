@@ -3651,6 +3651,14 @@ finalize_web_nodes() {
         # Домен портала → 127.0.0.1: ansible bitrix-env мог перезаписать /etc/hosts
         # уже после configure_portal_hosts, поэтому переприменяем последним шагом.
         bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/bcm_portal_hosts.sh ] && /opt/bcm/bin/lib/bcm_portal_hosts.sh assert 2>/dev/null || true" >/dev/null 2>&1
+        # Сторож настроек портала. ⚠️ Эталон снимается ЗДЕСЬ, последним шагом:
+        # к этому моменту .settings.php уже приведён к кластерному виду (БД на
+        # ProxySQL, кэш и сессии на VIP), а ansible bitrix-env отработал. Снимать
+        # раньше — значит зафиксировать в эталоне скелет. Ставим только там, где
+        # БД подтверждена: иначе эталоном стал бы заведомо нерабочий конфиг.
+        if [[ "$fz_db_ok" != "0" ]]; then
+            bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/bcm_settings_guard.sh ] && /opt/bcm/bin/lib/bcm_settings_guard.sh --install 2>/dev/null || true" >/dev/null 2>&1
+        fi
         if [[ "$fz_db_ok" == "0" ]]; then
             log_warn "  $name: mysqld ОСТАВЛЕН включённым (БД портала не на ProxySQL); ProxySQL/HA-Cron переприменены."
         else
