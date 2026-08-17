@@ -14,6 +14,7 @@ source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_runtime.sh"
+source "${BCM_LIB_DIR}/bcm_php_update.sh"
 
 # ──── Загрузить топологию ─────────────────────────────────────────────────────
 if ! bcm_conf_exists; then
@@ -305,6 +306,39 @@ _ws_show_php_info() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Главное меню модуля
 # ─────────────────────────────────────────────────────────────────────────────
+# ──── Версия PHP: статус и последовательная смена ───────────────────────────
+# ⚠️ Меняем только через эту процедуру, а НЕ через меню bitrix-env: оно обновит
+# лишь ноды из своего пула ansible (обычно одну), и кластер останется с разными
+# версиями PHP на разных нодах.
+_ws_php_version_menu() {
+    while true; do
+        bcm_php_status
+        echo
+        local items=(
+            "1.  Перевести все web-ноды на PHP 8.2"
+            "2.  Перевести все web-ноды на PHP 8.3"
+            "3.  Перевести все web-ноды на PHP 8.4"
+            "4.  Указать версию вручную"
+            "0.  Назад"
+        )
+        bcm_print_menu items
+        local choice; bcm_read_choice "Ваш выбор" choice
+        case "$choice" in
+            1) bcm_php_rolling "8.2" ;;
+            2) bcm_php_rolling "8.3" ;;
+            3) bcm_php_rolling "8.4" ;;
+            4)
+                local v; read -r -p "  Версия (например 8.3; 0 — отмена): " v
+                [[ "$v" == "0" || -z "$v" ]] && { bcm_info "Отменено."; bcm_any_key; continue; }
+                bcm_php_rolling "$v"
+                ;;
+            0) return 0 ;;
+            "") : ;;
+            *) bcm_warn "Неверный выбор: ${choice}" ;;
+        esac
+    done
+}
+
 _ws_menu() {
     while true; do
         bcm_section_header "Веб-серверы (Nginx + Apache/httpd)"
@@ -320,6 +354,7 @@ _ws_menu() {
             "8.  Текущие соединения (ss -tuln, порты 80/443)"
             "9.  PHP info (версия, модули, mod_php)"
             "10. Свои настройки nginx (${EDITOR:-vi}, все web)"
+            "11. Версия PHP: статус и смена (последовательно, без простоя)"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -338,6 +373,7 @@ _ws_menu() {
             8) _ws_show_connections               ;;
             9) _ws_show_php_info                  ;;
             10) bcm_confedit_nginx                ;;
+            11) _ws_php_version_menu              ;;
             0) return 0                           ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

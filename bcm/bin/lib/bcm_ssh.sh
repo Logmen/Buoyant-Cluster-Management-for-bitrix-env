@@ -203,7 +203,7 @@ bcm_deploy_to_node() {
               bin/lib/bcm_confedit.sh bin/lib/bcm_update.sh \
               bin/lib/transformer_notify.sh bin/lib/transformer_check.sh \
               bin/lib/bcm_mail.sh bin/lib/bcm_portal_hosts.sh \
-              bin/lib/bcm_settings_guard.sh VERSION; do
+              bin/lib/bcm_settings_guard.sh bin/lib/bcm_php_update.sh VERSION; do
         bcm_ssh_copy_file "${bcm_src}/${f}" "$ip" "/opt/bcm/${f}"
     done
     bcm_ssh_exec "$ip" "chmod +x /opt/bcm/bin/lib/*.sh 2>/dev/null || true"
