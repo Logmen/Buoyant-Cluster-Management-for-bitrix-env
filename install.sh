@@ -2563,21 +2563,9 @@ EOF
 EOF
             bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd"
         elif [[ "$role" == "pxc" ]]; then
-            # MySQL / Percona Galera logs
-            cat << 'EOF' >> "$lr_cfg"
-
-# MySQL / Percona Galera
-/var/log/mysql/*.log /var/log/mysql/error.log /var/log/mysql/slow.log {
-    daily
-    rotate 4
-    size 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
+            # Блока для /var/log/mysql здесь НЕТ намеренно: error.log и slow.log
+            # ротируются почасовым набором (configure_pxc_log_rotation), а один и
+            # тот же файл в двух наборах logrotate отвергает как дубль записи.
             bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/mysql && chown -R mysql:mysql /var/log/mysql || true"
         elif [[ "$role" == "s3" ]]; then
             # MinIO
@@ -2604,6 +2592,91 @@ EOF
         rm -f "$lr_cfg"
     done
     log_ok "Локальная ротация логов на всех узлах успешно настроена."
+}
+
+# ──── Почасовая ротация error.log MySQL (PXC) ────────────────────────────────
+# Bitrix постоянно берёт именованные блокировки, а PXC при обязательном для нас
+# pxc_strict_mode=PERMISSIVE пишет на КАЖДУЮ из них варнинг WSREP «doesn't
+# recommend use of GET_LOCK» — на живом портале это ~3 ГБ error.log в сутки,
+# почти целиком на writer'е (ProxySQL шлёт lock-функции только туда).
+# ⚠️ Отфильтровать варнинг средствами журнала НЕЛЬЗЯ: ни log_error_verbosity=1,
+# ни правило log_filter_dragnet по subsystem/prio на него не действуют — Galera
+# пишет эти строки мимо конвейера компонентов error log. Единственная
+# альтернатива, pxc_strict_mode=DISABLED, гасит заодно и варнинги о прочих
+# неподдерживаемых операциях, поэтому объём ограничивается ротацией.
+configure_pxc_log_rotation() {
+    log_info "Настройка почасовой ротации логов MySQL на PXC-нодах..."
+
+    # ⚠️ Набор лежит ВНЕ /etc/logrotate.d: оттуда его подхватил бы суточный прогон
+    # штатного logrotate.timer, а один и тот же файл в двух наборах logrotate
+    # отвергает как дубль записи. По той же причине в bcm-node блока MySQL нет.
+    # ⚠️ dateext включён глобально в /etc/logrotate.conf, поэтому нужен
+    # dateformat с часом: при суточном суффиксе несколько ротаций за день дали бы
+    # одно имя. copytruncate — mysqld не переоткрывает error.log по сигналу.
+    local local_cfg="/tmp/bcm-logrotate-mysql.conf"
+    cat > "$local_cfg" <<'CFG'
+# Сгенерировано install.sh — почасовая ротация логов MySQL.
+# Запускается bcm-logrotate-mysql.timer со своим файлом состояния.
+/var/log/mysql/error.log /var/log/mysql/slow.log {
+    hourly
+    maxsize 200M
+    rotate 6
+    dateext
+    dateformat -%Y%m%d-%H
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+CFG
+
+    # ⚠️ Свой таймер обязателен: штатный logrotate.timer суточный, и директива
+    # hourly сама по себе, без почасового запуска, не даёт ничего.
+    local local_svc="/tmp/bcm-logrotate-mysql.service"
+    cat > "$local_svc" <<'UNIT'
+[Unit]
+Description=Почасовая ротация error.log/slow.log MySQL (BCM)
+Documentation=man:logrotate(8)
+
+[Service]
+Type=oneshot
+# Копирование многосотмегабайтного лога не должно конкурировать с БД за диск.
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/sbin/logrotate -s /var/lib/logrotate/bcm-mysql.status /etc/bitrix-cluster/logrotate-mysql.conf
+UNIT
+
+    local local_tmr="/tmp/bcm-logrotate-mysql.timer"
+    cat > "$local_tmr" <<'UNIT'
+[Unit]
+Description=Почасовой запуск ротации логов MySQL (BCM)
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    local name ip
+    for name in "${PXC_NODES[@]}"; do
+        ip="${PXC_IPS[$name]}"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            log_info "[DRY RUN] Почасовая ротация логов MySQL на $name ($ip)"
+            continue
+        fi
+        log_info "  $name ($ip): раскатка почасовой ротации..."
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/bitrix-cluster /var/lib/logrotate"
+        bcm_ssh_copy_file "$local_cfg" "$ip" "/etc/bitrix-cluster/logrotate-mysql.conf"
+        bcm_ssh_copy_file "$local_svc" "$ip" "/etc/systemd/system/bcm-logrotate-mysql.service"
+        bcm_ssh_copy_file "$local_tmr" "$ip" "/etc/systemd/system/bcm-logrotate-mysql.timer"
+        bcm_ssh_exec "$ip" "chmod 644 /etc/bitrix-cluster/logrotate-mysql.conf"
+        bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable --now bcm-logrotate-mysql.timer"
+    done
+    rm -f "$local_cfg" "$local_svc" "$local_tmr"
+    log_ok "Почасовая ротация логов MySQL настроена на PXC-нодах."
 }
 
 # ──── Авто-восстановление PXC после полного обесточивания ────────────────────
@@ -3820,6 +3893,8 @@ main() {
     configure_cache_redis
 
     configure_remote_logging
+
+    configure_pxc_log_rotation
 
     # Финальная фиксация web-нод — ПОСЛЕДНИМ шагом (после оседания bitrix-env-ansible)
     finalize_web_nodes
