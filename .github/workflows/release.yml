@@ -38,6 +38,10 @@ jobs:
       - name: Install shellcheck + php-cli
         # php-cli нужен проверке 12 (синтаксис шаблонов и PHP-сниппетов install.sh);
         # без него она молча пропускается с warning.
+        # ⚠️ Единственный шаг, ходящий в сеть: при затыке на зеркале apt висит без
+        # вывода, а дефолтный лимит job'а — 6 часов, и прогон выглядит «упавшим»,
+        # хотя тесты даже не стартовали (ловили: 35 минут против обычных 31 с).
+        timeout-minutes: 5
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck php-cli
 
       - name: Pre-release checks (tests/release_check.sh)
