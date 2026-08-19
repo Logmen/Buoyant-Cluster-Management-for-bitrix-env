@@ -177,7 +177,7 @@ fi
 # ──────────────────────────────────────────────────────────────────────────
 section "9. Манифест релизного tarball'а"
 man_fail=0
-for item in bcm install.sh install_answers.conf.example README.md LICENSE NOTICE DEPLOY_REQUIREMENTS.txt; do
+for item in bcm install.sh install_answers.conf.example scripts/preflight_check.sh README.md LICENSE NOTICE DEPLOY_REQUIREMENTS.txt; do
     if [[ ! -e "$item" ]]; then fail "нет файла из манифеста релиза: $item"; man_fail=1; fi
 done
 [[ $man_fail -eq 0 ]] && pass "все файлы релизного манифеста на месте"
