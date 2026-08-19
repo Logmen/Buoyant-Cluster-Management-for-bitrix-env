@@ -310,7 +310,10 @@ if (( S3_ENABLED )) && [[ -n "${S3_VHOST_DOMAIN:-}" ]]; then
         && info "S3-домен $S3_VHOST_DOMAIN резолвится публично" \
         || info "S3-домен $S3_VHOST_DOMAIN публично не резолвится — на web-нодах он прописывается в /etc/hosts (это штатно)"
 fi
+declare -A _vip_seen=()
 for v in "${VIPS[@]}"; do
+    [[ -n "${_vip_seen[$v]:-}" ]] && continue
+    _vip_seen["$v"]=1
     if ping -c1 -W1 "$v" >/dev/null 2>&1; then
         warn "VIP $v уже отвечает на ping — либо кластер уже развёрнут, либо адрес занят чужим хостом"
     else
@@ -328,20 +331,37 @@ fi
 section "6. Доступность узлов и вход root"
 # ──────────────────────────────────────────────────────────────────────────────
 SSH_BASE=(-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+SSH_KEY_OPTS=(-o BatchMode=yes -o PreferredAuthentications=publickey)
+SSH_PASS_OPTS=(-o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1)
+
+# Ключ кластера, если узлы уже развёрнуты и парольный вход закрыт.
+[[ -z "$SSH_KEY" && -r /etc/bitrix-cluster/cluster_id_rsa ]] && SSH_KEY=/etc/bitrix-cluster/cluster_id_rsa
+
+# ⚠️ Порядок методов: каждая НЕУДАЧНАЯ попытка входа считается sshd и pam_faillock, и
+# несколько прогонов подряд способны заблокировать root на узле. Поэтому пробуем сначала
+# тот метод, который реально может сработать: ключ — только если он у нас вообще есть
+# (задан --ssh-key, лежит ключ кластера, есть ключи в агенте или в ~/.ssh); иначе сразу пароль.
+PREFER_KEY=0
+[[ -n "$SSH_KEY" ]] && PREFER_KEY=1
+ssh-add -l >/dev/null 2>&1 && PREFER_KEY=1
+for _k in "${HOME}/.ssh/id_rsa" "${HOME}/.ssh/id_ed25519" "${HOME}/.ssh/id_ecdsa"; do
+    [[ -r "$_k" ]] && PREFER_KEY=1
+done
+(( PREFER_KEY )) || info "своих SSH-ключей нет — вход проверяется сразу паролем root из файла ответов (лишние неудачные попытки блокируют root через pam_faillock)"
 
 pf_ssh() {   # выполнить команду на узле; stdin не читается (-n)
     local ip="$1"; shift
     case "${NODE_AUTH_BY_IP[$ip]:-none}" in
-        key)  timeout 30 ssh -n "${SSH_BASE[@]}" -o BatchMode=yes ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" "$@" 2>/dev/null ;;
-        pass) timeout 30 sshpass -p "$ROOT_PASSWORD" ssh -n "${SSH_BASE[@]}" "root@${ip}" "$@" 2>/dev/null ;;
+        key)  timeout 30 ssh -n "${SSH_BASE[@]}" "${SSH_KEY_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" "$@" 2>/dev/null ;;
+        pass) timeout 30 sshpass -p "$ROOT_PASSWORD" ssh -n "${SSH_BASE[@]}" "${SSH_PASS_OPTS[@]}" "root@${ip}" "$@" 2>/dev/null ;;
         *)    return 1 ;;
     esac
 }
 pf_ssh_script() {   # выполнить скрипт со stdin: pf_ssh_script <ip> <args...> < script
     local ip="$1"; shift
     case "${NODE_AUTH_BY_IP[$ip]:-none}" in
-        key)  timeout 120 ssh "${SSH_BASE[@]}" -o BatchMode=yes ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" "bash -s -- $*" 2>/dev/null ;;
-        pass) timeout 120 sshpass -p "$ROOT_PASSWORD" ssh "${SSH_BASE[@]}" "root@${ip}" "bash -s -- $*" 2>/dev/null ;;
+        key)  timeout 120 ssh "${SSH_BASE[@]}" "${SSH_KEY_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" "bash -s -- $*" 2>/dev/null ;;
+        pass) timeout 120 sshpass -p "$ROOT_PASSWORD" ssh "${SSH_BASE[@]}" "${SSH_PASS_OPTS[@]}" "root@${ip}" "bash -s -- $*" 2>/dev/null ;;
         *)    return 1 ;;
     esac
 }
@@ -355,21 +375,28 @@ for n in "${ORDER[@]}"; do
         fail "$n ($ip): порт 22/tcp недоступен"
         continue
     fi
-    if timeout 10 ssh -n "${SSH_BASE[@]}" -o BatchMode=yes ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" true 2>/dev/null; then
-        NODE_AUTH_BY_IP["$ip"]="key"; NODE_AUTH["$n"]="key"
+    _try_key()  { timeout 10 ssh -n "${SSH_BASE[@]}" "${SSH_KEY_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} "root@${ip}" true 2>/dev/null; }
+    _try_pass() { command -v sshpass >/dev/null 2>&1 && [[ -n "${ROOT_PASSWORD:-}" ]] \
+                  && timeout 10 sshpass -p "$ROOT_PASSWORD" ssh -n "${SSH_BASE[@]}" "${SSH_PASS_OPTS[@]}" "root@${ip}" true 2>/dev/null; }
+    if (( PREFER_KEY )) && _try_key; then
+        NODE_AUTH_BY_IP["$ip"]="key"; NODE_AUTH["$n"]="key"; auth_key=$((auth_key+1))
         pass "$n ($ip): вход root по ключу"
-        auth_key=$((auth_key+1))
-    elif command -v sshpass >/dev/null 2>&1 && [[ -n "${ROOT_PASSWORD:-}" ]] \
-         && timeout 10 sshpass -p "$ROOT_PASSWORD" ssh -n "${SSH_BASE[@]}" "root@${ip}" true 2>/dev/null; then
-        NODE_AUTH_BY_IP["$ip"]="pass"; NODE_AUTH["$n"]="pass"
-        auth_pass=$((auth_pass+1))
+    elif _try_pass; then
+        NODE_AUTH_BY_IP["$ip"]="pass"; NODE_AUTH["$n"]="pass"; auth_pass=$((auth_pass+1))
         pass "$n ($ip): вход root по паролю из файла ответов"
+    elif (( PREFER_KEY == 0 )) && _try_key; then
+        NODE_AUTH_BY_IP["$ip"]="key"; NODE_AUTH["$n"]="key"; auth_key=$((auth_key+1))
+        pass "$n ($ip): вход root по ключу"
     else
-        fail "$n ($ip): root не входит ни по ключу, ни по паролю ROOT_PASSWORD"
+        reason="$(timeout 10 ssh -n "${SSH_BASE[@]}" -o BatchMode=yes "root@${ip}" true 2>&1 \
+                  | grep -iE 'denied|closed|refused|locked|too many' | head -1)"
+        fail "$n ($ip): root не входит ни по ключу, ни по паролю ROOT_PASSWORD${reason:+ — $reason}"
+        fail_hint=1
         continue
     fi
     REACHABLE+=("$n")
 done
+(( ${fail_hint:-0} )) && info "если пароль верен и вход просто «отваливается» — проверьте на узле: faillock --user root (сброс: faillock --user root --reset) и sshd -T | grep -iE 'permitrootlogin|passwordauthentication'"
 (( auth_pass == 0 && auth_key > 0 )) && warn "вход по паролю нигде не подтверждён: install.sh раскатывает ключ через sshpass — временно разрешите PasswordAuthentication/PermitRootLogin для root"
 
 (( ${#REACHABLE[@]} )) || { section "Итог"; fail "ни один узел недоступен — дальнейшие проверки невозможны"; exit 1; }
