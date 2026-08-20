@@ -139,7 +139,7 @@ BUILD="$(mktemp -d)"; trap 'rm -rf "$_tmpgnupg" "$BUILD"' EXIT
 STAGE="bcm-${VERSION}"
 mkdir -p "${BUILD}/${STAGE}"
 git archive --format=tar "$TAG" \
-    bcm install.sh install_answers.conf.example scripts/preflight_check.sh \
+    bcm install.sh install_answers.conf.example scripts/preflight_check.sh scripts/portal_export.sh \
     README.md LICENSE NOTICE DEPLOY_REQUIREMENTS.txt \
     | tar -x -C "${BUILD}/${STAGE}" \
     || { _undo_hint; die "не удалось собрать дерево релиза из git archive"; }
