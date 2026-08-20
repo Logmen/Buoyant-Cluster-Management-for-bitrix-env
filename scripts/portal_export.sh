@@ -139,11 +139,17 @@ EXCLUDES=(
 )
 (( WITH_CACHE )) && EXCLUDES=()
 
-# ⚠️ .settings_extra.php в кластере ПРИНАДЛЕЖИТ BCM: там лежит слой наложений
-# (ProxySQL + redis), защищающий портал от перезаписи .settings.php ansible'ом.
-# Файл источника (обычно memcache) молча перебил бы кластерную конфигурацию —
-# поэтому он не едет в общий архив, а откладывается в conflicts/ для сверки.
-CONFLICT_FILES=( "bitrix/.settings_extra.php" )
+# ⚠️ Файлы подключения и кэша в кластере ПРИНАДЛЕЖАТ BCM и bitrix-env: у приёмника
+# уже есть свои, указывающие на ProxySQL и redis-VIP. Файлы источника указывают на
+# localhost и memcache, и, приехав поверх, тихо оторвали бы портал от кластера
+# (.settings_extra.php накладывается ПОВЕРХ .settings.php без проверки readonly).
+# Поэтому они не едут в общий архив, а откладываются в conflicts/ — не потеряны,
+# но переносятся только осознанно, по значениям (см. REPORT.md).
+CONFLICT_FILES=(
+    "bitrix/.settings.php"
+    "bitrix/.settings_extra.php"
+    "bitrix/php_interface/dbconn.php"
+)
 
 # ──── Каталог вывода ─────────────────────────────────────────────────────────
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -366,6 +372,25 @@ agents="$(_mysql -N -B -e "SELECT COUNT(*) FROM ${DB_NAME}.b_agent WHERE ACTIVE=
     echo "  выравнивается по \`pull.signature_key\` со всех нод. Вручную ничего копировать не нужно."
     echo "- **Конвертер документов (transformer).** Ставится отдельно, только после развёртывания"
     echo "  портала и при редакции Enterprise: меню 14."
+    echo
+    echo "## Файлы в \`conflicts/\`"
+    echo
+    echo "Они НЕ входят в \`files.tar.zst\`: в кластере эти файлы уже созданы"
+    echo "bitrix-env и BCM и указывают на ProxySQL и redis-VIP. Копировать их поверх"
+    echo "нельзя — портал уедет на localhost и memcache. Переносить только значения:"
+    echo
+    echo "- \`bitrix/.settings.php\` — из источника забрать \`crypto\` (ключ шифрования:"
+    echo "  без него не расшифруются сохранённые токены и пароли модулей), \`cookies\`,"
+    echo "  \`cache_flags\`, \`exception_handling\`, \`utf_mode\`. Секции \`connections\`,"
+    echo "  \`cache\` и \`session\` брать НЕ надо — они кластерные."
+    echo "  \`pull.signature_key\`: либо оставить кластерный, либо, если переносите ключ"
+    echo "  источника, после правки заново выровнять \`security.key\` push-серверов на всех"
+    echo "  web-нодах (иначе клиенты получат \`4010 Wrong Channel Id\`)."
+    echo "- \`bitrix/.settings_extra.php\` — в кластере это файл BCM (слой наложений)."
+    echo "  Из источника не переносить ничего: там кэш, который перебьёт кластерный."
+    echo "- \`bitrix/php_interface/dbconn.php\` — забрать прикладные константы"
+    echo "  (\`CACHED_*\`, \`BX_FILE_PERMISSIONS\`/\`BX_DIR_PERMISSIONS\`, свои define'ы)."
+    echo "  \`BX_CACHE_TYPE\`/\`BX_MEMCACHE_*\` и реквизиты БД — НЕ переносить."
     echo
     echo "## Проверка целостности архивов"
     echo
