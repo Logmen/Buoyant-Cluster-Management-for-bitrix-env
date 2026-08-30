@@ -1555,19 +1555,27 @@ SQL
     done
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_NODES_BACKENDS__" "$web_backends_sticky"
 
-    # ⚠️ web_cache_backend (CSS/JS-кэш) — ОДИН источник: первый web (источник lsyncd
-    # и admin-primary) primary, остальные backup. Часть бандлов имеет фиксированное
-    # имя без контент-хэша (kernel_*_v1.js), нода собирает его лениво как снимок
-    # своего состояния, и после обновления модулей на нодах под одним именем лежат
-    # РАЗНЫЕ файлы. Round-robin отдавал бы браузеру то один, то другой (обе ноды —
-    # 200, retry-on 404 не спасает) → часть компонентов не инициализируется, портал
-    # рисуется без стилей. Подробности — в шапке бэкенда в haproxy.cfg.tmpl.
+    # ⚠️ web_cache_backend (CSS/JS-кэш) — трафик закреплён за первой web-нодой
+    # (источник lsyncd и admin-primary) через `balance first`. Закрепление нужно,
+    # потому что часть бандлов имеет фиксированное имя без контент-хэша
+    # (kernel_*_v1.js): нода собирает его лениво как снимок своего состояния, и
+    # после обновления модулей под одним именем на нодах лежат РАЗНЫЕ файлы.
+    # Round-robin отдавал бы браузеру то один, то другой (обе ноды — 200) → часть
+    # компонентов не инициализируется, портал рисуется без стилей.
+    #
+    # ⚠️⚠️ Пиры при этом ОБЫЧНЫЕ серверы, БЕЗ `backup` (ловили вживую, август 2026):
+    # `backup` задействуется, только когда все активные ноды DOWN, поэтому
+    # redispatch по `retry-on 404` не мог до них дотянуться. А 404 здесь — штатная
+    # ситуация: бандл собирает та нода, что отрисовала страницу, и если пользователь
+    # закреплён sticky-cookie за другой, у первой ноды его просто нет. Получался
+    # вечный 404 при живой ноде — портал без стилей до ручной синхронизации
+    # /bitrix/cache. С активными пирами повтор уходит к соседу и берёт готовый файл.
     local cache_src="${WEB_NODES[0]}"
     local web_cache_backends=""
     web_cache_backends="${web_cache_backends}    server ${cache_src} ${WEB_IPS[$cache_src]}:80 check inter 2s fall 3 rise 2\n"
     for name in "${WEB_NODES[@]}"; do
         [[ "$name" == "$cache_src" ]] && continue
-        web_cache_backends="${web_cache_backends}    server ${name} ${WEB_IPS[$name]}:80 check inter 2s fall 3 rise 2 backup\n"
+        web_cache_backends="${web_cache_backends}    server ${name} ${WEB_IPS[$name]}:80 check inter 2s fall 3 rise 2\n"
     done
     render_multiline "$local_haproxy_cfg" "__BCM_WEB_CACHE_BACKENDS__" "$web_cache_backends"
 
