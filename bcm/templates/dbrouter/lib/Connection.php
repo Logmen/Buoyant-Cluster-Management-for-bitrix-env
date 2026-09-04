@@ -33,6 +33,10 @@
  * закоммиченных до его начала, поэтому запись через writer видна следующим
  * чтением через реплику даже из другого хита.
  *
+ * Старый API ($DB->Query) исполняет SQL мимо этого класса — напрямую на ресурсе
+ * mysqli; его накрывает LegacyDatabase (подмена $GLOBALS['DB'] из init.php), которая
+ * зовёт executeLegacy()/noteLegacyStatement() и делит с этим классом состояние хита.
+ *
  * Конфигурация — блок reader внутри подключения default в .settings.php:
  *   'reader' => ['host' => '127.0.0.1:6033', 'login' => 'bitrix_ro',
  *                'password' => …(по умолчанию как у основного), 'database' => …,
@@ -82,6 +86,8 @@ class Connection extends MysqliConnection
 	private ?array $readerConfig = null;
 	private ?bool $enabled = null;
 	private int $enabledCheckedAt = 0;
+	/** Ошибка последнего reader-запроса старого API: [errno, message]. */
+	private ?array $legacyError = null;
 
 	/** @var array<string, int> */
 	private static array $stats = ['reader' => 0, 'writer' => 0, 'fallback' => 0];
@@ -134,6 +140,75 @@ class Connection extends MysqliConnection
 	{
 		parent::disconnectInternal();
 		$this->closeReader();
+	}
+
+	// ──── Старый API (CDatabase::Query через LegacyDatabase) ────────────────
+
+	/**
+	 * Выполняет запрос старого API на reader, если он туда маршрутизируется.
+	 * null — исполнять на writer (вызывающий делает это сам через mysqli_query и затем
+	 * зовёт noteLegacyStatement); false — reader вернул ошибку SQL (см. getLegacyError*);
+	 * иначе результат mysqli.
+	 *
+	 * @return \mysqli_result|bool|null
+	 */
+	public function executeLegacy(string $sql)
+	{
+		$this->legacyError = null;
+		if (!$this->isEnabled())
+		{
+			return null;
+		}
+		$head = self::statementHead($sql);
+		if ($head !== 'SELECT' && $head !== '(')
+		{
+			return null;
+		}
+		if (!$this->isReadable(self::stripLiterals($sql)))
+		{
+			return null;
+		}
+		if (!$this->connectReader())
+		{
+			self::$stats['fallback']++;
+			return null;
+		}
+
+		[$ok, $errno, $error, $result] = self::execOn($this->reader, $sql);
+		if ($ok)
+		{
+			self::$stats['reader']++;
+			return $result;
+		}
+		if (self::isTransientError($errno))
+		{
+			$this->markReaderDown("query error {$errno}: {$error}");
+			self::$stats['fallback']++;
+			return null;
+		}
+		$this->legacyError = [$errno, $error];
+
+		return false;
+	}
+
+	/** Учёт запроса старого API, успешно выполненного на writer (таблицы, транзакции, SET). */
+	public function noteLegacyStatement(string $sql): void
+	{
+		self::$stats['writer']++;
+		if ($this->isEnabled())
+		{
+			$this->noteWriterStatement($sql, self::statementHead($sql));
+		}
+	}
+
+	public function getLegacyErrorCode(): int
+	{
+		return (int)($this->legacyError[0] ?? 0);
+	}
+
+	public function getLegacyErrorMessage(): string
+	{
+		return (string)($this->legacyError[1] ?? '');
 	}
 
 	/**

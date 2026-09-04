@@ -20,7 +20,13 @@
 #     (владелец и режим — как у соседей в дереве портала);
 #   • .settings.php: className + блок reader (dbrouter_repoint.php); эталон сторожа
 #     переснимается (bcm_settings_guard.sh --install) — автозагрузчик класса живёт в
-#     .settings_extra.php; httpd перечитывает конфиг (graceful reload, opcache).
+#     .settings_extra.php; httpd перечитывает конфиг (graceful reload, opcache);
+#   • старый API ($DB->Query исполняет SQL мимо класса подключения): блок bcm:dbrouter
+#     в действующем php_interface/init.php подключает legacy.php модуля, который
+#     подменяет $GLOBALS['DB'] на Bcm\DbRouter\LegacyDatabase. ⚠️ Правится тот init.php,
+#     который ядро реально грузит: /local/php_interface/init.php, если он есть, иначе
+#     /bitrix/php_interface/init.php; создавать local-вариант при существующем
+#     bitrix-варианте НЕЛЬЗЯ — ядро берёт только один из них (local вытесняет bitrix).
 # PXC-сторона (пользователь-читатель, wsrep_sync_wait=1) — оркестратор (меню 4 → 8)
 # или install.sh: отсюда до PXC не ходим.
 #
@@ -42,6 +48,8 @@ GUARD="/opt/bcm/bin/lib/bcm_settings_guard.sh"
 GUARD_REFERENCE="/etc/bitrix-cluster/settings-cluster.php"
 KILL_SWITCH="/etc/bitrix-cluster/dbrouter.off"
 LOG="/var/log/bcm/dbrouter.log"
+HOOK_BEGIN="// bcm:dbrouter-begin"
+HOOK_END="// bcm:dbrouter-end"
 
 _dr_log()  { mkdir -p /var/log/bcm 2>/dev/null || true; echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null || true; }
 _dr_err()  { echo "ОШИБКА: $*" >&2; _dr_log "ERROR: $*"; }
@@ -163,6 +171,85 @@ _dr_install_files() {
     _dr_info "✓ Файлы модуля установлены (${MODULE_DST})."
 }
 
+# ──── init.php: подмена $DB для старого API ──────────────────────────────────
+# Действующий init.php (см. шапку). Пусто — ни одного нет.
+_dr_init_php() {
+    if [[ -f "${SITE_ROOT}/local/php_interface/init.php" ]]; then
+        echo "${SITE_ROOT}/local/php_interface/init.php"
+    elif [[ -f "${SITE_ROOT}/bitrix/php_interface/init.php" ]]; then
+        echo "${SITE_ROOT}/bitrix/php_interface/init.php"
+    fi
+}
+
+_dr_hook_present() {
+    local f; f=$(_dr_init_php)
+    [[ -n "$f" ]] && grep -qF "$HOOK_BEGIN" "$f"
+}
+
+# Добавить блок в конец действующего init.php (создать /local/php_interface/init.php,
+# только если нет ни одного). Владелец/режим — как у соседей в дереве портала.
+_dr_hook_add() {
+    local f; f=$(_dr_init_php)
+    if [[ -z "$f" ]]; then
+        f="${SITE_ROOT}/local/php_interface/init.php"
+        mkdir -p "$(dirname "$f")"
+        printf '<?php\n' > "$f"
+        chown --reference="${SITE_ROOT}/local/modules" "$f" 2>/dev/null || chown bitrix:bitrix "$f"
+        chmod 0664 "$f"
+    fi
+    if grep -qF "$HOOK_BEGIN" "$f"; then
+        _dr_info "✓ Блок bcm:dbrouter уже в ${f}."
+        return 0
+    fi
+    php -l "$f" >/dev/null 2>&1 || { _dr_err "${f} не проходит проверку синтаксиса ещё ДО правки — блок не добавлен."; return 1; }
+    local bak="${f}.bcm-bak-dbrouter"
+    [[ -f "$bak" ]] || cp -p "$f" "$bak"
+    # Если файл закрыт тегом ?>, блок открывается своим <?php; иначе мы уже внутри
+    # PHP-кода и повторный <?php был бы синтаксической ошибкой.
+    local open_tag=""
+    if tail -c 200 "$f" | tr -d '[:space:]' | grep -qE '\?>$'; then
+        open_tag=$'<?php\n'
+    fi
+    cat >> "$f" <<HOOK
+
+${open_tag}${HOOK_BEGIN} — разделение чтений BCM: маршрутизирующий \$DB для старого API (bcm_dbrouter.sh)
+if (is_file(\$_SERVER['DOCUMENT_ROOT'] . '/local/modules/bcm.dbrouter/legacy.php')) {
+    require_once \$_SERVER['DOCUMENT_ROOT'] . '/local/modules/bcm.dbrouter/legacy.php';
+}
+${HOOK_END}
+HOOK
+    if ! php -l "$f" >/dev/null 2>&1; then
+        cp -p "$bak" "$f"
+        _dr_err "${f} после добавления блока не проходит проверку синтаксиса — возвращён из бэкапа."
+        return 1
+    fi
+    _dr_log "init.php: блок bcm:dbrouter добавлен в ${f}"
+    _dr_info "✓ Блок bcm:dbrouter добавлен в ${f}."
+}
+
+_dr_hook_remove() {
+    local f; f=$(_dr_init_php)
+    [[ -n "$f" ]] && grep -qF "$HOOK_BEGIN" "$f" || { _dr_info "✓ Блока bcm:dbrouter в init.php нет."; return 0; }
+    local tmp; tmp=$(mktemp)
+    # Удаляем блок вместе с открывающим его тегом <?php и пустой строкой перед ним.
+    awk -v b="$HOOK_BEGIN" -v e="$HOOK_END" '
+        { lines[NR]=$0 }
+        END {
+            n=NR; skip_from=0; skip_to=0
+            for (i=1;i<=n;i++) if (index(lines[i], b)==1) { skip_from=i; break }
+            for (i=skip_from;i<=n;i++) if (index(lines[i], e)==1) { skip_to=i; break }
+            if (skip_from>0 && skip_to>0) {
+                if (skip_from>1 && lines[skip_from-1]=="<?php") skip_from--
+                if (skip_from>1 && lines[skip_from-1]=="") skip_from--
+            }
+            for (i=1;i<=n;i++) if (skip_from==0 || i<skip_from || i>skip_to) print lines[i]
+        }' "$f" > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+    php -l "$f" >/dev/null 2>&1 || _dr_err "${f} после удаления блока не проходит проверку синтаксиса — проверьте вручную (бэкап ${f}.bcm-bak-dbrouter)."
+    _dr_log "init.php: блок bcm:dbrouter удалён из ${f}"
+    _dr_info "✓ Блок bcm:dbrouter удалён из ${f}."
+}
+
 # ──── .settings.php ─────────────────────────────────────────────────────────
 _dr_settings_status() {
     [[ -f "$REPOINT_PHP" ]] || { echo "RESULT=NO_TEMPLATE"; return 1; }
@@ -190,6 +277,12 @@ _dr_settings() {
     if [[ "$res" != "OK" ]]; then
         _dr_err ".settings.php не переписан (${out//$'\n'/ })."
         exit 1
+    fi
+    # Старый API: блок в init.php (после .settings.php — без маршрутизатора он бездействует).
+    if [[ "$mode" == "enable" ]]; then
+        _dr_hook_add || exit 1
+    else
+        _dr_hook_remove
     fi
     # Сторож настроек: эталон и наложения (.settings_extra.php с автозагрузчиком) — с нового файла.
     if [[ -x "$GUARD" && -f "$GUARD_REFERENCE" ]]; then
@@ -235,8 +328,14 @@ if ($c instanceof \Bcm\DbRouter\Connection) {
     $s = $c->getRouterState();
     echo 'ENABLED=', $s['enabled'] ? 'Y' : 'N', "\n";
     echo 'KILL_SWITCH=', $s['kill_switch'] ? 'Y' : 'N', "\n";
+        // Старый API: $DB подменён на LegacyDatabase и его SELECT тоже уходит на reader.
+    $legacyClass = get_class($GLOBALS['DB']);
+    $lr = $GLOBALS['DB']->Query("SELECT VARIABLE_VALUE AS H FROM performance_schema.global_variables WHERE VARIABLE_NAME = 'hostname'")->Fetch();
+    echo 'LEGACY_CLASS=', $legacyClass, "\n";
+    echo 'LEGACY_READER_HOST=', $lr['H'] ?? '', "\n";
     echo 'STATS=reader:', $s['stats']['reader'], ',writer:', $s['stats']['writer'], ',fallback:', $s['stats']['fallback'], "\n";
-    echo 'RESULT=', ($s['enabled'] && $s['stats']['reader'] > 0 && $reader['H'] !== $writer['H']) ? 'OK' : 'NOROUTE', "\n";
+    $legacyOk = ($GLOBALS['DB'] instanceof \Bcm\DbRouter\LegacyDatabase) && ($lr['H'] ?? '') !== '' && $lr['H'] !== $writer['H'];
+    echo 'RESULT=', ($s['enabled'] && $s['stats']['reader'] > 0 && $reader['H'] !== $writer['H'] && $legacyOk) ? 'OK' : 'NOROUTE', "\n";
 } else {
     echo "ENABLED=N\nRESULT=VENDOR_CLASS\n";
 }
@@ -248,7 +347,7 @@ PHP
         out=$(BX_DOCROOT="$SITE_ROOT" php "$tmp" 2>/dev/null); rc=$?
     fi
     rm -f "$tmp"
-    echo "$out" | grep -E '^(CLASS|READER_HOST|WRITER_HOST|ENABLED|KILL_SWITCH|STATS|RESULT)='
+    echo "$out" | grep -E '^(CLASS|READER_HOST|WRITER_HOST|ENABLED|KILL_SWITCH|LEGACY_CLASS|LEGACY_READER_HOST|STATS|RESULT)='
     [[ $rc -eq 0 ]] && echo "$out" | grep -q '^RESULT=OK$'
 }
 
@@ -263,6 +362,7 @@ _dr_status() {
     echo "SETTINGS_CLASS=${cls:-?}"
     echo "SETTINGS_ROUTED=${routed:-N}"
     echo "KILL_SWITCH=$( [[ -f "$KILL_SWITCH" ]] && echo on || echo off )"
+    echo "INIT_HOOK=$( _dr_hook_present && echo present || echo absent ) ($(_dr_init_php))"
     local ro_hg rule_user
     ro_hg=$(_dr_admin "SELECT default_hostgroup FROM runtime_mysql_users WHERE username='$(_dr_lit "$RO_USER")' AND active=1 LIMIT 1;" | tr -d '[:space:]')
     rule_user=$(_dr_admin "SELECT COALESCE(username,'') FROM runtime_mysql_query_rules WHERE rule_id=4;" | tr -d '[:space:]')
@@ -287,6 +387,9 @@ _dr_kill() {
         *)   _dr_err "--kill on|off"; exit 2;;
     esac
 }
+
+# При source (тесты) диспетчер не запускается.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0 2>/dev/null || true
 
 case "${1:-}" in
     --status)        _dr_status ;;
