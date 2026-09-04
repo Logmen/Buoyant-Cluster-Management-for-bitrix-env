@@ -4,6 +4,7 @@
 #   __ADMIN_USER__, __ADMIN_PASSWORD__, __PROXY_PORT__, __ADMIN_PORT__
 #   __HG_WRITE__ (10), __HG_READ__ (20)
 #   __MONITOR_USER__, __MONITOR_PASS__
+#   __READER_USER__ (<BITRIX_DB_USER>_ro), __READER_ACTIVE__ (1|0 по DB_READ_SPLIT)
 #   MYSQL_SERVERS_LIST — список серверов
 
 datadir="/var/lib/proxysql"
@@ -96,21 +97,25 @@ mysql_query_rules=
         apply=1
     },
     {
-        # Правило 4: остальные SELECT → HG_WRITE (ProxySQL = HA-прокси, НЕ read-splitter).
-        # ⚠️ РАНЕЕ было → HG_READ (read/write split), но это НЕСОВМЕСТИМО с тем, как
-        # Bitrix мешает именованные блокировки (GET_LOCK), temp-таблицы и user-переменные
-        # с обычными SELECT'ами на ОДНОМ соединении: пока коннект залочен на writer (HG_WRITE)
-        # удержанным GET_LOCK, ProxySQL отказывается уводить следующий ^SELECT на HG_READ →
-        # «(9006) connection is locked to hostgroup … but trying to reach hostgroup …»
-        # (ловили вживую при обновлении модулей через /bitrix/admin, июнь 2026). Stateless
-        # query-rule не может «не уводить SELECT, пока держится lock» → чтения тоже на writer.
-        # Galera синхронна, поэтому единый активный узел для чтений/записи консистентен;
-        # failover остаётся за mysql_galera_hostgroups. writer_is_also_reader тут не важен.
-        # ВНИМАНИЕ: режим единой ноды (bcm_cluster_mode.sh) переключает именно rule_id=4
-        # (pin → HG_WRITE = no-op; unpin → ОБРАТНО на HG_WRITE, НЕ HG_READ).
-        # При изменении нумерации правил — поправить там.
+        # Правило 4: остальные SELECT ОСНОВНОГО пользователя → HG_WRITE (ProxySQL =
+        # HA-прокси, НЕ read-splitter). Stateless-правило не умеет «не уводить SELECT,
+        # пока держится GET_LOCK»: коннект, залоченный на writer именованной блокировкой,
+        # ProxySQL отказывается двигать на HG_READ → «(9006) connection is locked to
+        # hostgroup …» при обновлении модулей через /bitrix/admin (ловили вживую).
+        # Galera синхронна, единый узел для чтений/записи консистентен; failover
+        # остаётся за mysql_galera_hostgroups.
+        # ⚠️ Разделение чтений делает НЕ это правило, а класс подключения BCM
+        # (Bcm\DbRouter\Connection в .settings.php): чистые SELECT он шлёт вторым
+        # соединением под пользователем-читателем (__READER_USER__), у которого
+        # default_hostgroup=HG_READ и на которого это правило НЕ распространяется
+        # (username ниже). Так один и тот же ^SELECT для основного пользователя идёт
+        # на writer, для читателя — на реплики, и всё, что привязано к соединению
+        # (блокировки, транзакции, переменные), остаётся у основного.
+        # ВНИМАНИЕ: режим единой ноды (bcm_cluster_mode.sh) переключает rule_id=4 и
+        # default_hostgroup читателя. При изменении нумерации правил — поправить там.
         rule_id=4
         active=1
+        username="__BITRIX_DB_USER__"
         match_pattern="^SELECT"
         destination_hostgroup=__HG_WRITE__
         apply=1
@@ -126,6 +131,17 @@ mysql_users=
         default_hostgroup=__HG_WRITE__
         transaction_persistent=1
         active=1
+    },
+    {
+        # Пользователь-читатель для разделения чтений (тот же пароль, что у основного;
+        # в PXC у него только SELECT). Правила 1–3 (транзакции, FOR UPDATE, блокировки)
+        # на него распространяются как страховка, правило 4 — нет, поэтому его SELECT
+        # идут в default_hostgroup=HG_READ. active=0, если DB_READ_SPLIT=0.
+        username="__READER_USER__"
+        password="__BITRIX_DB_PASS__"
+        default_hostgroup=__HG_READ__
+        transaction_persistent=1
+        active=__READER_ACTIVE__
     }
 )
 

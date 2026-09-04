@@ -575,6 +575,303 @@ _psql_sync_config() {
 }
 
 # ──── Меню ────────────────────────────────────────────────────────────────────
+# ──── Разделение чтений: SELECT портала → реплики PXC ─────────────────────────
+# Исполнитель на web-ноде — bin/lib/bcm_dbrouter.sh (ProxySQL-пользователь-читатель,
+# файлы модуля /local/modules/bcm.dbrouter, className+reader в .settings.php).
+# PXC-сторона (пользователь-читатель с одним SELECT, wsrep_sync_wait=1) — здесь.
+DBROUTER_LIB="/opt/bcm/bin/lib/bcm_dbrouter.sh"
+
+_rs_pxc_nodes() {
+    local -n _out=$1
+    local str
+    str=$(bcm_get_nodes "pxc" 2>/dev/null) || { _out=(); return 1; }
+    [[ -z "$str" ]] && { _out=(); return 1; }
+    read -ra _out <<< "$str"
+}
+
+# Литерал MySQL: экранируем обратный слэш и одинарную кавычку (пароли со спецсимволами).
+_rs_mysql_lit() { local v="${1//\\/\\\\}"; printf '%s' "${v//\'/\\\'}"; }
+
+_psql_readsplit_status() {
+    bcm_section_header "Разделение чтений — статус"
+    local -a web_nodes pxc_nodes
+    _psql_get_web_nodes web_nodes || { bcm_error "Нет web-нод в cluster.conf."; bcm_any_key; return; }
+    local rs ro
+    rs=$(bcm_conf_get proxysql read_split 2>/dev/null || echo "")
+    ro=$(bcm_conf_get proxysql reader_user 2>/dev/null || echo "")
+    bcm_info "cluster.conf: read_split=${rs:-0}  reader_user=${ro:-—}  (аварийный рубильник: файл /etc/bitrix-cluster/dbrouter.off)"
+    echo
+    local wn ip out
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        bcm_color "WHITE" "  ── ${wn} (${ip}) ──"
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_echo_color "RED_BOLD" "  Узел недоступен"; echo; continue
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 40 "${DBROUTER_LIB} --status" 2>/dev/null) || out=""
+        if [[ -z "$out" ]]; then
+            bcm_warn "  bcm_dbrouter.sh не отвечает — BCM на ноде устарел (bcm --update)?"
+        else
+            echo "$out" | sed 's/^/  /'
+        fi
+        echo
+    done
+    if _rs_pxc_nodes pxc_nodes; then
+        bcm_color "WHITE" "  ── PXC: wsrep_sync_wait (1 — SELECT на реплике ждёт применения закоммиченного) ──"
+        local pn pip v
+        for pn in "${pxc_nodes[@]}"; do
+            pip=$(bcm_get_node_ip "pxc" "$pn") || continue
+            v=$(bcm_ssh_exec_timeout "$pip" 10 "mysql -N -e \"SHOW VARIABLES LIKE 'wsrep_sync_wait'\" 2>/dev/null | awk '{print \$2}'" 2>/dev/null | tr -d '[:space:]')
+            printf '  %-10s %s\n' "$pn" "${v:-недоступен}"
+        done
+    fi
+    bcm_any_key
+}
+
+# Откат web-стороны на перечисленных нодах (settings → proxysql), без остановки на ошибках.
+_rs_rollback_web() {
+    local what="$1"; shift
+    local wn ip
+    for wn in "$@"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        [[ "$what" == "settings" || "$what" == "all" ]] && bcm_ssh_exec_timeout "$ip" 60 "${DBROUTER_LIB} --settings disable" >/dev/null 2>&1
+        [[ "$what" == "proxysql" || "$what" == "all" ]] && bcm_ssh_exec_timeout "$ip" 30 "${DBROUTER_LIB} --proxysql disable" >/dev/null 2>&1
+    done
+    return 0
+}
+
+_psql_readsplit_enable() {
+    bcm_section_header "Включить разделение чтений"
+    local -a web_nodes pxc_nodes
+    _psql_get_web_nodes web_nodes || { bcm_error "Нет web-нод в cluster.conf."; bcm_any_key; return; }
+    _rs_pxc_nodes pxc_nodes || { bcm_error "Нет PXC-нод в cluster.conf."; bcm_any_key; return; }
+    [[ ${#pxc_nodes[@]} -ge 2 ]] || { bcm_error "Нужны минимум два узла PXC (writer и реплика)."; bcm_any_key; return; }
+    if [[ "$(bcm_get_cluster_mode 2>/dev/null)" == "single" ]]; then
+        bcm_error "Кластер в режиме единой ноды (меню 1 → 7) — сначала вернитесь в HA."
+        bcm_any_key; return
+    fi
+
+    local db_user db_pass ro_user hg_read
+    db_user=$(bcm_conf_get proxysql bitrix_db_user 2>/dev/null || echo "")
+    db_pass=$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null || echo "")
+    hg_read=$(_psql_get_hg_read)
+    ro_user=$(bcm_conf_get proxysql reader_user 2>/dev/null || echo "")
+    [[ -z "$ro_user" ]] && ro_user="${db_user}_ro"
+    if [[ -z "$db_user" || -z "$db_pass" ]]; then
+        bcm_error "В cluster.conf нет [proxysql] bitrix_db_user / bitrix_db_password."
+        bcm_any_key; return
+    fi
+
+    echo "  Шаги:"
+    echo "   1. PXC: пользователь-читатель ${ro_user} (только SELECT) и wsrep_sync_wait=1 на всех узлах;"
+    echo "   2. ProxySQL на каждой web: ${ro_user} → HG${hg_read}, правило ^SELECT — только для ${db_user};"
+    echo "   3. web: файлы модуля /local/modules/bcm.dbrouter, className и reader в .settings.php, эталон сторожа;"
+    echo "   4. самопроверка на каждой web: SELECT из-под ядра уходит на узел, отличный от writer."
+    echo "  При сбое любого шага сделанное откатывается. Аварийный рубильник — пункт 4 этого меню."
+    echo
+    bcm_confirm "Включить разделение чтений?" || { bcm_info "Отменено."; bcm_any_key; return; }
+    echo
+
+    # 1. PXC: все узлы Synced, пользователь на writer'е (реплицируется Galera), sync_wait везде.
+    local pn pip st
+    for pn in "${pxc_nodes[@]}"; do
+        pip=$(bcm_get_node_ip "pxc" "$pn") || continue
+        st=$(bcm_ssh_exec_timeout "$pip" 10 "mysql -N -e \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" 2>/dev/null | awk '{print \$2}'" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$st" != "Synced" ]]; then
+            bcm_error "${pn}: состояние '${st:-недоступен}', нужен Synced на всех узлах PXC."
+            bcm_any_key; return
+        fi
+    done
+    local writer writer_ip
+    writer=$(bcm_get_pxc_writer 2>/dev/null || echo "")
+    writer_ip=$(bcm_get_node_ip "pxc" "$writer" 2>/dev/null) || writer_ip=""
+    [[ -z "$writer_ip" ]] && { writer="${pxc_nodes[0]}"; writer_ip=$(bcm_get_node_ip "pxc" "$writer"); }
+    local pass_lit
+    pass_lit=$(_rs_mysql_lit "$db_pass")
+    bcm_info "PXC: пользователь ${ro_user} на ${writer}..."
+    if ! bcm_ssh_exec "$writer_ip" "mysql" <<SQL
+CREATE USER IF NOT EXISTS '${ro_user}'@'%' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
+ALTER USER '${ro_user}'@'%' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
+GRANT SELECT ON *.* TO '${ro_user}'@'%';
+FLUSH PRIVILEGES;
+SQL
+    then
+        bcm_error "Не удалось создать пользователя ${ro_user} на ${writer}."
+        bcm_any_key; return
+    fi
+    bcm_ok "  ${writer}: пользователь ${ro_user} создан (SELECT)."
+
+    for pn in "${pxc_nodes[@]}"; do
+        pip=$(bcm_get_node_ip "pxc" "$pn") || continue
+        st=$(bcm_ssh_script "$pip" <<'SCRIPT'
+mysql -e "SET GLOBAL wsrep_sync_wait=1" || exit 1
+if grep -qE '^wsrep_sync_wait[[:space:]]*=' /etc/my.cnf; then
+    sed -i -E 's/^(wsrep_sync_wait[[:space:]]*=).*/\1 1/' /etc/my.cnf
+else
+    sed -i '/^\[mysqld\]/a wsrep_sync_wait = 1' /etc/my.cnf
+fi
+mysql -N -e "SHOW VARIABLES LIKE 'wsrep_sync_wait'" | awk '{print $2}'
+SCRIPT
+        ) || st=""
+        st="${st//[[:space:]]/}"
+        if [[ "$st" == "1" ]]; then
+            bcm_ok "  ${pn}: wsrep_sync_wait=1 (runtime + /etc/my.cnf)."
+        else
+            bcm_error "${pn}: wsrep_sync_wait не применён (${st:-нет ответа})."
+            bcm_any_key; return
+        fi
+    done
+
+    # 2. ProxySQL на каждой web (fail-closed: откат на уже переключённых).
+    local wn ip out
+    local -a done_nodes=()
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_error "${wn}: недоступна — включение прервано, откат ProxySQL на ${done_nodes[*]:-—}."
+            _rs_rollback_web proxysql "${done_nodes[@]}"
+            bcm_any_key; return
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 60 "${DBROUTER_LIB} --proxysql enable" 2>&1) || {
+            bcm_error "${wn}: ProxySQL — ${out//$'\n'/ }"
+            _rs_rollback_web proxysql "${done_nodes[@]}"
+            bcm_any_key; return
+        }
+        echo "$out" | sed "s/^/  ${wn}: /"
+        done_nodes+=("$wn")
+    done
+
+    # 3. Файлы модуля (источник lsyncd первым — он в списке первым) и .settings.php.
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        out=$(bcm_ssh_exec_timeout "$ip" 60 "${DBROUTER_LIB} --install-files" 2>&1) || {
+            bcm_error "${wn}: файлы модуля — ${out//$'\n'/ }"
+            _rs_rollback_web proxysql "${web_nodes[@]}"
+            bcm_any_key; return
+        }
+        echo "$out" | sed "s/^/  ${wn}: /"
+    done
+    local -a settings_done=()
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        out=$(bcm_ssh_exec_timeout "$ip" 120 "${DBROUTER_LIB} --settings enable" 2>&1) || {
+            bcm_error "${wn}: .settings.php — ${out//$'\n'/ }"
+            _rs_rollback_web settings "${settings_done[@]}"
+            _rs_rollback_web proxysql "${web_nodes[@]}"
+            bcm_any_key; return
+        }
+        echo "$out" | sed "s/^/  ${wn}: /"
+        settings_done+=("$wn")
+    done
+
+    # 4. Самопроверка из-под ядра Bitrix: reader-узел обязан отличаться от writer.
+    local failed=0 res
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        out=$(bcm_ssh_exec_timeout "$ip" 120 "${DBROUTER_LIB} --selftest" 2>/dev/null) || true
+        res=$(echo "$out" | sed -n 's/^RESULT=//p' | head -1)
+        echo "$out" | sed "s/^/  ${wn}: /"
+        [[ "$res" == "OK" ]] || failed=1
+    done
+    if [[ $failed -eq 1 ]]; then
+        bcm_error "Самопроверка не прошла хотя бы на одной ноде — откатываю .settings.php и ProxySQL на всех web."
+        _rs_rollback_web all "${web_nodes[@]}"
+        bcm_any_key; return
+    fi
+
+    bcm_conf_set "proxysql" "read_split" "1"
+    bcm_conf_set "proxysql" "reader_user" "$ro_user"
+    bcm_conf_sync 2>/dev/null || true
+    bcm_log_info "Разделение чтений включено: читатель ${ro_user} → HG${hg_read}, wsrep_sync_wait=1."
+    echo
+    bcm_ok "Разделение чтений включено на всех web-нодах."
+    bcm_info "Наблюдать: пункт «статус» (счётчики HG${hg_read} растут) и /var/log/bcm/dbrouter.log на web."
+    bcm_any_key
+}
+
+_psql_readsplit_disable() {
+    bcm_section_header "Выключить разделение чтений"
+    local -a web_nodes pxc_nodes
+    _psql_get_web_nodes web_nodes || { bcm_error "Нет web-нод в cluster.conf."; bcm_any_key; return; }
+    local ro_user
+    ro_user=$(bcm_conf_get proxysql reader_user 2>/dev/null || echo "")
+    [[ -z "$ro_user" ]] && ro_user="$(bcm_conf_get proxysql bitrix_db_user 2>/dev/null)_ro"
+    echo "  Порядок: .settings.php → штатный класс (все запросы на writer), затем ProxySQL и PXC"
+    echo "  теряют пользователя ${ro_user}. wsrep_sync_wait=1 на PXC остаётся: с чтениями на writer он бесплатен."
+    echo
+    bcm_confirm "Выключить разделение чтений?" || { bcm_info "Отменено."; bcm_any_key; return; }
+    echo
+    local wn ip out
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_warn "  ${wn}: недоступна — выключите на ней позже: ${DBROUTER_LIB} --settings disable; --proxysql disable"
+            continue
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 120 "${DBROUTER_LIB} --settings disable && ${DBROUTER_LIB} --proxysql disable" 2>&1) || true
+        echo "$out" | sed "s/^/  ${wn}: /"
+    done
+    if _rs_pxc_nodes pxc_nodes; then
+        local writer writer_ip
+        writer=$(bcm_get_pxc_writer 2>/dev/null || echo "${pxc_nodes[0]}")
+        writer_ip=$(bcm_get_node_ip "pxc" "$writer" 2>/dev/null) || writer_ip=$(bcm_get_node_ip "pxc" "${pxc_nodes[0]}")
+        if bcm_ssh_exec "$writer_ip" "mysql -e \"DROP USER IF EXISTS '${ro_user}'@'%'\"" </dev/null >/dev/null 2>&1; then
+            bcm_ok "  ${writer}: пользователь ${ro_user} удалён из PXC."
+        else
+            bcm_warn "  ${writer}: не удалось удалить ${ro_user} из PXC (сделайте вручную)."
+        fi
+    fi
+    bcm_conf_set "proxysql" "read_split" "0"
+    bcm_conf_sync 2>/dev/null || true
+    bcm_log_info "Разделение чтений выключено."
+    bcm_ok "Разделение чтений выключено: все запросы портала идут на writer."
+    bcm_any_key
+}
+
+# Рубильник: файл на web-нодах, класс перечитывает его раз в 5 с — без правок конфигов.
+_psql_readsplit_kill() {
+    local mode="$1"
+    local -a web_nodes
+    _psql_get_web_nodes web_nodes || { bcm_error "Нет web-нод в cluster.conf."; bcm_any_key; return; }
+    local wn ip out
+    for wn in "${web_nodes[@]}"; do
+        ip=$(bcm_get_node_ip "web" "$wn") || continue
+        out=$(bcm_ssh_exec_timeout "$ip" 20 "${DBROUTER_LIB} --kill ${mode}" 2>&1) || out="ошибка: ${out}"
+        echo "  ${wn}: ${out}"
+    done
+    bcm_any_key
+}
+
+_psql_readsplit_menu() {
+    while true; do
+        bcm_section_header "Разделение чтений (SELECT портала → реплики PXC)"
+        local rs
+        rs=$(bcm_conf_get proxysql read_split 2>/dev/null || echo "0")
+        bcm_info "Сейчас: $( [[ "$rs" == "1" ]] && echo "ВКЛЮЧЕНО" || echo "выключено" ) (cluster.conf [proxysql] read_split)"
+        echo
+        local -a items=(
+            "1.  Статус на web-нодах и PXC"
+            "2.  Включить (PXC-пользователь, ProxySQL, модуль, .settings.php, самопроверка)"
+            "3.  Выключить (вернуть все запросы на writer)"
+            "4.  Аварийно: рубильник ВКЛ на всех web (всё на writer, конфиги не трогаются)"
+            "5.  Снять рубильник"
+            "0.  Назад"
+        )
+        bcm_print_menu items
+        local choice
+        bcm_read_choice "Введите ваш выбор" choice
+        case "$choice" in
+            1) _psql_readsplit_status ;;
+            2) _psql_readsplit_enable ;;
+            3) _psql_readsplit_disable ;;
+            4) _psql_readsplit_kill on ;;
+            5) _psql_readsplit_kill off ;;
+            0|"") break ;;
+            *) bcm_error "Неверный выбор."; bcm_any_key ;;
+        esac
+    done
+}
+
 _psql_print_menu() {
     local hg_write hg_read proxy_port
     hg_write=$(_psql_get_hg_write)
@@ -588,6 +885,7 @@ _psql_print_menu() {
         "4.  Статистика connection pool"
         "5.  Перезапустить ProxySQL на всех web-нодах"
         "6.  Синхронизировать конфиг между web-нодами"
+        "7.  Разделение чтений (SELECT портала → реплики PXC)"
         "9.  Свои настройки ProxySQL (${EDITOR:-vi}, SQL к admin)"
         "0.  Назад"
     )
@@ -641,6 +939,7 @@ main() {
             4) _psql_show_stats ;;
             5) _psql_restart_all ;;
             6) _psql_sync_config ;;
+            7) _psql_readsplit_menu ;;
             9) bcm_confedit_proxysql ;;
             0) break ;;
             "") : ;;

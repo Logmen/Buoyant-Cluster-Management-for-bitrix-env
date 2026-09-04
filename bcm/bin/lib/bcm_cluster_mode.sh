@@ -98,7 +98,10 @@ _bcm_haproxy_pin_web() {
 }
 
 # ──── ProxySQL: куда направлять ^SELECT (rule_id=4 в proxysql.cnf.tmpl) ───────
-# _bcm_proxysql_select_target <hostgroup>
+# _bcm_proxysql_select_target <hostgroup> [reader_hostgroup]
+# Второй аргумент — default_hostgroup пользователя-читателя разделения чтений
+# ([proxysql] read_split=1, reader_user): pin ведёт его вместе с ^SELECT на writer,
+# unpin возвращает на HG_READ. Без разделения чтений аргумент не используется.
 # Применяет на ВСЕХ доступных web-нодах И проверяет runtime-результат. Возвращает
 # 0, только если хотя бы одна нода переключена и ни одна доступная не дала сбой;
 # иначе — ненулевой код. Раньше ошибки UPDATE молча глотались (>/dev/null 2>&1),
@@ -106,7 +109,15 @@ _bcm_haproxy_pin_web() {
 # ничего — отсюда повторяющаяся ошибка 9006 на установке портала.
 _bcm_proxysql_select_target() {
     local hg="$1"
+    local reader_hg="${2:-$1}"
     local web_nodes ap au aps
+    local read_split ro_user ro_sql=""
+    read_split=$(bcm_conf_get proxysql read_split 2>/dev/null || echo "0")
+    ro_user=$(bcm_conf_get proxysql reader_user 2>/dev/null || echo "")
+    if [[ "$read_split" == "1" && -n "$ro_user" ]]; then
+        ro_sql="UPDATE mysql_users SET default_hostgroup=${reader_hg} WHERE username='${ro_user}'; \
+                LOAD MYSQL USERS TO RUNTIME; SAVE MYSQL USERS TO DISK;"
+    fi
     web_nodes=$(bcm_get_nodes "web" 2>/dev/null) || web_nodes=""
     ap=$(bcm_get_proxysql_admin_port 2>/dev/null || echo "6032")
     au=$(bcm_get_proxysql_admin_user 2>/dev/null || echo "admin")
@@ -134,7 +145,7 @@ _bcm_proxysql_select_target() {
         out=$(bcm_ssh_exec_verbose "$ip" \
             "mysql --default-auth=mysql_native_password -h127.0.0.1 -P${ap} -u${au} -p${aps_q} -e \
              \"UPDATE mysql_query_rules SET destination_hostgroup=${hg} WHERE rule_id=4; \
-               LOAD MYSQL QUERY RULES TO RUNTIME; SAVE MYSQL QUERY RULES TO DISK;\"" 2>&1)
+               LOAD MYSQL QUERY RULES TO RUNTIME; SAVE MYSQL QUERY RULES TO DISK; ${ro_sql}\"" 2>&1)
         rc=$?
         if [[ $rc -ne 0 ]]; then
             bcm_log_error "  ${wn} (${ip}): ошибка ProxySQL admin — ${out//$'\n'/ }"
@@ -147,8 +158,15 @@ _bcm_proxysql_select_target() {
             "mysql --default-auth=mysql_native_password -h127.0.0.1 -P${ap} -u${au} -p${aps_q} -N -e \
              \"SELECT destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id=4;\"")
         got="${got//[[:space:]]/}"
-        if [[ "$got" == "$hg" ]]; then
-            bcm_log_info "  ${wn} (${ip}): ^SELECT → HG ${hg} (подтверждено)."
+        local ro_got="$reader_hg"
+        if [[ -n "$ro_sql" ]]; then
+            ro_got=$(bcm_ssh_exec "$ip" \
+                "mysql --default-auth=mysql_native_password -h127.0.0.1 -P${ap} -u${au} -p${aps_q} -N -e \
+                 \"SELECT default_hostgroup FROM runtime_mysql_users WHERE username='${ro_user}' LIMIT 1;\"")
+            ro_got="${ro_got//[[:space:]]/}"
+        fi
+        if [[ "$got" == "$hg" && "$ro_got" == "$reader_hg" ]]; then
+            bcm_log_info "  ${wn} (${ip}): ^SELECT → HG ${hg}$( [[ -n "$ro_sql" ]] && echo ", читатель ${ro_user} → HG ${reader_hg}" ) (подтверждено)."
             applied=$((applied+1))
         else
             bcm_log_error "  ${wn} (${ip}): переключение НЕ подтверждено (rule_id=4 → '${got:-?}', ожидалось ${hg})."
@@ -244,15 +262,17 @@ bcm_cluster_unpin() {
     # rule_id=4). Раньше unpin возвращал на HG_READ и воскрешал ошибку 9006 при
     # обновлении модулей через /bitrix/admin. Поэтому pin и unpin теперь оба → HG_WRITE
     # (single-режим по ProxySQL фактически no-op; реальное закрепление — HAProxy+lsyncd).
-    local hg_write
+    local hg_write hg_read
     hg_write=$(bcm_get_proxysql_hg_write 2>/dev/null || echo "10")
+    hg_read=$(bcm_get_proxysql_hg_read 2>/dev/null || echo "20")
 
     bcm_log_info "Режим единой ноды ВЫКЛ: возврат в HA."
 
     _bcm_haproxy_pin_web "" "ready" \
         || bcm_log_warn "bcm_cluster_unpin: HAProxy восстановлен НЕ полностью (см. выше) — проверь lb."
 
-    if ! _bcm_proxysql_select_target "$hg_write"; then
+    # Читатель разделения чтений (если включено) возвращается на реплики.
+    if ! _bcm_proxysql_select_target "$hg_write" "$hg_read"; then
         bcm_log_error "bcm_cluster_unpin: ^SELECT не подтверждён на HG_WRITE — режим НЕ снят (cluster.conf не изменён)."
         return 1
     fi

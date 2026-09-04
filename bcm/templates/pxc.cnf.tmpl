@@ -80,7 +80,12 @@ wsrep_sst_method            = xtrabackup-v2
 
 # Performance tuning for Galera
 wsrep_applier_threads       = 4
-wsrep_sync_wait             = 0
+# Причинная согласованность чтений: 1 — SELECT на узле ждёт применения всех
+# транзакций, закоммиченных в кластере до его начала. Нужно для разделения чтений
+# (SELECT портала на репликах через класс подключения BCM): запись через writer
+# видна следующим чтением через реплику даже из другого хита. На writer'е очередь
+# применения пуста — цена нулевая. 0 — только когда DB_READ_SPLIT=0.
+wsrep_sync_wait             = __WSREP_SYNC_WAIT__
 wsrep_retry_autocommit      = 3
 wsrep_max_ws_rows           = 131072
 wsrep_max_ws_size           = 1073741824

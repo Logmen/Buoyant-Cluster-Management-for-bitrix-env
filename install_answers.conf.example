@@ -77,6 +77,11 @@ PROXYSQL_MONITOR_PASS="CHANGE_ME_MONITOR_PASS"
 # Пользователь БД Bitrix
 BITRIX_DB_USER="bitrix"
 BITRIX_DB_PASS="CHANGE_ME_DB_PASS"
+# Разделение чтений: чистые SELECT портала идут на реплики PXC через пользователя
+# ProxySQL <BITRIX_DB_USER>_ro (класс подключения BCM в .settings.php), записи —
+# на writer. 1 — включить (по умолчанию), 0 — все запросы на writer. Переключается
+# и после установки: BCM меню 4 → 8.
+DB_READ_SPLIT="1"
 
 # Keepalived VRID для web-нод (HA Cron)
 WEB_VRID="56"

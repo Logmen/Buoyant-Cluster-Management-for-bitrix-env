@@ -225,7 +225,7 @@ if command -v php >/dev/null 2>&1; then
             fail "php -l: ${p/#$_phptmp\//install.sh (сниппет )}"
             php_fail=1
         fi
-    done < <( { compgen -G 'bcm/templates/*.php' || true; compgen -G "$_phptmp/*.php" || true; } )
+    done < <( { find bcm/templates -name '*.php' | sort; compgen -G "$_phptmp/*.php" || true; } )
     n_snip=$(find "$_phptmp" -name '*.php' | wc -l)
     rm -rf "$_phptmp"
     [[ $php_fail -eq 0 ]] && pass "php -l чисто (шаблоны + ${n_snip} сниппет(ов) install.sh)"

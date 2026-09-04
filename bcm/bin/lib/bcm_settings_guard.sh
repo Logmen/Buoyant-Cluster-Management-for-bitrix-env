@@ -86,10 +86,13 @@ _sg_fix_ownership() {
 }
 
 # ──── Снятие эталона с текущего (заведомо рабочего) .settings.php ────────────
+# Эталон — это будущее содержимое .settings_extra.php целиком: шапка,
+# автозагрузчик маршрутизатора чтений и массив защищаемых секций.
 _sg_make_reference() {
     [[ -f "$SETTINGS" ]] || _sg_die "нет $SETTINGS — портал не развёрнут"
 
-    php -r '
+    local body
+    body=$(php -r '
         $src = $argv[1]; $sections = explode(" ", $argv[2]);
         $s = include $src;
         if (!is_array($s)) { fwrite(STDERR, "не удалось прочитать .settings.php\n"); exit(2); }
@@ -100,13 +103,42 @@ _sg_make_reference() {
         if (!$out) { fwrite(STDERR, "в .settings.php нет ни одной защищаемой секции\n"); exit(3); }
         // Формат обязан совпадать с .settings.php: Bitrix кладёт значение из
         // extra прямо в data[секция], а читает его как data[секция]["value"].
-        echo "<?php\n";
-        echo "// Сгенерировано BCM (bcm_settings_guard.sh). Правки будут ЗАТЁРТЫ.\n";
-        echo "// Этот файл накладывается ПОВЕРХ .settings.php и держит кластерные\n";
-        echo "// настройки, когда ansible bitrix-env возвращает .settings.php к скелету.\n";
-        echo "// Эталон: /etc/bitrix-cluster/settings-cluster.php\n";
         echo "return ", var_export($out, true), ";\n";
-    ' "$SETTINGS" "$GUARDED_SECTIONS" > "${REFERENCE}.tmp" || _sg_die "не удалось собрать эталон"
+    ' "$SETTINGS" "$GUARDED_SECTIONS") || _sg_die "не удалось собрать эталон"
+
+    {
+        cat <<'HDR'
+<?php
+// Сгенерировано BCM (bcm_settings_guard.sh). Правки будут ЗАТЁРТЫ.
+// Этот файл накладывается ПОВЕРХ .settings.php и держит кластерные
+// настройки, когда ansible bitrix-env возвращает .settings.php к скелету.
+// Эталон: /etc/bitrix-cluster/settings-cluster.php
+
+// Автозагрузка класса подключения BCM (Bcm\DbRouter\Connection — разделение
+// чтений между узлами PXC, см. /local/modules/bcm.dbrouter). Живёт здесь, потому
+// что extra читается ядром ДО создания подключения к БД и не перезаписывается
+// ansible bitrix-env (в отличие от dbconn.php и init.php). Если файлов модуля на
+// ноде нет, имя класса привязывается к штатному MysqliConnection: портал работает
+// без разделения чтений, а не падает на «Class not found».
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Bcm\\DbRouter\\';
+    if (strncmp($class, $prefix, strlen($prefix)) !== 0) {
+        return;
+    }
+    $file = __DIR__ . '/../local/modules/bcm.dbrouter/lib/' . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+    if (is_file($file)) {
+        require_once $file;
+        return;
+    }
+    if ($class === $prefix . 'Connection') {
+        error_log('BCM dbrouter: ' . $file . ' not found, falling back to \\Bitrix\\Main\\DB\\MysqliConnection');
+        class_alias(\Bitrix\Main\DB\MysqliConnection::class, $class);
+    }
+}, true, false);
+
+HDR
+        printf '%s\n' "$body"
+    } > "${REFERENCE}.tmp"
 
     php -l "${REFERENCE}.tmp" >/dev/null 2>&1 || { rm -f "${REFERENCE}.tmp"; _sg_die "собранный эталон не проходит проверку синтаксиса"; }
 

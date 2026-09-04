@@ -155,6 +155,10 @@ PROXYSQL_MONITOR_USER="monitor"
 PROXYSQL_MONITOR_PASS="monitorpass"
 BITRIX_DB_USER="bitrix"
 BITRIX_DB_PASS="bitrixpass"
+# Разделение чтений: SELECT портала на реплики PXC (пользователь ProxySQL
+# <BITRIX_DB_USER>_ro + класс подключения BCM в .settings.php), записи на writer.
+# 1 — включить, иначе все запросы на writer. Переключается и после установки (bcm 4 → 8).
+DB_READ_SPLIT="1"
 WEB_VRID="56"
 # Redis-хранилище сессий (HA: master-replica + плавающий VIP)
 SESSION_VIP=""
@@ -629,6 +633,9 @@ collect_topology_interactive() {
     read -r -s -p "Введите пароль пользователя БД Bitrix: " BITRIX_DB_PASS
     echo
 
+    read -r -p "Разделять чтения (SELECT портала → реплики PXC, записи → writer)? [Y/n]: " _read_split
+    [[ "$_read_split" =~ ^[Nn] ]] && DB_READ_SPLIT="0" || DB_READ_SPLIT="1"
+
     read -r -p "Введите Keepalived VRID для WEB-нод (по умолчанию 56): " WEB_VRID
     WEB_VRID="${WEB_VRID:-56}"
 
@@ -929,6 +936,9 @@ hg_write = 10
 hg_read = 20
 hg_backup_write = 11
 hg_offline = 30
+# Разделение чтений (класс подключения BCM + пользователь-читатель ProxySQL); меню 4 → 8.
+read_split = ${DB_READ_SPLIT}
+reader_user = ${BITRIX_DB_USER}_ro
 
 EOF
 
@@ -1436,6 +1446,8 @@ configure_services() {
         fi
         log_info "  innodb_buffer_pool_size на $name: ${pool_mb}M (RAM: ${node_mem_mb:-?}M)"
         sed -i "s/__INNODB_BUFFER_SIZE__/${pool_mb}M/g" "$local_pxc_cfg"
+        # Причинная согласованность чтений нужна только при разделении чтений.
+        sed -i "s/__WSREP_SYNC_WAIT__/$( [[ "$DB_READ_SPLIT" == "1" ]] && echo 1 || echo 0 )/g" "$local_pxc_cfg"
         render_value "$local_pxc_cfg" "__DB_TIMEZONE__" "$db_tz"
 
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/mysql/conf.d /etc/mysql/mysql.conf.d /var/log/mysql"
@@ -1480,7 +1492,16 @@ configure_services() {
         # (ps), ни в логи нод (используем bcm_ssh_exec без логирования команды).
         # ВАЖНО: mysql_native_password обязателен — PXC 8 по умолчанию caching_sha2,
         # а ProxySQL ходит на backend по native; иначе ProxySQL не подключится к PXC.
-        log_info "Создание пользователей monitor/${BITRIX_DB_USER} на $PXC_WRITER (native auth)..."
+        # Пользователь-читатель разделения чтений: тот же пароль, что у основного,
+        # но только SELECT — через него класс подключения BCM шлёт чистые SELECT на
+        # реплики (ProxySQL default_hostgroup=HG_READ). Ничего, кроме чтения, он не может.
+        local ro_user_sql=""
+        if [[ "$DB_READ_SPLIT" == "1" ]]; then
+            ro_user_sql="CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}_ro'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+ALTER USER '${BITRIX_DB_USER}_ro'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+GRANT SELECT ON *.* TO '${BITRIX_DB_USER}_ro'@'%';"
+        fi
+        log_info "Создание пользователей monitor/${BITRIX_DB_USER}$( [[ "$DB_READ_SPLIT" == "1" ]] && echo "/${BITRIX_DB_USER}_ro" ) на $PXC_WRITER (native auth)..."
         bcm_ssh_exec "$writer_ip" "mysql" <<SQL || log_warn "Не удалось создать пользователей БД (см. состояние кластера)."
 CREATE USER IF NOT EXISTS '${PROXYSQL_MONITOR_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
 ALTER USER '${PROXYSQL_MONITOR_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
@@ -1488,6 +1509,7 @@ GRANT USAGE, REPLICATION CLIENT ON *.* TO '${PROXYSQL_MONITOR_USER}'@'%';
 CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
 ALTER USER '${BITRIX_DB_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
 GRANT ALL PRIVILEGES ON *.* TO '${BITRIX_DB_USER}'@'%';
+${ro_user_sql}
 FLUSH PRIVILEGES;
 SQL
 
@@ -1855,6 +1877,9 @@ EOF
     sed -i "s/__MONITOR_USER__/${PROXYSQL_MONITOR_USER}/g" "$local_proxysql_cfg"
     render_value "$local_proxysql_cfg" "__MONITOR_PASS__" "$PROXYSQL_MONITOR_PASS"
     sed -i "s/__BITRIX_DB_USER__/${BITRIX_DB_USER}/g" "$local_proxysql_cfg"
+    # Пользователь-читатель разделения чтений (default_hostgroup=HG_READ); active=0 → выключен.
+    sed -i "s/__READER_USER__/${BITRIX_DB_USER}_ro/g" "$local_proxysql_cfg"
+    sed -i "s/__READER_ACTIVE__/$( [[ "$DB_READ_SPLIT" == "1" ]] && echo 1 || echo 0 )/g" "$local_proxysql_cfg"
     render_value "$local_proxysql_cfg" "__BITRIX_DB_PASS__" "$BITRIX_DB_PASS"
     # Bitrix ходит через ProxySQL → sql_mode/time_zone сессии задаёт ProxySQL.
     # Время БД = время web (требование Bitrix), sql_mode пустой (требование Bitrix).
@@ -3727,7 +3752,7 @@ is_local_node_part_of_cluster() {
 finalize_web_nodes() {
     log_info "Финальная фиксация состояния web-нод (локальный mysqld выключен, HA-Cron роль)..."
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log_info "[DRY RUN] disable+stop+reset-failed mysqld, restart proxysql, cron_notify.sh assert на web-нодах"
+        log_info "[DRY RUN] disable+stop+reset-failed mysqld, restart proxysql, cron_notify.sh assert, разделение чтений (DB_READ_SPLIT=${DB_READ_SPLIT}) на web-нодах"
         return 0
     fi
     # ── Ре-ассерт подключения БД портала к ProxySQL (ПОСЛЕДНИМ, после оседания ansible).
@@ -3789,6 +3814,24 @@ finalize_web_nodes() {
         # Домен портала → 127.0.0.1: ansible bitrix-env мог перезаписать /etc/hosts
         # уже после configure_portal_hosts, поэтому переприменяем последним шагом.
         bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/bcm_portal_hosts.sh ] && /opt/bcm/bin/lib/bcm_portal_hosts.sh assert 2>/dev/null || true" >/dev/null 2>&1
+        # Разделение чтений: файлы модуля + className/reader в .settings.php. Только при
+        # подтверждённой БД на ProxySQL (иначе нечего маршрутизировать) и ДО снятия
+        # эталона сторожем — эталон обязан содержать уже включённый маршрутизатор.
+        # Пользователь-читатель в PXC и ProxySQL посеян раньше (configure_services).
+        if [[ "$fz_db_ok" == "1" && "$DB_READ_SPLIT" == "1" ]]; then
+            local fz_dr fz_st
+            fz_dr=$(bcm_ssh_exec "$ip" "[ -x /opt/bcm/bin/lib/bcm_dbrouter.sh ] && /opt/bcm/bin/lib/bcm_dbrouter.sh --install-files && /opt/bcm/bin/lib/bcm_dbrouter.sh --settings enable 2>&1" 2>&1) || true
+            if echo "$fz_dr" | grep -q 'className=Bcm'; then
+                fz_st=$(bcm_ssh_exec "$ip" "/opt/bcm/bin/lib/bcm_dbrouter.sh --selftest 2>/dev/null | sed -n 's/^RESULT=//p'" 2>/dev/null | tr -d '[:space:]') || fz_st=""
+                if [[ "$fz_st" == "OK" ]]; then
+                    log_ok "  $name: разделение чтений включено (самопроверка: reader ≠ writer)."
+                else
+                    log_warn "  $name: разделение чтений включено, но самопроверка вернула '${fz_st:-?}' — проверьте: bcm → 4 → 8 → статус."
+                fi
+            else
+                log_warn "  $name: разделение чтений НЕ включено (${fz_dr//$'\n'/ }) — включите позже: bcm → 4 → 8."
+            fi
+        fi
         # Сторож настроек портала. ⚠️ Эталон снимается ЗДЕСЬ, последним шагом:
         # к этому моменту .settings.php уже приведён к кластерному виду (БД на
         # ProxySQL, кэш и сессии на VIP), а ansible bitrix-env отработал. Снимать
