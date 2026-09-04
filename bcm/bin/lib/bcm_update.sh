@@ -242,6 +242,14 @@ bcm_self_update() {
     chown -R root:root "$dest" 2>/dev/null || true
 
     # 7. Раскатать обновлённый пакет на все ноды кластера.
+    # ⚠️⚠️ Список файлов, которые bcm_deploy_to_node копирует на ноды, — явный и живёт в
+    # bcm_ssh.sh. К этому моменту функция загружена из СТАРОЙ версии BCM (процесс
+    # запущен до обновления), поэтому новый lib-файл релиза доезжал бы только до
+    # brain-ноды (ловили вживую при 1.0.8 → 1.0.11: bcm_dbrouter.sh не попал на web02).
+    # Перечитываем библиотеку из уже обновлённого /opt/bcm ДО раскатки.
+    # shellcheck disable=SC1090
+    source "${dest}/bin/lib/bcm_ssh.sh" 2>/dev/null \
+        || bcm_warn "не удалось перечитать ${dest}/bin/lib/bcm_ssh.sh — раскатка по списку прежней версии"
     bcm_load_topology || true
     local -a failed=()
     local node ip layer
