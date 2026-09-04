@@ -527,6 +527,159 @@ _cron_managed_del() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Фоновая шина Messenger ядра: с хитов на master-cron
+#
+# Ядро при run_mode=web (умолчание) на каждом хите обходит все очереди шины и
+# берёт на каждую GET_LOCK — на нагруженном портале это 4/5 запросов к БД.
+# run_mode=cli в .settings.php снимает опрос с хитов; очереди разбирает
+# потребитель local/cron/bcm-messenger.php раз в минуту из класса «только master»
+# (переезжает вместе с web-VRRP). Исполнитель на web — bin/lib/bcm_messenger.sh.
+# ─────────────────────────────────────────────────────────────────────────────
+MESSENGER_LIB="/opt/bcm/bin/lib/bcm_messenger.sh"
+MESSENGER_CRON_MARK="local/cron/bcm-messenger.php"
+# 55 с работы и 5 с паузы между проходами: проход по ~30 очередям стоит ~50 запросов
+# (блокировка + выборка на очередь) — при паузе 1 с потребитель сам давал бы половину
+# прежней нагрузки, при 5 с — около 5 %; задержка фоновых задач до 5 с приемлема.
+MESSENGER_CRON_LINE='* * * * * bitrix flock -n /home/bitrix/.bcm-messenger.lock /usr/bin/php -f /home/bitrix/www/local/cron/bcm-messenger.php 55 5 2>&1 | logger -t bcm-messenger'
+MESSENGER_CRON_COMMENT='# фоновая шина Messenger ядра (очереди main/calendar/bizproc): потребитель вместо опроса на хитах (BCM меню 10 → 10)'
+
+_cron_messenger_status() {
+    bcm_section_header "Фоновая шина Messenger — статус"
+    local node ip out
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        bcm_color "WHITE" "  ── ${node} (${ip}) ──"
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_echo_color "RED_BOLD" "  Узел недоступен"; echo; continue
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 40 "${MESSENGER_LIB} --status" 2>/dev/null) || out=""
+        [[ -z "$out" ]] && bcm_warn "  bcm_messenger.sh не отвечает — BCM на ноде устарел (bcm --update)?" || echo "$out" | sed 's/^/  /'
+        echo
+    done
+    bcm_info "RUN_MODE=web — очереди разбирают хиты; cli — потребитель из master-cron. QUEUE_ROWS не должен расти."
+    bcm_any_key
+}
+
+# Строка cron в классе master: добавить/удалить (идемпотентно).
+_cron_messenger_job() {
+    local action="$1" content
+    content=$(_cron_managed_get master | grep -v '^[[:space:]]*$' || true)
+    if [[ "$action" == "add" ]]; then
+        if echo "$content" | grep -qF "$MESSENGER_CRON_MARK"; then
+            bcm_ok "  Строка cron уже есть в bcm-portal-master."
+            return 0
+        fi
+        content="${content:+$content$'\n'}${MESSENGER_CRON_COMMENT}"$'\n'"${MESSENGER_CRON_LINE}"
+    else
+        echo "$content" | grep -qF "$MESSENGER_CRON_MARK" || { bcm_ok "  Строки cron в bcm-portal-master нет."; return 0; }
+        content=$(echo "$content" | grep -vF "$MESSENGER_CRON_MARK" | grep -vF "$MESSENGER_CRON_COMMENT" || true)
+    fi
+    _cron_managed_push master "$content"
+}
+
+_cron_messenger_enable() {
+    bcm_section_header "Messenger → master-cron"
+    echo "  Шаги:"
+    echo "   1. потребитель local/cron/bcm-messenger.php на каждой web (владелец bitrix);"
+    echo "   2. строка в классе «только master» (каждую минуту, 55 с работы / 5 с пауза, под flock, журнал — syslog bcm-messenger);"
+    echo "   3. .settings.php: messenger run_mode=cli на каждой web (секция под сторожем), reload httpd;"
+    echo "   4. пробный прогон потребителя на master-ноде."
+    echo "  При сбое шага 3 сделанное откатывается (run_mode=web, строка cron снимается)."
+    echo
+    bcm_confirm "Перенести разбор очередей Messenger на master-cron?" || { bcm_info "Отменено."; bcm_any_key; return; }
+    echo
+    local node ip out
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_error "${node}: недоступна — перенос прерван, ничего не изменено."
+            bcm_any_key; return
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 60 "${MESSENGER_LIB} --install-files" 2>&1) || {
+            bcm_error "${node}: потребитель — ${out//$'\n'/ }"; bcm_any_key; return; }
+        echo "$out" | sed "s/^/  ${node}: /"
+    done
+    _cron_messenger_job add || { bcm_error "Строка cron не раскатана на все web — перенос прерван."; bcm_any_key; return; }
+
+    local -a done_nodes=()
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        out=$(bcm_ssh_exec_timeout "$ip" 120 "${MESSENGER_LIB} --settings cli" 2>&1) || {
+            bcm_error "${node}: .settings.php — ${out//$'\n'/ }; откат."
+            local n
+            for n in "${done_nodes[@]}"; do
+                bcm_ssh_exec_timeout "${BCM_NODE_IP[$n]}" 120 "${MESSENGER_LIB} --settings web" >/dev/null 2>&1
+            done
+            _cron_messenger_job remove >/dev/null
+            bcm_any_key; return
+        }
+        echo "$out" | sed "s/^/  ${node}: /"
+        done_nodes+=("$node")
+    done
+
+    local master master_ip
+    master=$(_cron_get_master_node 2>/dev/null || echo "")
+    master_ip="${BCM_NODE_IP[$master]:-}"
+    if [[ -n "$master_ip" ]]; then
+        bcm_info "Пробный прогон потребителя на ${master} (3 с)..."
+        out=$(bcm_ssh_exec_timeout "$master_ip" 60 "${MESSENGER_LIB} --consume-test" 2>&1) || true
+        echo "$out" | sed "s/^/  ${master}: /"
+        if ! echo "$out" | grep -q '^RESULT=OK'; then
+            bcm_warn "Пробный прогон не подтвердил работу потребителя — проверьте вывод; очереди тем временем разбирает cron (journalctl -t bcm-messenger)."
+        fi
+    fi
+    bcm_log_info "Messenger переведён на master-cron (run_mode=cli, bcm-messenger.php)."
+    echo
+    bcm_ok "Готово: хиты очереди не опрашивают, потребитель запускается из bcm-portal-master раз в минуту."
+    bcm_info "Наблюдать: пункт «статус» (QUEUE_ROWS не растёт, CONSUMER_RUNNING=1 на master) и journalctl -t bcm-messenger."
+    bcm_any_key
+}
+
+_cron_messenger_disable() {
+    bcm_section_header "Messenger → обратно на хиты"
+    bcm_confirm "Вернуть разбор очередей на хиты (run_mode=web) и снять строку cron?" || { bcm_info "Отменено."; bcm_any_key; return; }
+    local node ip out
+    for node in "${BCM_NODES_WEB[@]}"; do
+        ip="${BCM_NODE_IP[$node]:-}"
+        [[ -z "$ip" ]] && continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_warn "  ${node}: недоступна — выполните позже: ${MESSENGER_LIB} --settings web"; continue
+        fi
+        out=$(bcm_ssh_exec_timeout "$ip" 120 "${MESSENGER_LIB} --settings web" 2>&1) || true
+        echo "$out" | sed "s/^/  ${node}: /"
+    done
+    _cron_messenger_job remove || bcm_warn "Строка cron снята не на всех web."
+    bcm_log_info "Messenger возвращён на хиты (run_mode=web)."
+    bcm_ok "Очереди снова разбирают хиты. Файл потребителя оставлен (без run_mode=cli он бездействует)."
+    bcm_any_key
+}
+
+_cron_messenger_menu() {
+    while true; do
+        bcm_section_header "Фоновая шина Messenger ядра (очереди main/calendar/bizproc)"
+        local -a items=(
+            "1.  Статус на web-нодах (режим, потребитель, глубина очередей)"
+            "2.  Перенести на master-cron (run_mode=cli + потребитель раз в минуту)"
+            "3.  Вернуть на хиты (run_mode=web, снять строку cron)"
+            "0.  Назад"
+        )
+        bcm_print_menu items
+        local choice
+        bcm_read_choice "Ваш выбор" choice
+        case "$choice" in
+            1) _cron_messenger_status ;;
+            2) _cron_messenger_enable ;;
+            3) _cron_messenger_disable ;;
+            0|"") break ;;
+            *) bcm_warn "Неверный выбор: ${choice}" ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Главное меню модуля
 # ─────────────────────────────────────────────────────────────────────────────
 _cron_menu() {
@@ -545,6 +698,7 @@ _cron_menu() {
             "7.  Задания BCM: список (master-only и локальные)"
             "8.  Задания BCM: добавить"
             "9.  Задания BCM: удалить"
+            "10. Фоновая шина Messenger ядра: на master-cron / на хиты"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -562,6 +716,7 @@ _cron_menu() {
             7) _cron_managed_list          ;;
             8) _cron_managed_add           ;;
             9) _cron_managed_del           ;;
+            10) _cron_messenger_menu       ;;
             0) return 0                    ;;
             "") : ;;
             *) bcm_warn "Неверный выбор: ${choice}" ;;

@@ -51,7 +51,9 @@ UNIT_SERVICE="/etc/systemd/system/bcm-settings-guard.service"
 # входят намеренно: их bitrix-env правит через bx_blockinfile между маркерами,
 # не разрушая остальной файл, а signature_key завязан на security.key
 # push-сервера и должен оставаться под управлением bitrix-env.
-GUARDED_SECTIONS="connections cache session"
+# messenger — режим фоновой шины ядра (run_mode=cli, очереди разбирает master-cron,
+# см. bcm_messenger.sh): без защиты клоббер вернул бы опрос очередей на хиты.
+GUARDED_SECTIONS="connections cache session messenger"
 
 # ──── Файлы nginx, которые тоже сносит ansible ──────────────────────────────
 # ⚠️ Роль web (`sites_synchronize.yml`) синхронизирует /etc/nginx/bx/settings
