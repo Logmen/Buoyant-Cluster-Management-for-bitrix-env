@@ -1431,15 +1431,19 @@ configure_services() {
         sed -i "s/__NODE_IP__/${ip}/g" "$local_pxc_cfg"
         sed -i "s/__CLUSTER_NAME__/bitrix_pxc/g" "$local_pxc_cfg"
         sed -i "s/__GALERA_NODES_LIST__/${galera_nodes}/g" "$local_pxc_cfg"
-        # innodb_buffer_pool_size — авто-подбор от RAM ноды под бюджет памяти Bitrix:
-        # global_buffers + conn_buffers(~2M) * max_connections(500) ≤ ~75% RAM.
-        # → pool = 0.75*RAM − 500*2M − 128M (прочие global). Floor 256M; fallback 1024M.
-        # max_connections=500 задан в pxc.cnf.tmpl — при его изменении поправить и тут.
+        # innodb_buffer_pool_size — авто-подбор от RAM ноды. Замерено на PXC 8.4 (crm-кластер,
+        # 15,5 ГБ RAM): mysqld держит сверх пула ~2,3 ГБ (gcache, соединения, словарь, TLS,
+        # performance_schema), ОС и страничному кэшу нужен ещё ~1 ГБ. Прежние 75 % RAM под пул
+        # давали RSS 13,4 из 15,5 ГБ, swap и алерты «память >90 %» на всех трёх узлах.
+        # → pool = 0.65*RAM − 512M, округлённый ВНИЗ до кратного 1024M: сервер сам округляет
+        # пул ВВЕРХ до instances(8, drop-in) × chunk(128M) = 1 ГБ, и 10524M превращались в 11 ГБ.
+        # Floor 1024M; fallback 1024M. На 15,5 ГБ → 9 ГБ (RSS ~11,4 ГБ, свободно ~27 %).
         local node_mem_mb pool_mb
         node_mem_mb=$(bcm_ssh_exec "$ip" "awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo" 2>/dev/null | tr -d '[:space:]') || true
-        if [[ "$node_mem_mb" =~ ^[0-9]+$ && "$node_mem_mb" -ge 1024 ]]; then
-            pool_mb=$(( node_mem_mb * 75 / 100 - 500 * 2 - 128 ))
-            [[ "$pool_mb" -lt 256 ]] && pool_mb=256
+        if [[ "$node_mem_mb" =~ ^[0-9]+$ && "$node_mem_mb" -ge 2048 ]]; then
+            pool_mb=$(( node_mem_mb * 65 / 100 - 512 ))
+            pool_mb=$(( pool_mb / 1024 * 1024 ))
+            [[ "$pool_mb" -lt 1024 ]] && pool_mb=1024
         else
             pool_mb=1024
             log_warn "  Не удалось определить RAM ноды $name — innodb_buffer_pool_size=1024M (fallback)."
