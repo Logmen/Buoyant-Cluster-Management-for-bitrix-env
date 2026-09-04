@@ -119,7 +119,10 @@ _ms_status() {
     elif grep -qsF "bcm-messenger.php" "$CRON_MASTER_OFF"; then cron_state="present (нода BACKUP)"; fi
     echo "CRON_JOB=${cron_state}"
     echo "HA_CRON_ROLE=$(cat /run/bcm-ha-cron.role 2>/dev/null || echo '?')"
-    echo "CONSUMER_RUNNING=$(pgrep -fc 'local/cron/bcm-messenger.php' 2>/dev/null || echo 0)"
+    # pgrep -c печатает 0 и выходит с кодом 1, когда процессов нет — без «|| echo».
+    local running
+    running=$(pgrep -fc 'local/cron/bcm-messenger.php' 2>/dev/null || true)
+    echo "CONSUMER_RUNNING=${running:-0}"
     local port user pass depth
     port=$(bcm_conf_get proxysql port 2>/dev/null); user=$(bcm_conf_get proxysql bitrix_db_user 2>/dev/null); pass=$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null)
     if [[ -n "$user" && -n "$pass" ]]; then
