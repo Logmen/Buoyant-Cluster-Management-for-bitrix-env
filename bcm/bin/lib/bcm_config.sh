@@ -347,7 +347,8 @@ bcm_conf_sync() {
                 fi
                 # cluster.conf несёт пароли в открытом виде — закрыть права на ноде.
                 if declare -f bcm_ssh_exec >/dev/null; then
-                    bcm_ssh_exec "$ip" "chmod 600 ${BCM_CONF_FILE}" 2>/dev/null || true
+                    # </dev/null — иначе ssh съест ввод оператора (см. bcm_node_reachable).
+                    bcm_ssh_exec "$ip" "chmod 600 ${BCM_CONF_FILE}" </dev/null 2>/dev/null || true
                 else
                     ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=3 \
                         -i "${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}" \

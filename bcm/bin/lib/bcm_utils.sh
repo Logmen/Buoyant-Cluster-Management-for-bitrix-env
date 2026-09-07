@@ -359,7 +359,10 @@ bcm_valid_hostname() {
 bcm_node_reachable() {
     local ip="$1"
     local timeout="${2:-5}"
-    ssh -o ConnectTimeout="$timeout" \
+    # ⚠️ -n обязателен: без него ssh читает stdin вызывающего и СЪЕДАЕТ ввод
+    # оператора. Ловилось в меню (проба идёт между вопросами: ответ на следующий
+    # вопрос уходил в ssh, и меню получало пустую строку).
+    ssh -n -o ConnectTimeout="$timeout" \
         -o StrictHostKeyChecking=accept-new \
         -o BatchMode=yes \
         -i "${BCM_SSH_KEY:-/etc/bitrix-cluster/cluster_id_rsa}" \
