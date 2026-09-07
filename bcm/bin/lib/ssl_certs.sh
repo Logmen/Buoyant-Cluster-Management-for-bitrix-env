@@ -48,6 +48,7 @@ WEB_PEERS="${WEB_PEERS:-}"                # IP web-нод: серт раздаё
                                           # реального серта валидация падает (Socket error [0])
 WEB_CERT="${WEB_CERT:-/etc/nginx/ssl/cert.pem}"   # bitrix-env: cert и key одним pem
 DOMAIN="${DOMAIN:-}"
+PORTAL_DOMAIN="${PORTAL_DOMAIN:-}"          # домен портала: только его серт уходит на web-ноды
 LE_EMAIL="${LE_EMAIL:-}"
 VIP="${VIP:-}"
 CERT_DIR="${CERT_DIR:-/etc/haproxy/certs}"
@@ -247,8 +248,32 @@ issue() {
 # ──── Серт на web-ноды (локальный nginx :443 для self-check'ов Bitrix) ───────
 # bitrix-env держит в /etc/nginx/ssl/cert.pem серт и ключ ОДНИМ файлом — наш pem
 # подходит как есть. Откат при провале nginx -t.
+# Покрывает ли pem имя хоста (CN/SAN, wildcard — один уровень).
+_pem_covers() {
+    local pem="$1" host="$2" n names
+    [[ -n "$host" ]] || return 1
+    names=$( { openssl x509 -in "$pem" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/.*DNS:\([^ ]*\).*/\1/p';
+               openssl x509 -in "$pem" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/.*CN=\([^,]*\).*/\1/p'; } )
+    for n in $names; do
+        [[ "$n" == "$host" ]] && return 0
+        if [[ "$n" == \*.* ]]; then
+            local suffix="${n#\*}"
+            [[ "$host" == *"$suffix" && "${host%"$suffix"}" != *.* && -n "${host%"$suffix"}" ]] && return 0
+        fi
+    done
+    return 1
+}
+
 _deploy_to_webs() {
     local pem="$1" ip
+    # ⚠️ На web-ноды уходит ТОЛЬКО серт домена портала: nginx там держит один cert.pem,
+    # и всё, что на web ходит в https://<портал> (домен смотрит в 127.0.0.1: self-check'и
+    # Битрикса, MCP-коннектор), проверяет имя. Серт дополнительного домена (support.*)
+    # заменил бы его и ломал эти вызовы «hostname does not match» (ловили вживую).
+    if [[ -n "$PORTAL_DOMAIN" ]] && ! _pem_covers "$pem" "$PORTAL_DOMAIN"; then
+        log "серт не покрывает домен портала ${PORTAL_DOMAIN} — на web-ноды не раздаётся (только LB, по SNI)."
+        return 0
+    fi
     for ip in $WEB_PEERS; do
         if ! _reachable "$ip"; then
             log "web ${ip} недоступен — серт для локального :443 не доставлен."

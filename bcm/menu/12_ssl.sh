@@ -37,6 +37,25 @@ SSL_ENV="/etc/bitrix-cluster/ssl-renew.env"
 
 # ──── Параметры из конфига ───────────────────────────────────────────────────
 _ssl_domain()  { bcm_conf_get ssl domain 2>/dev/null || bcm_conf_get network portal_domain 2>/dev/null || echo ""; }
+_ssl_portal_domain() { bcm_conf_get network portal_domain 2>/dev/null || echo ""; }
+
+# Покрывает ли сертификат (fullchain) имя хоста: CN и SAN, wildcard — один уровень.
+# _ssl_pem_covers <fullchain> <host>
+_ssl_pem_covers() {
+    local fc="$1" host="$2" n
+    [[ -n "$host" ]] || return 1
+    local names
+    names=$( { openssl x509 -in "$fc" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/.*DNS:\([^ ]*\).*/\1/p';
+               openssl x509 -in "$fc" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/.*CN=\([^,]*\).*/\1/p'; } )
+    for n in $names; do
+        [[ "$n" == "$host" ]] && return 0
+        if [[ "$n" == \*.* ]]; then
+            local suffix="${n#\*}"
+            [[ "$host" == *"$suffix" && "${host%"$suffix"}" != *.* && -n "${host%"$suffix"}" ]] && return 0
+        fi
+    done
+    return 1
+}
 _ssl_email()   { bcm_conf_get ssl le_email 2>/dev/null || echo ""; }
 _ssl_acme_ca() { bcm_conf_get ssl acme_ca 2>/dev/null || echo "letsencrypt"; }
 
@@ -99,6 +118,7 @@ _ssl_push_env() {
             "LB_PEERS=\"${lb_ips}\"" \
             "WEB_PEERS=\"${web_ips}\"" \
             "DOMAIN=\"${domain}\"" \
+            "PORTAL_DOMAIN=\"$(_ssl_portal_domain)\"" \
             "LE_EMAIL=\"${email}\"" \
             "VIP=\"${vip}\"" \
             "ACME_CA=\"$(_ssl_acme_ca)\"" \
@@ -152,6 +172,8 @@ systemctl daemon-reload && systemctl enable --now bcm-cert-renew.timer" 2>/dev/n
 _ssl_show_status() {
     bcm_section_header "SSL: статус сертификатов на LB-нодах"
     bcm_info "Домен: $(_ssl_domain || true)  |  режим: $(bcm_conf_get ssl mode 2>/dev/null || echo none)  |  force_https: $(bcm_conf_get ssl force_https 2>/dev/null || echo 0)"
+    local extra; extra=$(bcm_conf_get ssl extra_domains 2>/dev/null || echo "")
+    [[ -n "$extra" ]] && bcm_info "Дополнительные домены (только на LB, по SNI): ${extra}"
     echo
     local node ip
     for node in "${BCM_NODES_LB[@]}"; do
@@ -184,6 +206,8 @@ _ssl_show_status() {
 _ssl_install_custom() {
     bcm_section_header "Установка своего сертификата (fullchain + key) на все LB"
     bcm_info "Файлы должны лежать на ЭТОЙ ноде (скопируйте заранее, например в /root/)."
+    bcm_info "Серт домена портала ($(_ssl_portal_domain)) обновит и nginx web-нод (self-check'и Битрикса);"
+    bcm_info "серт ДРУГОГО домена ставится только на LB и отдаётся по SNI — на web-нодах остаётся серт портала."
     echo
 
     local fc key domain
@@ -207,6 +231,17 @@ _ssl_install_custom() {
         || { bcm_error "Сертификат уже истёк."; bcm_any_key; return; }
     bcm_ok "Пара валидна: $(openssl x509 -in "$fc" -noout -enddate 2>/dev/null)"
 
+    # Домен портала vs дополнительный: web-ноды и [ssl] domain/mode трогаем ТОЛЬКО для
+    # серта, покрывающего домен портала. Иначе nginx web-нод получил бы чужой серт, а
+    # всё, что на web ходит в https://<портал> (домен там смотрит в 127.0.0.1: self-check'и,
+    # MCP-коннектор), упёрлось бы в «hostname does not match» (ловили вживую).
+    local portal_domain is_portal=0
+    portal_domain=$(_ssl_portal_domain)
+    if [[ -z "$portal_domain" || "$domain" == "$portal_domain" ]] || _ssl_pem_covers "$fc" "$portal_domain"; then
+        is_portal=1
+    else
+        bcm_info "Домен ${domain} не покрывает домен портала ${portal_domain}: дополнительный серт — только на LB."
+    fi
     bcm_confirm "Раскатать ${domain}.pem на все LB и перечитать HAProxy?" || { bcm_info "Отменено."; bcm_any_key; return; }
 
     local pem
@@ -233,7 +268,10 @@ _ssl_install_custom() {
 
     # И на web-ноды (локальный nginx :443): self-check'и Bitrix ходят на
     # ssl://домен:443 → 127.0.0.1 (hosts-фикс) — без реального серта падают.
-    for node in "${BCM_NODES_WEB[@]}"; do
+    # Только для серта домена портала (см. is_portal выше).
+    local -a web_deploy=()
+    [[ $is_portal -eq 1 ]] && web_deploy=("${BCM_NODES_WEB[@]}")
+    for node in "${web_deploy[@]}"; do
         ip="${BCM_NODE_IP[$node]:-}"
         [[ -z "$ip" ]] && continue
         bcm_node_reachable "$ip" 5 2>/dev/null || { bcm_warn "  ${node}: недоступен — серт не доставлен."; ok_all=0; continue; }
@@ -254,8 +292,16 @@ _ssl_install_custom() {
     rm -f "$pem"
 
     if [[ $ok_all -eq 1 ]]; then
-        bcm_conf_set ssl domain "$domain"
-        bcm_conf_set ssl mode "custom"
+        if [[ $is_portal -eq 1 ]]; then
+            bcm_conf_set ssl domain "$domain"
+            bcm_conf_set ssl mode "custom"
+        else
+            # Список дополнительных доменов (для статуса); домен портала не меняется.
+            local extra; extra=$(bcm_conf_get ssl extra_domains 2>/dev/null || echo "")
+            if [[ ",${extra}," != *",${domain},"* ]]; then
+                bcm_conf_set ssl extra_domains "${extra:+${extra},}${domain}"
+            fi
+        fi
         bcm_conf_sync 2>/dev/null || true
         bcm_ok "Готово. Проверьте: пункт «Проверка HTTPS через VIP»."
     fi
