@@ -168,6 +168,16 @@ _bk_put() {
     fi
 }
 
+# Содержимое объекта/файла (маленького) в stdout.
+_bk_cat() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc cat "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null
+    else
+        cat "$(_nfs_root)/${rel}" 2>/dev/null
+    fi
+}
+
 _bk_exists() {
     local rel="$1"
     if [[ "$BACKUP_TARGET" == "s3" ]]; then
@@ -183,6 +193,21 @@ _bk_size() {
         _mc stat "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | sed -n 's/^Size *: *//p' | head -1
     else
         du -h "$(_nfs_root)/${rel}" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# Объём каталога-префикса (не объекта). ⚠️ mc stat по префиксу пуст — это не
+# объект, размер считает mc du. ⚠️⚠️ ВЫЗЫВАТЬ ТОЛЬКО в backup_files: du обходит
+# ВСЕ объекты префикса (на 300k файлов портала — минуты) и в --status ему не
+# место: статус читает зонд bcm-portal с бюджетом в секунды, и медленный ответ
+# рушит сбор метрик всей ноды. Поэтому размер считается раз в сутки после
+# зеркалирования и кладётся в files/last.size, а --status его просто читает.
+_bk_dir_size() {
+    local rel="$1"
+    if [[ "$BACKUP_TARGET" == "s3" ]]; then
+        _mc du "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | tail -1 | awk '{print $1}'
+    else
+        du -sh "$(_nfs_root)/${rel}" 2>/dev/null | awk '{print $1}'
     fi
 }
 
@@ -353,6 +378,11 @@ backup_files() {
         "bitrix/html_pages/*" "bitrix/tmp/*" "bitrix/backup/*" "*.tmp" ".git/*" \
         && printf 'node=%s date=%s duration=%ss\n' "$SELF_NODE" "$DATE_TAG" "$((SECONDS - t0))" \
             | _bk_put "$marker" 2>>"$LOG_FILE"; then
+        # Кэш объёма копии для --status (портал показывает его в разделе копий):
+        # пересчитывать на каждый статус нельзя — du обходит все объекты.
+        # ⚠️ НЕ в files/: там лежат маркеры дней, а _bk_list берёт последний по
+        # алфавиту — посторонний объект подменил бы собой маркер свежей копии.
+        _bk_dir_size "www" | _bk_put "meta/www_size" 2>>"$LOG_FILE" || true
         log "files: ок за $((SECONDS - t0))с."
     else
         log "files: ОШИБКА mirror/маркера (см. ${LOG_FILE})."
@@ -367,7 +397,9 @@ status() {
     echo "conf|$(_bk_list "conf/${SELF_NODE}/")"
     echo "db|$(_bk_list "db/")"
     echo "files_marker|$(_bk_list "files/")"
-    echo "www_size|$(_bk_size "www")"
+    # Размер копии кода — из кэша, записанного последним backup_files (одно GET),
+    # а не пересчётом: --status зовёт зонд портала раз в минуту.
+    echo "www_size|$(_bk_cat "meta/www_size" | tr -d '[:space:]')"
     return 0
 }
 
