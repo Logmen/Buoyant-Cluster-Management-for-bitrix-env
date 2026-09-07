@@ -39,6 +39,8 @@ if ! bcm_s3_storage_enabled; then
     bcm_info "Между нодами их зеркалит отдельный lsyncd-инстанс (меню 6 → 10) — это"
     bcm_info "репликация, а не бэкап: удаления не расходятся, а файл, принятый за секунды"
     bcm_info "до отказа ноды, доехать не успеет."
+    bcm_info "Зеркало и облако совместимы: в бакет уходит то, что попало под правила,"
+    bcm_info "остальное продолжает зеркалиться (меню 6 → 10, режим on)."
     echo
     bcm_info "Варианты подключения:"
     bcm_info "  • внешний бакет провайдера — можно подключить сейчас, пункт 1;"
@@ -79,6 +81,9 @@ S3U_APIHOST="$(bcm_conf_get s3_upload api_host 2>/dev/null || echo '')"
 # По умолчанию Y (включая старые конфиги без ключа).
 S3U_USE_HTTPS="$(bcm_conf_get s3_upload use_https 2>/dev/null || echo Y)"
 [[ -z "$S3U_USE_HTTPS" ]] && S3U_USE_HTTPS="Y"
+# Стиль адресации бакета, проверенный при подключении (path|vhost). Пусто —
+# конфиг старый: тогда ничего не утверждаем, показываем оба варианта.
+S3U_ADDRESSING="$(bcm_conf_get s3_upload addressing 2>/dev/null || echo '')"
 S3U_DOCROOT="/home/bitrix/www"
 
 # Активная нода (single-active) или первый web
@@ -102,10 +107,19 @@ _cs_print_values() {
     printf "  %s %s\n" "$(bcm_pad 'HTTPS:' 22)"             "$([[ "$S3U_USE_HTTPS" == Y ]] && echo 'Да (MinIO TLS, серт доверен через CA)' || echo 'Нет')"
     printf "  %s %s\n" "$(bcm_pad 'CNAME:' 22)"             "(пусто)"
     echo
-    bcm_warn "«Имя сервера» — БЕЗ http:// и без бакета (модуль сам строит bucket.<API>)."
-    bcm_warn "Модуль clouds работает ТОЛЬКО virtual-host + подпись V4 → Регион обязателен."
+    bcm_warn "«Имя сервера» — БЕЗ http:// и без бакета: имя бакета модуль подставит сам."
+    bcm_warn "Подпись AWS V4 → Регион обязателен и должен совпадать с настройкой хранилища."
+    case "$S3U_ADDRESSING" in
+        path)  bcm_info "Адресация: path-style — модуль ходит на ${S3U_APIHOST}/${S3U_BUCKET}/…" ;;
+        vhost) bcm_info "Адресация: virtual-host — модуль ходит на ${S3U_BUCKET}.${S3U_APIHOST}/…" ;;
+        *)     bcm_info "Адресация зависит от версии модуля: clouds ≥ 26.100 — path-style"
+               bcm_info "(${S3U_APIHOST}/${S3U_BUCKET}/…), более старые — virtual-host"
+               bcm_info "(${S3U_BUCKET}.${S3U_APIHOST}/…, нужен wildcard-DNS и серт под него)." ;;
+    esac
     bcm_warn "Во вкладке «Правила» — хранить ВСЕ файлы (пустой модуль). Иначе Disk-файлы"
     bcm_warn "(.docx/.pdf) осядут локально → генератор документов/просмотр выдаст 404."
+    bcm_warn "А если правила узкие осознанно — держите зеркало /upload (меню 6 → 10, режим on):"
+    bcm_warn "то, что не уехало в бакет, обязано быть на ВСЕХ нодах, иначе round-robin → 404."
     if bcm_s3_storage_external; then
         bcm_info "Хранилище внешнее: имя резолвится публичным DNS провайдера."
     else
@@ -193,13 +207,14 @@ _cs_register() {
 # ──── Меню ───────────────────────────────────────────────────────────────────
 _cs_menu() {
     while true; do
-        bcm_section_header "Облачное хранилище /upload (MinIO S3)"
+        bcm_section_header "Облачное хранилище /upload (S3)"
         bcm_info "Бакет: ${S3U_BUCKET}  Endpoint: ${S3U_ENDPOINT}"
+        bcm_info "Адресация: ${S3U_ADDRESSING:-не задана}  Зеркало /upload: $(bcm_upload_mirror_mode)$(bcm_upload_mirror_wanted && echo ' (работает)' || echo ' (снято)')"
         local items=(
             "1.  Показать значения для админки (надёжно)"
             "2.  Проверить связь web→хранилище"
             "3.  Авто-регистрация бакета (best-effort, нужен портал)"
-            "4.  Полная проверка доступа к бакету (запись/чтение/vhost)"
+            "4.  Полная проверка доступа к бакету (запись/чтение/адресация)"
             "0.  Назад"
         )
         bcm_print_menu items

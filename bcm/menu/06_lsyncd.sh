@@ -92,8 +92,10 @@ _ls_show_status() {
         bcm_echo_color "$svc_color" "$svc_st"
         echo
 
-        # Зеркало /upload — отдельный always-on инстанс, есть только без слоя S3.
-        if ! bcm_s3_storage_enabled; then
+        # Зеркало /upload — отдельный always-on инстанс (пункт 10). Держим его,
+        # пока этого хочет [lsyncd] upload_mirror: без хранилища — всегда, с
+        # хранилищем — если оператор явно оставил (см. bcm_upload_mirror_wanted).
+        if bcm_upload_mirror_wanted; then
             local mir_st
             mir_st=$(bcm_ssh_service_status "$ip" "lsyncd-upload")
             printf "  Зеркало /upload: "
@@ -308,11 +310,11 @@ sync {
 }
 LSYNCD_SYNC
 )
-        # Без слоя S3 /upload зеркалит отдельный always-on инстанс на КАЖДОЙ
-        # web-ноде (пункт 10) — загрузки приходят на любую, а этот конфиг
-        # односторонний. Тогда блок ниже не генерируем: два инстанса толкали бы
-        # одно дерево. Логика синхронна с lsyncd_role.sh (UPLOAD_MIRROR).
-        bcm_s3_storage_enabled || continue
+        # Пока /upload зеркалит отдельный always-on инстанс на КАЖДОЙ web-ноде
+        # (пункт 10) — загрузки приходят на любую, а этот конфиг односторонний, —
+        # блок ниже НЕ генерируем: два инстанса толкали бы одно дерево. Предикат
+        # общий с lsyncd_role.sh и install.sh (bcm_upload_mirror_wanted).
+        bcm_upload_mirror_wanted && continue
         lsyncd_conf+=$(cat <<LSYNCD_SYNC
 
 -- /upload: статика модулей (en/ru-хелп, картинки crm/main, лого sale) — НЕ CFile,
@@ -591,25 +593,37 @@ _ls_roles() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Главное меню модуля
 # ─────────────────────────────────────────────────────────────────────────────
-# ──── Зеркало /upload между web-нодами (только для кластера без S3) ──────────
+# ──── Зеркало /upload между web-нодами ───────────────────────────────────────
 # Основной lsyncd односторонний и живёт лишь на держателе web-VRRP, а загрузки
 # приходят на любую ноду. Отдельный always-on инстанс (lsyncd_upload.sh) на каждой
 # web-ноде раздаёт свой /upload пирам без --delete.
+#
+# ⚠️ Зеркало и облачное /upload НЕ взаимоисключающи. В бакет уходит только то, что
+# попало под FILE_RULES; статика модулей, resize_cache и всё, что осталось на диске
+# (в т.ч. файлы, залитые до подключения хранилища), обязаны быть на ВСЕХ web-нодах,
+# иначе round-robin отдаёт по ним 404. Поэтому режим хранится явно в cluster.conf
+# ([lsyncd] upload_mirror = auto|on|off) и переживает повторный install.sh.
 _ls_upload_mirror() {
     bcm_section_header "Зеркало /upload между web-нодами"
 
-    if bcm_s3_storage_enabled; then
-        bcm_info "В кластере развёрнут слой S3: пользовательские файлы /upload хранятся"
-        bcm_info "в бакете и одинаково доступны всем web-нодам — зеркало не нужно."
-        bcm_info "Статику модулей из /upload раздаёт основной lsyncd с источника."
-        bcm_any_key
-        return
-    fi
+    local mode; mode="$(bcm_upload_mirror_mode)"
+    local wanted="нет"; bcm_upload_mirror_wanted && wanted="да"
+    printf "  %s %s\n" "$(bcm_pad 'Режим ([lsyncd] upload_mirror):' 34)" "$mode"
+    printf "  %s %s\n" "$(bcm_pad 'Зеркало должно работать:' 34)" "$wanted"
+    echo
 
-    bcm_warn "Слоя S3 нет: /upload лежит на дисках web-нод."
-    bcm_info "Зеркало раздаёт файлы, принятые ЛЮБОЙ нодой, на остальные (без --delete),"
-    bcm_info "иначе файл виден только принявшей ноде (404 при round-robin) и теряется"
-    bcm_info "вместе с ней. Удаления не зеркалятся — на пирах остаются сироты."
+    if bcm_s3_storage_enabled; then
+        bcm_info "Облачное хранилище /upload подключено: файлы, попавшие под правила бакета,"
+        bcm_info "лежат в S3 и одинаково доступны всем нодам. Остальное (статика модулей,"
+        bcm_info "старые файлы, всё вне правил) остаётся на дисках — это зеркалит зеркало."
+        bcm_info "Режим on держит зеркало вместе с S3; auto снял бы его."
+    else
+        bcm_warn "Хранилища для /upload нет: файлы лежат на дисках web-нод."
+        bcm_info "Зеркало раздаёт файлы, принятые ЛЮБОЙ нодой, на остальные (без --delete),"
+        bcm_info "иначе файл виден только принявшей ноде (404 при round-robin) и теряется"
+        bcm_info "вместе с ней."
+    fi
+    bcm_info "Удаления не зеркалятся — на пирах остаются сироты (место на диске)."
     echo
 
     local node ip st
@@ -624,26 +638,50 @@ _ls_upload_mirror() {
     done
     echo
 
-    echo "    1. Включить/переприменить зеркало на всех web-нодах"
-    echo "    2. Выключить зеркало на всех web-нодах"
+    echo "    1. Включить/переприменить зеркало на всех web-нодах (режим on)"
+    echo "    2. Выключить зеркало на всех web-нодах (режим off)"
+    echo "    3. Вернуть режим auto (по наличию хранилища)"
     echo "    0. Назад"
     echo
     local ch
     bcm_read_choice "Ваш выбор" ch
     case "$ch" in
-        1) _ls_upload_mirror_apply "--configure" ;;
+        1) _ls_upload_mirror_set on ;;
         2)
-            bcm_warn "После выключения файл, загруженный на одну ноду, остальным виден НЕ будет."
+            bcm_warn "После выключения файл, загруженный на одну ноду, остальным виден НЕ будет"
+            bcm_warn "(кроме тех, что уходят в бакет по правилам хранилища)."
             if bcm_confirm "Выключить зеркало /upload?"; then
-                _ls_upload_mirror_apply "--disable"
+                _ls_upload_mirror_set off
             else
                 bcm_info "Отменено."
                 bcm_any_key
             fi
             ;;
+        3) _ls_upload_mirror_set auto ;;
         0|"") return ;;
         *) bcm_warn "Неверный выбор: ${ch}"; bcm_any_key ;;
     esac
+}
+
+# Записать режим в cluster.conf, разослать по узлам и применить его на web-нодах.
+# ⚠️ Блок /upload в ОСНОВНОМ конфиге lsyncd — зеркальный к этому решению (меню 6 → 3,
+# lsyncd_role.sh): включённое зеркало означает, что основной lsyncd /upload не трогает.
+# Уже запущенный lsyncd конфиг сам не перечитает — отсюда подсказка про пункт 3.
+_ls_upload_mirror_set() {
+    local mode="$1"
+    bcm_conf_set lsyncd upload_mirror "$mode"
+    bcm_conf_sync 2>/dev/null || true
+    bcm_ok "Режим зеркала: ${mode} (записан в cluster.conf и разослан по узлам)."
+
+    if bcm_upload_mirror_wanted; then
+        _ls_upload_mirror_apply "--configure"
+    else
+        _ls_upload_mirror_apply "--disable"
+    fi
+
+    bcm_info "Основной lsyncd подхватит изменение при следующем promote; чтобы применить"
+    bcm_info "сейчас — пункт 3 «Настроить lsyncd» (перегенерирует конфиг на источнике)."
+    bcm_any_key
 }
 
 _ls_upload_mirror_apply() {
@@ -659,7 +697,6 @@ _ls_upload_mirror_apply() {
             bcm_error "  ${node}: не удалось (нет каталога upload, lsyncd или скрипта?)."
         fi
     done
-    bcm_any_key
 }
 
 _ls_menu() {
@@ -677,7 +714,7 @@ _ls_menu() {
             "7.  Показать лог lsyncd"
             "8.  Проверить синхронизацию (счётчик файлов)"
             "9.  Роли источника (авто-failover) / назначить источник"
-            "10. Зеркало /upload между web-нодами (кластер без S3)"
+            "10. Зеркало /upload между web-нодами"
             "0.  Назад"
         )
         bcm_print_menu menu_items

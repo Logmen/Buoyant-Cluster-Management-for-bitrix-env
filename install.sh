@@ -215,6 +215,62 @@ s3_enabled() {
     [[ ${#S3_NODES[@]} -gt 0 ]]
 }
 
+# ──── Чтение уже существующего cluster.conf ──────────────────────────────────
+# Нужно там, где повторный прогон обязан УВИДЕТЬ то, что настроили после установки
+# (внешний бакет, режим зеркала). Секция-aware: одноимённые ключи есть в разных
+# секциях (mode= и в [cluster], и в [ssl]).
+_conf_read_key() {
+    local section="$1" key="$2"
+    [[ -r "$BCM_CONF_FILE" ]] || return 0
+    awk -v sec="[${section}]" -v key="$key" '
+        /^\[/{ inc = ($0 == sec) }
+        inc && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub(/^[^=]*=[[:space:]]*/, ""); gsub(/[[:space:]]/, ""); print; exit
+        }
+    ' "$BCM_CONF_FILE" 2>/dev/null
+}
+
+# Секция целиком (с заголовком и комментариями) — для переноса в новый конфиг.
+_conf_read_section() {
+    local section="$1"
+    [[ -r "$BCM_CONF_FILE" ]] || return 0
+    awk -v sec="[${section}]" '
+        /^\[/{ inc = ($0 == sec); if (inc) { print; next } }
+        inc { print }
+    ' "$BCM_CONF_FILE" 2>/dev/null
+}
+
+# ХРАНИЛИЩЕ для /upload доступно: свой слой S3 либо внешний бакет провайдера
+# ([s3_upload], пишет bcm_s3_external.sh). Своих нод для облачного /upload не нужно.
+s3_storage_enabled() {
+    s3_enabled && return 0
+    [[ -n "$(_conf_read_key s3_upload endpoint)" && -n "$(_conf_read_key s3_upload bucket)" ]]
+}
+
+# ──── Зеркало /upload между web-нодами: auto | on | off ──────────────────────
+# Один предикат на install.sh, меню 6 и lsyncd_role.sh (см. bcm_config.sh::
+# bcm_upload_mirror_wanted). auto — зеркало держим, пока нет хранилища для /upload;
+# on — держим всегда, в том числе вместе с S3 (в бакет уходит только то, что попало
+# под FILE_RULES; статика модулей и старые файлы остаются на дисках и обязаны быть
+# на ВСЕХ нодах); off — не держим. ⚠️ Зеркало включено ⇒ основной lsyncd /upload
+# НЕ синкает: одно дерево не должны толкать два инстанса.
+upload_mirror_mode() {
+    local m; m="$(_conf_read_key lsyncd upload_mirror | tr '[:upper:]' '[:lower:]')"
+    case "$m" in
+        on|yes|y|1)  echo on  ;;
+        off|no|n|0)  echo off ;;
+        *)           echo auto ;;
+    esac
+}
+
+upload_mirror_wanted() {
+    case "$(upload_mirror_mode)" in
+        on)  return 0 ;;
+        off) return 1 ;;
+        *)   ! s3_storage_enabled ;;
+    esac
+}
+
 # Последствия установки без S3 — оператор должен их видеть при каждом прогоне.
 warn_s3_disabled() {
     log_warn "Слой S3 не задан — кластер ставится БЕЗ объектного хранилища."
@@ -224,10 +280,12 @@ warn_s3_disabled() {
     log_warn "    секунды до отказа ноды, доехать до пиров не успевает."
     log_warn "  • Резервное копирование не настраивается: нет целевого хранилища"
     log_warn "    (меню 13 сообщит об этом, таймеры bcm-backup-* не ставятся)."
-    log_warn "  • Меню 11 «Облачное хранилище /upload» будет недоступно."
-    log_info "Варианты: добавить 2+ S3-нод и повторить install.sh (тогда /upload уходит"
-    log_info "в бакет, а зеркало снимается автоматически); бэкапы до этого — внешними"
-    log_info "средствами."
+    log_warn "  • Меню 11 «Облачное хранилище /upload» предложит подключить ВНЕШНИЙ бакет:"
+    log_warn "    для облачного /upload свои S3-ноды не нужны, достаточно доступа к бакету."
+    log_info "Варианты: добавить 2+ S3-нод и повторить install.sh; либо подключить внешний"
+    log_info "бакет провайдера через меню 11. В обоих случаях зеркало /upload по умолчанию"
+    log_info "снимается (режим auto) — чтобы оставить его вместе с S3, меню 6 → 10 (режим on)."
+    log_info "Бэкапы до появления хранилища — внешними средствами."
 }
 
 # ──── Утилиты валидации ──────────────────────────────────────────────────────
@@ -827,6 +885,24 @@ write_conf() {
         log_info "[DRY RUN] Запись конфигурации в $target_conf"
         return
     fi
+    # ⚠️ Конфиг перезаписывается ЦЕЛИКОМ, поэтому всё, что настраивается ПОСЛЕ
+    # установки, обязано быть считано до перезаписи и перенесено в новый файл:
+    #   • [s3_upload] внешнего провайдера (меню 11 → подключить внешнее S3) —
+    #     своего слоя S3 нет, и без переноса кластер «забыл» бы хранилище;
+    #   • [lsyncd] upload_mirror — явное решение оператора по зеркалу /upload.
+    local preserved_s3="" preserved_backup="" mirror_mode
+    mirror_mode="$(upload_mirror_mode)"
+    if [[ "$(_conf_read_key s3_upload provider)" == "external" ]]; then
+        preserved_s3="$(_conf_read_section s3_upload)"
+        log_info "Внешнее S3-хранилище в cluster.conf сохраняется при перезаписи."
+    fi
+    # [backup] после установки настраивают из меню 13 (цель, бакет, retention и
+    # ⚠️ enc_key, которым зашифрованы уже лежащие в хранилище conf-архивы) —
+    # регенерация из файла ответов сделала бы их нерасшифровываемыми.
+    if [[ -n "$(_conf_read_key backup target)" || -n "$(_conf_read_key backup bucket)" ]]; then
+        preserved_backup="$(_conf_read_section backup)"
+        log_info "Настроенная секция [backup] в cluster.conf сохраняется при перезаписи."
+    fi
     mkdir -p "$(dirname "$target_conf")"
     cat > "$target_conf" <<EOF
 # /etc/bitrix-cluster/cluster.conf
@@ -905,6 +981,19 @@ portal_domain = ${PORTAL_DOMAIN}
 mode = normal
 active_node = ${WEB_NODES[0]}
 
+[lsyncd]
+# Зеркало /upload между web-нодами (юнит lsyncd-upload, меню 6 → 10):
+#   auto — держим, пока для /upload нет облачного хранилища (свой слой S3 или
+#          внешний бакет в [s3_upload]);
+#   on   — держим ВСЕГДА, в том числе вместе с облачным /upload: в бакет уходит
+#          лишь то, что попало под FILE_RULES, а статика модулей, resize_cache и
+#          файлы, залитые до подключения хранилища, остаются на дисках и обязаны
+#          быть на ВСЕХ нодах (иначе round-robin отдаёт по ним 404);
+#   off  — не держим.
+# ⚠️ Зеркало включено ⇒ ОСНОВНОЙ lsyncd блок /upload не генерирует: одно дерево
+# не должны толкать два инстанса (lsyncd_role.sh, меню 6 → 3).
+upload_mirror = ${mirror_mode}
+
 [session]
 redis_vip = ${SESSION_VIP}
 redis_port = ${SESSION_REDIS_PORT}
@@ -969,11 +1058,19 @@ vhost_domain = ${S3_VHOST_DOMAIN}
 api_host = ${S3_VHOST_DOMAIN}:${S3_PORT}
 
 EOF
+    elif [[ -n "$preserved_s3" ]]; then
+        # Внешний бакет: своего слоя S3 нет, но хранилище для /upload есть —
+        # секцию переносим как есть (её писал bcm_s3_external.sh после проверок).
+        cat >> "$target_conf" <<EOF
+${preserved_s3}
+
+EOF
     else
         cat >> "$target_conf" <<EOF
 # Слой S3 не развёрнут: секций [s3_upload] и [backup] нет. /upload лежит на дисках
 # web-нод, бэкапы в S3 не настроены. Чтобы включить — добавьте 2+ S3-нод в файл
-# ответов и повторите install.sh.
+# ответов и повторите install.sh либо подключите внешний бакет провайдера
+# (меню 11 → «Подключить внешнее S3-хранилище»).
 
 EOF
     fi
@@ -2817,11 +2914,13 @@ configure_lsyncd_role() {
     web_ips_list="${web_ips_list% }"
     local site_path="/home/bitrix/www"
     local primary="${WEB_NODES[0]}"
-    # Без S3 /upload зеркалится отдельным always-on инстансом на каждой web-ноде
-    # (configure_lsyncd_upload_mirror) — тогда основной конфиг роли блок /upload не
-    # генерирует, иначе дерево толкали бы два инстанса разом.
+    # Пока /upload зеркалится отдельным always-on инстансом на каждой web-ноде
+    # (configure_lsyncd_upload_mirror), основной конфиг роли блок /upload НЕ
+    # генерирует, иначе дерево толкали бы два инстанса разом. Решение — общий
+    # предикат (upload_mirror_wanted), его же перечитывает сам lsyncd_role.sh на
+    # каждом promote: оператор мог переключить зеркало уже после установки.
     local upload_mirror=0
-    s3_enabled || upload_mirror=1
+    upload_mirror_wanted && upload_mirror=1
 
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
@@ -2879,10 +2978,12 @@ ENV
 # Вызывать ПОСЛЕ configure_lsyncd_role (нужен lsyncd-role.env) и deploy_bcm.
 configure_lsyncd_upload_mirror() {
     local name ip
-    if s3_enabled; then
-        # Идемпотентность: если S3 добавили позже, зеркало снимается — контент
-        # пользовательских файлов уходит в бакет, дублировать его по нодам не нужно.
-        log_info "Слой S3 развёрнут — зеркало /upload между web-нодами не требуется."
+    if ! upload_mirror_wanted; then
+        # Идемпотентность: хранилище для /upload появилось позже (свой слой S3 или
+        # внешний бакет) при режиме auto — зеркало снимается, контент уходит в бакет.
+        # Режим off — оператор снял зеркало сам. Чтобы держать зеркало ВМЕСТЕ с S3
+        # (в бакет уходит лишь то, что попало под FILE_RULES) — меню 6 → 10, режим on.
+        log_info "Зеркало /upload не требуется (режим: $(upload_mirror_mode)) — снимаю с web-нод."
         [[ "$DRY_RUN" -eq 1 ]] && return 0
         for name in "${WEB_NODES[@]}"; do
             ip="${WEB_IPS[$name]}"
@@ -2891,7 +2992,7 @@ configure_lsyncd_upload_mirror() {
         return 0
     fi
 
-    log_info "Настройка зеркала /upload между web-нодами (слоя S3 нет)..."
+    log_info "Настройка зеркала /upload между web-нодами (режим: $(upload_mirror_mode))..."
     local ok_count=0
     for name in "${WEB_NODES[@]}"; do
         ip="${WEB_IPS[$name]}"

@@ -153,6 +153,39 @@ bcm_s3_storage_external() {
     bcm_s3_storage_enabled && ! bcm_s3_enabled
 }
 
+# ──── Зеркало /upload между web-нодами ───────────────────────────────────────
+# Режим из [lsyncd] upload_mirror: auto (умолчание) | on | off.
+#   auto — зеркало держим, пока для /upload нет облачного хранилища;
+#   on   — держим ВСЕГДА, в том числе вместе с S3;
+#   off  — не держим.
+bcm_upload_mirror_mode() {
+    local m
+    m="$(bcm_conf_get lsyncd upload_mirror 2>/dev/null || echo '')"
+    m="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$m" in
+        on|yes|y|1)  echo on  ;;
+        off|no|n|0)  echo off ;;
+        *)           echo auto ;;
+    esac
+}
+
+# ⚠️ ЕДИНСТВЕННЫЙ источник правды о зеркале /upload. На него обязаны опираться и
+# сам юнит lsyncd-upload (меню 6 → 10, install.sh), и блок /upload в ОСНОВНОМ
+# конфиге lsyncd (меню 6 → 3, lsyncd_role.sh): одно дерево не должны толкать два
+# инстанса разом. Поэтому «зеркало включено» ⇒ основной lsyncd /upload не трогает.
+#
+# Почему on имеет смысл вместе с S3: в бакет уходит только то, что попало под
+# FILE_RULES (у существующих порталов правила часто узкие — крупные файлы, медиа),
+# а статика модулей, resize_cache и всё, что осталось локально, обязано быть на
+# ВСЕХ web-нодах — иначе round-robin отдаёт 404.
+bcm_upload_mirror_wanted() {
+    case "$(bcm_upload_mirror_mode)" in
+        on)  return 0 ;;
+        off) return 1 ;;
+        *)   ! bcm_s3_storage_enabled ;;
+    esac
+}
+
 # ──── SSH ключ кластера ───────────────────────────────────────────────────────
 bcm_get_ssh_key() {
     bcm_conf_get "ssh" "private_key"

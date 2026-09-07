@@ -8,16 +8,19 @@
 // Выводит строки RESULT=... для разбора в BCM:
 //   NO_KERNEL | NO_CLOUDS_MODULE | ALREADY_EXISTS | OK | ADDED_BUT_TEST_FAILED | ADD_FAILED
 //
-// ⚠️ Контракт модуля проверен вживую (bitrix-env 9, клауд clouds):
+// ⚠️ Контракт модуля проверен вживую (bitrix-env 9, модуль clouds):
 //   SERVICE_ID = 'generic_s3' (S3 compatible storage; НЕ 'amazon_s3' — тот хардкодит
-//   s3.amazonaws.com). SETTINGS = HOST (api_host БЕЗ схемы; модуль строит
-//   bucket.HOST — только virtual-host!), ACCESS_KEY, SECRET_KEY, USE_HTTPS (Y/N).
-//   LOCATION = region (подпись AWS V4 → region обязателен и должен совпасть с MinIO).
+//   s3.amazonaws.com). SETTINGS = HOST (api_host БЕЗ схемы и без бакета — имя бакета
+//   модуль подставляет сам), ACCESS_KEY, SECRET_KEY, USE_HTTPS (Y/N).
+//   LOCATION = region (подпись AWS V4 → region обязателен и должен совпасть с хранилищем).
+// ⚠️ Куда именно уедет бакет в адресе, решает ВЕРСИЯ модуля, а не эти поля:
+//   clouds ≥ 26.100 → path-style (HOST/BUCKET/key), раньше → virtual-host
+//   (BUCKET.HOST/key). Совместимость провайдера проверяет bcm_s3_external.sh.
 // =============================================================================
 function out($s) { fwrite(STDOUT, $s . "\n"); }
 
 $docroot  = getenv('BX_DOCROOT') ?: '/home/bitrix/www';
-$apihost  = getenv('BX_S3_APIHOST');   // virtual-host имя БЕЗ схемы, напр. s3.bitrix.lab:9000
+$apihost  = getenv('BX_S3_APIHOST');   // host[:port] БЕЗ схемы, напр. s3.bitrix.lab:9000
 $bucket   = getenv('BX_S3_BUCKET');
 $region   = getenv('BX_S3_REGION') ?: 'us-east-1';
 $access   = getenv('BX_S3_ACCESS');
@@ -60,7 +63,7 @@ if (class_exists('CCloudStorageBucket')) {
 $arFields = array(
     'ACTIVE'     => 'Y',
     'READ_ONLY'  => 'N',
-    // 'generic_s3' = «S3 compatible storage» (virtual-host + V4). НЕ 'amazon_s3'.
+    // 'generic_s3' = «S3 compatible storage» (подпись V4). НЕ 'amazon_s3'.
     'SERVICE_ID' => 'generic_s3',
     'LOCATION'   => $region,
     'BUCKET'     => $bucket,
@@ -74,8 +77,8 @@ $arFields = array(
     // 404 на .docx/.pdf. Пустой MODULE = match all (проверено вживую). FindBucketForFile
     // вернёт этот бакет для любого модуля → всё уедет в общий S3.
     'FILE_RULES' => array(array('MODULE' => '', 'EXTENSION' => '', 'SIZE' => '')),
-    // Ключи строго по контракту CCloudStorageService_S3: HOST (без схемы; модуль
-    // строит bucket.HOST), ACCESS_KEY, SECRET_KEY, USE_HTTPS.
+    // Ключи строго по контракту CCloudStorageService_S3: HOST (без схемы и без
+    // бакета), ACCESS_KEY, SECRET_KEY, USE_HTTPS.
     'SETTINGS'   => array(
         'HOST'       => $apihost,
         'ACCESS_KEY' => $access,

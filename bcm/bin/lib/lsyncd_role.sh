@@ -51,11 +51,14 @@ LOG_FILE="${LOG_FILE:-/var/log/bcm/lsyncd-role.log}"
 # LSYNCD_MAX_DELETE. Большие легитимные удаления — через контролируемую
 # реконсиляцию в single-режиме, а не «вживую».
 MAX_DELETE="${LSYNCD_MAX_DELETE:-1000}"
-# Кластер без S3: /upload зеркалится отдельным always-on инстансом на КАЖДОЙ
-# web-ноде (lsyncd_upload.sh) — загрузки приходят на любую ноду, а этот
-# односторонний источник→пиры инстанс их не покрывает. Тогда блок /upload отсюда
-# убирается, чтобы дерево не толкали два инстанса разом. Со слоем S3 (=0)
-# остаётся прежнее поведение: раздача статики модулей с источника.
+# 1 — /upload зеркалит отдельный always-on инстанс на КАЖДОЙ web-ноде
+# (lsyncd_upload.sh): загрузки приходят на любую ноду, а этот односторонний
+# источник→пиры инстанс их не покрывает. Тогда блок /upload отсюда убирается,
+# чтобы дерево не толкали два инстанса разом. 0 — прежнее поведение: раздача
+# статики модулей с источника (актуально, когда контент /upload лежит в S3).
+# ⚠️ Значение из env — лишь фолбэк на момент установки: истина живёт в
+# cluster.conf ([lsyncd] upload_mirror), её вычисляет _resolve_upload_mirror ниже,
+# иначе переключение зеркала в меню 6 → 10 не доехало бы до конфига lsyncd.
 UPLOAD_MIRROR="${UPLOAD_MIRROR:-0}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8
@@ -100,15 +103,41 @@ _reachable() {
     timeout 8 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "root@${ip}" "exit 0" 2>/dev/null
 }
 
-# ──── Режим кластера из cluster.conf (секция [cluster] mode=) ─────────────────
-# Секция-aware: в conf есть и [ssl] mode= — простой grep ^mode брал бы не ту.
-_conf_get_cluster_mode() {
-    awk '
-        /^\[/{ inc = ($0 ~ /^\[cluster\]/) }
-        inc && /^[[:space:]]*mode[[:space:]]*=/ {
+# ──── Чтение cluster.conf ────────────────────────────────────────────────────
+# Секция-aware: одноимённые ключи есть в разных секциях (mode= и в [cluster], и в
+# [ssl]) — простой grep ^mode брал бы не ту.
+_conf_get() {
+    local section="$1" key="$2"
+    awk -v sec="[${section}]" -v key="$key" '
+        /^\[/{ inc = ($0 == sec) }
+        inc && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
             sub(/^[^=]*=[[:space:]]*/, ""); gsub(/[[:space:]]/, ""); print; exit
         }
     ' "$CLUSTER_CONF" 2>/dev/null
+}
+
+_conf_get_cluster_mode() {
+    _conf_get cluster mode
+}
+
+# ──── Нужно ли зеркало /upload (см. bcm_config.sh::bcm_upload_mirror_wanted) ──
+# auto (умолчание) — зеркало держим, пока для /upload нет облачного хранилища;
+# on/off — явное решение оператора (меню 6 → 10), переживает повторный install.sh.
+# Зеркало включено ⇒ основной lsyncd /upload НЕ синкает (иначе одно дерево толкали
+# бы два инстанса). Читаем при каждом запуске: promote перегенерирует конфиг.
+_resolve_upload_mirror() {
+    [[ -r "$CLUSTER_CONF" ]] || return 0
+    local m; m="$(_conf_get lsyncd upload_mirror | tr '[:upper:]' '[:lower:]')"
+    case "$m" in
+        on|yes|y|1)  UPLOAD_MIRROR=1; return 0 ;;
+        off|no|n|0)  UPLOAD_MIRROR=0; return 0 ;;
+    esac
+    # auto: хранилище для /upload есть, если в [s3_upload] заданы endpoint и bucket.
+    if [[ -n "$(_conf_get s3_upload endpoint)" && -n "$(_conf_get s3_upload bucket)" ]]; then
+        UPLOAD_MIRROR=0
+    else
+        UPLOAD_MIRROR=1
+    fi
 }
 
 # ──── Деградировано ли локальное дерево портала ──────────────────────────────
@@ -300,6 +329,8 @@ status() {
             | sed -E 's|.*=[[:space:]]*||' | tr -d '[:space:]'
     fi
 }
+
+_resolve_upload_mirror
 
 case "${1:-}" in
     promote) promote ;;

@@ -13,10 +13,15 @@
 # механизмы: меню 11 регистрирует бакет в модуле «Облачные хранилища», а
 # bcm_s3_storage_enabled разблокирует зависящие от хранилища пункты.
 #
-# ⚠️⚠️ Критичное требование к провайдеру — virtual-hosted-style (bucket.<host>).
-# Модуль Bitrix clouds (CCloudStorageService_S3) строит адрес объекта ТОЛЬКО так и
-# path-style не умеет. Провайдер, отдающий бакет исключительно по пути
-# (<host>/bucket), для /upload не подойдёт — проверка это ловит до записи конфига.
+# ⚠️⚠️ Критичное требование к провайдеру — стиль адресации бакета, и он зависит от
+# ВЕРСИИ модуля Bitrix clouds (CCloudStorageService_S3):
+#   • clouds ≥ 26.100 — path-style: и запрос, и ссылка на объект идут на
+#     https://<host>/<bucket>/<key> (бакет уехал в путь, GetFileSRC/SendRequest);
+#   • clouds <  26.100 — virtual-hosted-style: https://<bucket>.<host>/<key>,
+#     path-style такой модуль не умеет вовсе.
+# Проверка определяет, какие стили держит провайдер, читает версию модуля на
+# web-ноде и отклоняет связку до записи конфига, если нужный стиль недоступен.
+# Итог пишется в [s3_upload] addressing (path|vhost) — его показывает меню 11.
 #
 # ⚠️ Ключи в argv не передаём (видны в ps) — mc получает их через stdin.
 # =============================================================================
@@ -46,6 +51,26 @@ _s3ext_ensure_mc() {
         "curl -fsSL -o ${_S3EXT_MC} https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x ${_S3EXT_MC}" </dev/null
     bcm_ssh_exec "$ip" "test -x ${_S3EXT_MC}" </dev/null
 }
+
+# Версия модуля «Облачные хранилища» на web-ноде ('' — портала/модуля нет).
+# Строка version.php: 'VERSION' => '26.100.0' → tr оставляет только цифры и точки.
+_S3EXT_DOCROOT="${_S3EXT_DOCROOT:-/home/bitrix/www}"
+_s3ext_clouds_version() {
+    local ip="$1"
+    bcm_ssh_exec_timeout "$ip" 15 \
+        "grep -m1 \"'VERSION'\" ${_S3EXT_DOCROOT}/bitrix/modules/clouds/install/version.php 2>/dev/null | tr -dc '0-9.'" \
+        </dev/null 2>/dev/null | tr -d '[:space:]'
+}
+
+# Умеет ли эта версия модуля path-style (бакет в пути). Порог — 26.100.0.
+_s3ext_clouds_is_path_style() {
+    local ver="$1"
+    [[ -n "$ver" ]] || return 2                      # версия неизвестна
+    [[ "$(printf '%s\n%s\n' '26.100.0' "$ver" | sort -V | head -1)" == "26.100.0" ]]
+}
+
+# Стиль адресации, выбранный последней проверкой (path|vhost) — пишется в конфиг.
+_S3EXT_ADDRESSING=""
 
 # Полная проверка доступа. Печатает результат по шагам, возвращает 0, только если
 # пройдено всё, без чего интеграция заведомо не заработает.
@@ -98,27 +123,91 @@ ${secret}" | tr -d '[:space:]')
         *)          bcm_error "  объект записан, но не прочитан/не удалён (${rw:-нет ответа})"; fails=$((fails+1)) ;;
     esac
 
-    # 4. ⚠️ virtual-hosted-style — без него модуль clouds работать НЕ будет.
-    # Достаточно, что имя резолвится и хост отвечает любым HTTP-статусом.
+    # 4. Стиль адресации бакета: провайдер обязан уметь ровно тот, который построит
+    # УСТАНОВЛЕННЫЙ модуль clouds (path-style с 26.100, virtual-host до неё).
+    local proto="https"; [[ "$endpoint" == http://* ]] && proto="http"
+    # path-style: подписанный запрос с принудительным lookup=path — «endpoint
+    # ответил» тут недостаточно, провайдер может отвергать бакет в пути.
+    local pth
+    pth=$(bcm_ssh_exec_timeout "$ip" 40 \
+        "${_S3EXT_MC} alias set bcmpath '${endpoint}' --api s3v4 --path on >/dev/null 2>&1 || { echo PATH_SETFAIL; exit 0; }
+         ${_S3EXT_MC} ls 'bcmpath/${bucket}' >/dev/null 2>&1 && echo PATH_OK || echo PATH_FAIL
+         ${_S3EXT_MC} alias rm bcmpath >/dev/null 2>&1 || true" \
+        <<< "${access}
+${secret}" | tr -d '[:space:]')
+    # virtual-hosted-style: достаточно, что имя резолвится и хост отвечает любым HTTP.
     local vh
     vh=$(bcm_ssh_exec_timeout "$ip" 25 \
-        "getent hosts '${bucket}.${host}' >/dev/null 2>&1 && curl -s -o /dev/null -w '%{http_code}' --max-time 15 'https://${bucket}.${host}/' 2>/dev/null || echo 000" </dev/null | tr -d '[:space:]')
-    if [[ "$vh" == "000" || -z "$vh" ]]; then
-        bcm_error "  virtual-hosted-style НЕ работает: ${bucket}.${host} не резолвится или не отвечает"
-        bcm_info  "    модуль Bitrix «Облачные хранилища» умеет ТОЛЬКО такой адрес —"
-        bcm_info  "    с этим провайдером подключить /upload не получится"
-        fails=$((fails+1))
+        "getent hosts '${bucket}.${host}' >/dev/null 2>&1 && curl -s -o /dev/null -w '%{http_code}' --max-time 15 '${proto}://${bucket}.${host}/' 2>/dev/null || echo 000" </dev/null | tr -d '[:space:]')
+
+    local has_path=0 has_vhost=0
+    [[ "$pth" == *PATH_OK* ]] && has_path=1
+    [[ "$vh" != "000" && -n "$vh" ]] && has_vhost=1
+    if [[ $has_path -eq 1 ]]; then
+        bcm_ok "  path-style работает (${apihost}/${bucket})"
+    elif [[ "$pth" == *PATH_SETFAIL* ]]; then
+        # Не путать «провайдер не умеет» с «нечем проверить»: старый mc не знает --path.
+        bcm_warn "  path-style проверить нечем: mc на ноде не принял '--path on' (старый бинарь)"
     else
-        bcm_ok "  virtual-hosted-style работает (${bucket}.${host} → HTTP ${vh})"
+        bcm_warn "  path-style не работает (${apihost}/${bucket})"
     fi
+    [[ $has_vhost -eq 1 ]] \
+        && bcm_ok   "  virtual-hosted-style работает (${bucket}.${host} → HTTP ${vh})" \
+        || bcm_warn "  virtual-hosted-style не работает: ${bucket}.${host} не резолвится или молчит"
+
+    # Какой стиль нужен именно этому порталу — решает версия модуля на ноде.
+    local clouds_ver need_style ver_rc=0
+    clouds_ver="$(_s3ext_clouds_version "$ip")"
+    # rc: 0 — path-style, 1 — virtual-host, 2 — версия неизвестна. Через переменную,
+    # а не $? в elif: так намерение видно и не зависит от порядка проверок.
+    _s3ext_clouds_is_path_style "$clouds_ver" || ver_rc=$?
+    if [[ $ver_rc -eq 0 ]]; then
+        need_style="path"
+        bcm_info "  модуль clouds ${clouds_ver} → адрес объекта строится как path-style"
+    elif [[ $ver_rc -eq 2 ]]; then
+        # Портал ещё не развёрнут: жёстко требовать нечего, хватит любого стиля.
+        need_style="any"
+        bcm_warn "  версия модуля clouds не определена (портал ещё не развёрнут):"
+        bcm_info  "    path-style нужен clouds ≥ 26.100, virtual-host — более старым"
+    else
+        need_style="vhost"
+        bcm_info "  модуль clouds ${clouds_ver} → адрес объекта строится как virtual-host"
+    fi
+
+    _S3EXT_ADDRESSING=""
+    case "$need_style" in
+        path)
+            if [[ $has_path -eq 1 ]]; then _S3EXT_ADDRESSING="path"; else
+                bcm_error "  провайдер не отдаёт бакет по пути, а модуль clouds ${clouds_ver} умеет ТОЛЬКО так"
+                bcm_info  "    с этим провайдером подключить /upload не получится"
+                fails=$((fails+1))
+            fi ;;
+        vhost)
+            if [[ $has_vhost -eq 1 ]]; then _S3EXT_ADDRESSING="vhost"; else
+                bcm_error "  нет virtual-hosted-style, а модуль clouds ${clouds_ver} умеет ТОЛЬКО его"
+                bcm_info  "    нужен wildcard-DNS на ${bucket}.${host} и сертификат под него,"
+                bcm_info  "    иначе обновите портал до clouds ≥ 26.100 (там path-style)"
+                fails=$((fails+1))
+            fi ;;
+        *)
+            if   [[ $has_path  -eq 1 ]]; then _S3EXT_ADDRESSING="path"
+            elif [[ $has_vhost -eq 1 ]]; then _S3EXT_ADDRESSING="vhost"
+            else
+                bcm_error "  провайдер не отдаёт бакет ни по пути, ни по поддомену — подключать нечего"
+                fails=$((fails+1))
+            fi ;;
+    esac
 
     # 5. Анонимное чтение — не блокирующее, но без него картинки в браузере не
     # откроются: clouds отдаёт прямые ссылки и подписанных URL не делает.
+    # URL строим тем же стилем, каким его построит модуль.
+    local anon_url="${proto}://${bucket}.${host}/.bcm-anon"
+    [[ "$_S3EXT_ADDRESSING" == "path" ]] && anon_url="${proto}://${apihost}/${bucket}/.bcm-anon"
     local anon
     anon=$(bcm_ssh_exec_timeout "$ip" 40 \
         "t=/tmp/.bcm-s3anon.\$\$; echo anon > \$t
          ${_S3EXT_MC} cp -q \$t 'bcmext/${bucket}/.bcm-anon' >/dev/null 2>&1
-         c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 'https://${bucket}.${host}/.bcm-anon' 2>/dev/null || echo 000)
+         c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 '${anon_url}' 2>/dev/null || echo 000)
          ${_S3EXT_MC} rm 'bcmext/${bucket}/.bcm-anon' >/dev/null 2>&1; rm -f \$t; echo \$c" </dev/null | tr -d '[:space:]')
     if [[ "$anon" == "200" ]]; then
         bcm_ok "  объекты читаются анонимно — браузер отдаст файлы из облака"
@@ -197,16 +286,21 @@ bcm_s3ext_setup() {
     bcm_conf_set s3_upload use_https    "$use_https"
     bcm_conf_set s3_upload api_host     "$apihost"
     bcm_conf_set s3_upload provider     "external"
+    # Стиль адресации, который прошёл проверку: его показывает меню 11, по нему же
+    # понятно, почему в админке достаточно «Имени сервера» без wildcard-DNS.
+    bcm_conf_set s3_upload addressing   "${_S3EXT_ADDRESSING:-path}"
     bcm_conf_sync 2>/dev/null || true
-    bcm_ok "Параметры записаны и разосланы по узлам."
+    bcm_ok "Параметры записаны и разосланы по узлам (адресация: ${_S3EXT_ADDRESSING:-path})."
 
     echo
     bcm_info "Осталось два шага:"
     bcm_info "  1. Зарегистрировать бакет в портале — этот же раздел, пункт «Авто-регистрация»"
     bcm_info "     (или вручную по значениям из пункта «Показать значения для админки»)."
-    bcm_info "  2. Снять зеркало /upload между web-нодами: меню 6 → 10. Оно нужно было только"
-    bcm_info "     потому, что файлы лежали на дисках нод; с облаком оно лишь тратит место."
-    bcm_warn "Зеркало снимайте ПОСЛЕ регистрации бакета и проверки загрузки файла в портале."
+    bcm_info "  2. Решить, что делать с зеркалом /upload между web-нодами (меню 6 → 10)."
+    bcm_info "     По умолчанию (режим auto) оно снимается: контент уходит в бакет."
+    bcm_warn "     Если в бакет уходит НЕ ВСЁ — узкие FILE_RULES, файлы, залитые до"
+    bcm_warn "     подключения хранилища, статика модулей — зеркало нужно ОСТАВИТЬ"
+    bcm_warn "     (меню 6 → 10, режим on), иначе такие файлы видны лишь одной ноде."
     bcm_any_key
 }
 
@@ -225,6 +319,7 @@ bcm_s3ext_check() {
     [[ -z "$apihost" ]] && apihost="$(printf '%s' "$endpoint" | sed -E 's#^https?://##; s#/.*$##')"
 
     bcm_info "${endpoint} / бакет ${bucket} (регион ${region})"
+    bcm_info "адресация в конфиге: $(bcm_conf_get s3_upload addressing 2>/dev/null || echo '—')"
     echo
     if _s3ext_verify "$ip" "$endpoint" "$region" "$bucket" "$access" "$secret" "$apihost"; then
         echo; bcm_ok "Хранилище доступно и пригодно для /upload."

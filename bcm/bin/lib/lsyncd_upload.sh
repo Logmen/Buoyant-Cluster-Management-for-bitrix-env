@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034,SC1091,SC2155,SC2015,SC2181
 # =============================================================================
-# lsyncd_upload.sh — зеркало /upload между web-нодами для кластера БЕЗ S3.
+# lsyncd_upload.sh — зеркало /upload между web-нодами.
 #
-# Зачем. Пользовательские файлы Bitrix (/upload) при развёрнутом слое S3 живут в
-# MinIO и одинаково доступны всем web-нодам. Без S3 файл физически остаётся на
-# той ноде, которая приняла загрузку: остальные отдают по нему 404 (LB
-# балансирует round-robin), а отказ этой ноды делает файл недоступным, хотя
-# запись b_file лежит в общей БД. Поэтому /upload зеркалится между всеми
-# web-нодами.
+# Зачем. Файл, принятый одной web-нодой, физически остаётся на ней: остальные
+# отдают по нему 404 (LB балансирует round-robin), а отказ этой ноды делает файл
+# недоступным, хотя запись b_file лежит в общей БД. Поэтому /upload зеркалится
+# между всеми web-нодами.
+#
+# Облачное /upload (модуль «Облачные хранилища») зеркало НЕ отменяет: в бакет
+# уходит только то, что попало под FILE_RULES, а статика модулей, resize_cache и
+# файлы, залитые до подключения хранилища, остаются на дисках. Держать зеркало
+# вместе с S3 — штатный режим ([lsyncd] upload_mirror = on).
 #
 # Чем это отличается от основного lsyncd (lsyncd_role.sh). Тот односторонний
 # (источник→пиры), синкает КОД с --delete и работает ТОЛЬКО на держателе
@@ -27,9 +30,12 @@
 # ⚠️ insist=true: пир недоступен на старте — lsyncd продолжает работу и догонит
 # позже (без insist он завершился бы, и зеркала не было бы вовсе).
 #
-# Управляется install.sh (configure_lsyncd_upload_mirror) и меню 6; включается
-# ТОЛЬКО когда слоя S3 нет. Параметры — из /etc/bitrix-cluster/lsyncd-role.env
-# (тот же файл, что у lsyncd_role.sh).
+# Управляется install.sh (configure_lsyncd_upload_mirror) и меню 6 → 10; нужно ли
+# зеркало, решает [lsyncd] upload_mirror в cluster.conf (auto|on|off, единый
+# предикат — bcm_config.sh::bcm_upload_mirror_wanted). Параметры — из
+# /etc/bitrix-cluster/lsyncd-role.env (тот же файл, что у lsyncd_role.sh).
+# ⚠️ Зеркало включено ⇒ ОСНОВНОЙ lsyncd блок /upload не генерирует: одно дерево
+# не должны толкать два инстанса.
 #
 # ВНИМАНИЕ: НЕ ставить `set -e` — операции с пирами best-effort (пир может лежать).
 # =============================================================================
@@ -93,7 +99,7 @@ _gen_upload_conf() {
         cat <<HEAD
 -- ${UPLOAD_CONF}
 -- Сгенерировано BCM lsyncd_upload.sh (нода: ${SELF_NODE})
--- Зеркало пользовательских файлов /upload между web-нодами (кластер без S3).
+-- Зеркало пользовательских файлов /upload между web-нодами.
 -- НЕ редактировать вручную.
 
 settings {
@@ -138,7 +144,7 @@ _gen_upload_unit() {
     bin="$(_lsyncd_bin)"
     cat > "$UPLOAD_UNIT" <<UNIT
 [Unit]
-Description=BCM lsyncd: зеркало /upload между web-нодами (кластер без S3)
+Description=BCM lsyncd: зеркало /upload между web-нодами
 Documentation=man:lsyncd(1)
 After=network-online.target
 Wants=network-online.target
@@ -224,7 +230,7 @@ disable_mirror() {
     systemctl reset-failed "$UPLOAD_SVC" 2>/dev/null || true
     rm -f "$UPLOAD_UNIT" "$UPLOAD_CONF"
     systemctl daemon-reload 2>/dev/null || true
-    log "Зеркало /upload выключено (есть S3 либо отключено вручную)."
+    log "Зеркало /upload выключено ([lsyncd] upload_mirror: off либо auto при наличии S3)."
 }
 
 status() {
