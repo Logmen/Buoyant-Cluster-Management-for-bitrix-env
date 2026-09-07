@@ -93,7 +93,10 @@ log() {
 # спецсимволами (: $ & + / …) ломает парсинг («The security token included in
 # the request is invalid»); percent-encoding НЕ помогает (проверено вживую).
 # argv для ключей тоже нельзя (видны в ps) → mc alias set читает их со stdin.
-_mc() { "$MC_BIN" --quiet "$@"; }
+# ⚠️ MC_QUIET=true, а не только --quiet: флаг НЕ глушит прогресс-метр у `mc pipe`
+# (проверено вживую на mc 2025+) — счётчик байтов уходил в backup.log сотнями
+# килобайт CR-строк на каждую копию БД. Env гасит его, ошибки остаются видны.
+_mc() { MC_QUIET=true "$MC_BIN" --quiet "$@"; }
 
 _mc_setup() {
     _mc ls "${ALIAS}/" >/dev/null 2>&1 && return 0

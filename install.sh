@@ -1090,11 +1090,21 @@ acme_method = http
 
 EOF
 
-    if s3_enabled; then
+    if [[ -n "$preserved_backup" ]]; then
+        cat >> "$target_conf" <<EOF
+${preserved_backup}
+
+EOF
+    elif s3_enabled; then
         cat >> "$target_conf" <<EOF
 [backup]
-# Бэкапы в MinIO кластера (versioning + lifecycle). Креды/endpoint — из [s3_upload].
-# enc_key — шифрование conf-архивов (внутри пароли/ключи); retention применяет MinIO.
+# Куда складываем копии: target = s3 | nfs (пусто = s3, если развёрнут свой слой).
+# Для s3 endpoint/ключи берутся из [s3_upload]; если бакет копий у ДРУГОГО
+# провайдера или ключ скоуплен только на него — задайте здесь endpoint,
+# access_key и secret_key, они перекрывают [s3_upload] (меню 13 их и пишет).
+# enc_key — шифрование conf-архивов (внутри пароли/ключи); НЕ менять: старые
+# архивы станет нечем расшифровать. retention применяет lifecycle бакета.
+target = s3
 bucket = ${BACKUP_BUCKET}
 retention_days = ${BACKUP_RETENTION_DAYS}
 enc_key = ${BACKUP_ENC_KEY}
@@ -3650,23 +3660,50 @@ configure_backup() {
     # хранилище внешнее, и S3 не нужен вовсе. Отказываемся только когда цель — S3,
     # а слоя нет: иначе таймеры ежедневно падали бы на несуществующий endpoint.
     local bk_target="${BACKUP_TARGET:-s3}"
+    # ⚠️ Цель и её параметры могли настроить ПОСЛЕ установки (меню 13 → хранилище
+    # копий). Тогда cluster.conf главнее файла ответов: иначе повторный прогон
+    # молча вернул бы бэкапы на свой слой S3 (или отключил их вовсе).
+    local conf_target; conf_target="$(_conf_read_key backup target)"
+    [[ -n "$conf_target" ]] && bk_target="$conf_target"
+
+    # Параметры хранилища копий: [backup] → [s3_upload] → свой слой из файла ответов.
+    local s3_ep s3_ak s3_sk
+    s3_ep="$(_conf_read_key backup endpoint)";   [[ -z "$s3_ep" ]] && s3_ep="$(_conf_read_key s3_upload endpoint)"
+    s3_ak="$(_conf_read_key backup access_key)"; [[ -z "$s3_ak" ]] && s3_ak="$(_conf_read_key s3_upload access_key)"
+    s3_sk="$(_conf_read_key backup secret_key)"; [[ -z "$s3_sk" ]] && s3_sk="$(_conf_read_key s3_upload secret_key)"
+    if s3_enabled; then
+        # Свой слой: endpoint известен всегда, ключи — из файла ответов.
+        [[ -z "$s3_ep" ]] && s3_ep="https://${VIP}:9000"
+        [[ -z "$s3_ak" ]] && s3_ak="${S3_ACCESS_KEY:-minioadmin}"
+        [[ -z "$s3_sk" ]] && s3_sk="${S3_SECRET_KEY}"
+    fi
+    local bk_bucket bk_ret bk_enc
+    bk_bucket="$(_conf_read_key backup bucket)";         [[ -z "$bk_bucket" ]] && bk_bucket="${BACKUP_BUCKET}"
+    bk_ret="$(_conf_read_key backup retention_days)";    [[ -z "$bk_ret" ]]    && bk_ret="${BACKUP_RETENTION_DAYS}"
+    # ⚠️ enc_key НЕ перегенерируем: сменив его, мы сделали бы прежние conf-архивы
+    # нерасшифровываемыми. Из конфига — приоритетно.
+    bk_enc="$(_conf_read_key backup enc_key)";           [[ -z "$bk_enc" ]]    && bk_enc="${BACKUP_ENC_KEY}"
+
     if [[ "$bk_target" == "nfs" ]]; then
+        # Параметры NFS тоже могли прийти из меню 13.
+        [[ -z "${NFS_SERVER:-}" ]] && NFS_SERVER="$(_conf_read_key backup nfs_server)"
+        [[ -z "${NFS_EXPORT:-}" ]] && NFS_EXPORT="$(_conf_read_key backup nfs_export)"
+        [[ -z "${NFS_MOUNT:-}"  ]] && NFS_MOUNT="$(_conf_read_key backup nfs_mount)"
+        [[ -z "${NFS_SUBDIR:-}" ]] && NFS_SUBDIR="$(_conf_read_key backup nfs_subdir)"
         if [[ -z "${NFS_SERVER:-}" || -z "${NFS_EXPORT:-}" ]]; then
             log_warn "BACKUP_TARGET=nfs, но NFS_SERVER/NFS_EXPORT не заданы — копирование НЕ настроено."
             log_info "Задайте их в файле ответов либо настройте хранилище через меню 13."
             return 0
         fi
-    elif ! s3_enabled; then
-        log_warn "Слой S3 не развёрнут — резервное копирование НЕ настроено."
-        log_info "Укажите BACKUP_TARGET=nfs с параметрами NFS, либо добавьте 2+ S3-нод и повторите install.sh."
+    elif [[ -z "$s3_ep" || -z "$s3_ak" || -z "$s3_sk" ]]; then
+        # Цель s3 без своего слоя допустима — бакет может быть у провайдера, но
+        # тогда endpoint и ключи обязаны лежать в cluster.conf (их пишет меню 13).
+        log_warn "Цель копий — S3, но endpoint/ключи не найдены ни в [backup], ни в [s3_upload]."
+        log_info "Настройте хранилище копий через меню 13 либо укажите BACKUP_TARGET=nfs."
         return 0
     fi
 
-    log_info "Настройка резервного копирования (бакет ${BACKUP_BUCKET}, retention ${BACKUP_RETENTION_DAYS}д)..."
-
-    local s3_ep="https://${VIP}:9000"
-    local s3_ak="${S3_ACCESS_KEY:-minioadmin}"
-    local s3_sk="${S3_SECRET_KEY}"
+    log_info "Настройка резервного копирования (цель ${bk_target}, бакет ${bk_bucket}, retention ${bk_ret}д)..."
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         log_info "[DRY RUN] цель ${bk_target}: подготовка хранилища; env+таймеры на ноды"
@@ -3675,20 +3712,26 @@ configure_backup() {
 
     # 1. Подготовка хранилища. Для NFS её нет: каталог экспортирует внешний сервер,
     # монтирование и проверку делает сам bcm_backup.sh при каждом запуске.
-    if [[ "$bk_target" == "s3" ]]; then
+    # ⚠️ Бакет, versioning и lifecycle заводим только на СВОЁМ MinIO: на бакете
+    # провайдера у нас обычно scoped-ключ без прав на ilm/versioning — там это
+    # делает владелец хранилища (меню 13 при настройке об этом предупреждает).
+    if [[ "$bk_target" == "s3" ]] && ! s3_enabled; then
+        log_info "Бакет копий внешний (${bk_bucket}) — versioning и lifecycle настраивает владелец хранилища."
+    fi
+    if [[ "$bk_target" == "s3" ]] && s3_enabled; then
     # Бакет: versioning + lifecycle (на первой s3-ноде, mc там уже есть)
     local s3_01_name="${S3_NODES[0]}"
     local s3_01_ip="${S3_IPS[$s3_01_name]}"
-    bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc mb --ignore-existing site1/${BACKUP_BUCKET} && \
-        mc version enable site1/${BACKUP_BUCKET}"
+    bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc mb --ignore-existing site1/${bk_bucket} && \
+        mc version enable site1/${bk_bucket}"
     # История версий www/ и срок жизни db/ и conf/ — чистится сам MinIO
-    bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc ilm rule add --noncurrent-expire-days ${BACKUP_RETENTION_DAYS} site1/${BACKUP_BUCKET} 2>/dev/null; \
-        mc ilm rule add --prefix 'db/' --expire-days ${BACKUP_RETENTION_DAYS} site1/${BACKUP_BUCKET} 2>/dev/null; \
-        mc ilm rule add --prefix 'conf/' --expire-days ${BACKUP_RETENTION_DAYS} site1/${BACKUP_BUCKET} 2>/dev/null; true"
+    bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc ilm rule add --noncurrent-expire-days ${bk_ret} site1/${bk_bucket} 2>/dev/null; \
+        mc ilm rule add --prefix 'db/' --expire-days ${bk_ret} site1/${bk_bucket} 2>/dev/null; \
+        mc ilm rule add --prefix 'conf/' --expire-days ${bk_ret} site1/${bk_bucket} 2>/dev/null; true"
     # Versioning на бакете загрузок: site replication — это HA, а НЕ защита от
     # удаления/перезаписи; история версий + lifecycle закрывают эту дыру.
     bcm_ssh_exec_logged "$s3_01_name" "$s3_01_ip" "mc version enable site1/${S3_UPLOAD_BUCKET} && \
-        mc ilm rule add --noncurrent-expire-days ${BACKUP_RETENTION_DAYS} site1/${S3_UPLOAD_BUCKET} 2>/dev/null; true"
+        mc ilm rule add --noncurrent-expire-days ${bk_ret} site1/${S3_UPLOAD_BUCKET} 2>/dev/null; true"
     fi
 
     # 2. Порядок PXC-кандидатов: реплики (по возрастанию IP) раньше writer'а
@@ -3756,9 +3799,9 @@ ROLE='${layer}'
 S3_ENDPOINT='${s3_ep}'
 S3_ACCESS='${s3_ak_esc}'
 S3_SECRET='${s3_sk_esc}'
-BUCKET='${BACKUP_BUCKET}'
-ENC_KEY='${BACKUP_ENC_KEY}'
-RETENTION_DAYS='${BACKUP_RETENTION_DAYS}'
+BUCKET='${bk_bucket}'
+ENC_KEY='${bk_enc}'
+RETENTION_DAYS='${bk_ret}'
 DB_RANK='${db_rank}'
 DB_STAGGER='180'
 SITE_PATH='/home/bitrix/www'

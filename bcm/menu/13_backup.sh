@@ -19,6 +19,7 @@ source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_runtime.sh"
+source "${BCM_LIB_DIR}/bcm_backup_setup.sh"
 
 if ! bcm_conf_exists; then
     bcm_error "cluster.conf не найден. Запустите install.sh."
@@ -81,40 +82,75 @@ _bk_setup_nfs() {
     bcm_conf_set backup retention_days "$ret"
 
     bcm_info "Параметры записаны в cluster.conf."
-    bcm_warn "⚠ Раскатку env, fstab и таймеров на ноды делает install.sh:"
-    bcm_info "  sudo bash install.sh --answers-file <ваш файл>"
-    bcm_info "  (шаг configure_backup увидит target=nfs и настроит все ноды)."
-    bcm_any_key
+    bcm_conf_sync 2>/dev/null || true
+    echo
+    if bcm_confirm "Раскатать на ноды сейчас (nfs-utils, fstab, env, таймеры)?"; then
+        bcm_bk_deploy
+    else
+        bcm_info "Позже — пункт «Раскатать/переприменить бэкап на ноды»."
+        bcm_any_key
+    fi
+}
+
+# ──── Выбор и настройка цели ─────────────────────────────────────────────────
+# ⚠️ После смены цели обновляем переменные меню и сбрасываем алиас mc: иначе
+# статус и восстановление продолжили бы ходить в СТАРЫЙ бакет со старыми ключами.
+_bk_setup_target() {
+    bcm_section_header "Хранилище резервных копий"
+    bcm_info "Текущая цель: ${BK_TARGET:-не настроена}$([[ "$BK_TARGET" == "s3" ]] && echo " (бакет ${BK_BUCKET}, retention ${BK_RETENTION}д)")"
+    echo
+    echo "    1. S3 — бакет объектного хранилища (свой MinIO или провайдер)"
+    echo "    2. NFS — сетевой каталог"
+    echo "    0. Назад"
+    echo
+    local ch
+    bcm_read_choice "Ваш выбор" ch
+    case "$ch" in
+        1) bcm_bk_s3_setup ;;
+        2) _bk_setup_nfs ;;
+        *) return ;;
+    esac
+    BK_TARGET="$(bcm_bk_target)"
+    BK_BUCKET="$(bcm_bk_bucket)"
+    BK_RETENTION="$(bcm_bk_retention)"
+    _BK_MC_READY=0
 }
 
 # Хранилище копий: бакет MinIO кластера ИЛИ сетевой каталог NFS.
 # ⚠️ Раньше меню целиком блокировалось при отсутствии слоя S3. Это неверно для
 # кластеров с внешним хранилищем: цель nfs своего S3 не требует вовсе. Блокируем
 # только когда не настроено НИЧЕГО.
-BK_TARGET="$(bcm_conf_get backup target 2>/dev/null || echo '')"
-[[ -z "$BK_TARGET" ]] && { bcm_s3_enabled && BK_TARGET="s3" || BK_TARGET=""; }
+BK_TARGET="$(bcm_bk_target)"
 
 if [[ -z "$BK_TARGET" ]]; then
     bcm_section_header "Резервное копирование"
     bcm_error "Хранилище копий не настроено."
     bcm_info "Доступны две цели:"
-    bcm_info "  • S3 — бакет MinIO кластера (нужны 2+ S3-нод в файле ответов);"
-    bcm_info "  • NFS — сетевой каталог внешнего хранилища (слой S3 не нужен)."
-    bcm_info "Настроить NFS можно прямо отсюда — пункт «Настроить хранилище копий»."
+    bcm_info "  • S3 — бакет объектного хранилища: свой слой MinIO или бакет провайдера"
+    bcm_info "    (ОТДЕЛЬНЫЙ от бакета /upload — у копий свои retention и versioning);"
+    bcm_info "  • NFS — сетевой каталог внешнего хранилища (S3 не нужен вовсе)."
+    bcm_info "Обе настраиваются прямо отсюда, повторный install.sh не требуется."
     echo
-    if bcm_confirm "Настроить хранилище на NFS сейчас?"; then
-        _bk_setup_nfs
-    else
-        bcm_warn "До настройки копии портала и БД делайте внешними средствами."
-        bcm_any_key
-        exit 0
-    fi
+    echo "    1. Настроить S3 (бакет для копий)"
+    echo "    2. Настроить NFS (сетевой каталог)"
+    echo "    0. Выход"
+    echo
+    bcm_read_choice "Ваш выбор" _bk_first
+    case "${_bk_first:-0}" in
+        1) bcm_bk_s3_setup ;;
+        2) _bk_setup_nfs ;;
+        *) bcm_warn "До настройки копии портала и БД делайте внешними средствами."
+           bcm_any_key; exit 0 ;;
+    esac
+    BK_TARGET="$(bcm_bk_target)"
+    [[ -z "$BK_TARGET" ]] && exit 0
+    bcm_load_topology
 fi
 
 
 BK_LIB="/opt/bcm/bin/lib/bcm_backup.sh"
-BK_BUCKET="$(bcm_conf_get backup bucket 2>/dev/null || echo bitrix-backups)"
-BK_RETENTION="$(bcm_conf_get backup retention_days 2>/dev/null || echo 14)"
+BK_BUCKET="$(bcm_bk_bucket)"
+BK_RETENTION="$(bcm_bk_retention)"
 
 # mc локально (мы на web-ноде; /usr/bin/mc — Midnight Commander, НЕ трогать).
 # Авторизация — алиас в /root/.mc/config.json, ключи со stdin (НЕ MC_HOST: mc
@@ -123,10 +159,12 @@ _BK_MC_READY=0
 _bk_mc() {
     if [[ $_BK_MC_READY -eq 0 ]]; then
         if ! /usr/local/bin/mc --quiet ls bcmbk/ >/dev/null 2>&1; then
+            # ⚠️ Ключи БАКЕТА КОПИЙ: у провайдера ключ обычно скоуплен на один
+            # бакет, и ключ от /upload сюда не пустят (bcm_bk_s3_* учитывают это).
             local ep ak sk
-            ep="$(bcm_conf_get s3_upload endpoint 2>/dev/null || echo '')"
-            ak="$(bcm_conf_get s3_upload access_key 2>/dev/null || echo '')"
-            sk="$(bcm_conf_get s3_upload secret_key 2>/dev/null || echo '')"
+            ep="$(bcm_bk_s3_endpoint)"
+            ak="$(bcm_bk_s3_access)"
+            sk="$(bcm_bk_s3_secret)"
             printf '%s\n%s\n' "$ak" "$sk" \
                 | /usr/local/bin/mc --quiet alias set bcmbk "$ep" >/dev/null 2>&1 || true
         fi
@@ -265,7 +303,7 @@ _bk_offsite_help() {
 # ──── Меню ───────────────────────────────────────────────────────────────────
 _bk_menu() {
     while true; do
-        bcm_section_header "Резервное копирование (S3/MinIO, HA-aware)"
+        bcm_section_header "Резервное копирование (${BK_TARGET}$([[ "$BK_TARGET" == "s3" ]] && echo ": ${BK_BUCKET}"), HA-aware)"
         local menu_items=(
             "1.  Статус бэкапов (все типы, таймеры по нодам)"
             "2.  Бэкап конфигов сейчас (все ноды)"
@@ -274,6 +312,7 @@ _bk_menu() {
             "5.  Восстановление (копии и процедуры)"
             "6.  Offsite-копия (вторая линия)"
             "7.  Настроить хранилище копий (S3 / NFS)"
+            "8.  Раскатать/переприменить бэкап на ноды"
             "0.  Назад"
         )
         bcm_print_menu menu_items
@@ -287,7 +326,8 @@ _bk_menu() {
             4) _bk_run_files ;;
             5) _bk_restore_help ;;
             6) _bk_offsite_help ;;
-            7) _bk_setup_nfs ;;
+            7) _bk_setup_target ;;
+            8) bcm_bk_deploy ;;
             0) return 0 ;;
             *) bcm_warn "Неверный выбор." ;;
         esac
