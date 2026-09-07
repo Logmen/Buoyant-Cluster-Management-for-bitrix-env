@@ -35,11 +35,14 @@ if ($mode === 'status') {
 // очередь на хитах (создание задачи — «Default broker for messenger did not configured»),
 // и потребитель. Поэтому вместе с run_mode всегда пишем брокер default в том же виде,
 // что и умолчание ядра (тип db, таблица MessengerMessageTable).
+// ⚠️ Имя класса таблицы — БЕЗ ведущего обратного слэша: ядро сравнивает строку буквально с
+// MessengerMessageTable::class и с ведущим «\» отвергает её как «не в иерархии».
+const DEFAULT_TABLE = 'Bitrix\\Main\\Messenger\\Internals\\Storage\\Db\\Model\\MessengerMessageTable';
 if (empty($value['brokers']['default'])) {
-    $value['brokers']['default'] = [
-        'type' => 'db',
-        'params' => ['table' => '\\Bitrix\\Main\\Messenger\\Internals\\Storage\\Db\\Model\\MessengerMessageTable'],
-    ];
+    $value['brokers']['default'] = ['type' => 'db', 'params' => ['table' => DEFAULT_TABLE]];
+} elseif (isset($value['brokers']['default']['params']['table'])
+    && ltrim((string)$value['brokers']['default']['params']['table'], '\\') === DEFAULT_TABLE) {
+    $value['brokers']['default']['params']['table'] = DEFAULT_TABLE;
 }
 if ($mode === 'cli') {
     $value['run_mode'] = 'cli';
