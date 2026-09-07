@@ -30,16 +30,23 @@ if ($mode === 'status') {
     exit(0);
 }
 
+// ⚠️ Брокер по умолчанию ядро подставляет ТОЛЬКО когда секции messenger нет совсем
+// (BrokerManager::loadGlobalConfig): секция с одним run_mode роняет и постановку в
+// очередь на хитах (создание задачи — «Default broker for messenger did not configured»),
+// и потребитель. Поэтому вместе с run_mode всегда пишем брокер default в том же виде,
+// что и умолчание ядра (тип db, таблица MessengerMessageTable).
+if (empty($value['brokers']['default'])) {
+    $value['brokers']['default'] = [
+        'type' => 'db',
+        'params' => ['table' => '\\Bitrix\\Main\\Messenger\\Internals\\Storage\\Db\\Model\\MessengerMessageTable'],
+    ];
+}
 if ($mode === 'cli') {
     $value['run_mode'] = 'cli';
     $cfg['messenger'] = ['value' => $value, 'readonly' => true];
 } elseif ($mode === 'web') {
     unset($value['run_mode']);
-    if ($value) {
-        $cfg['messenger'] = ['value' => $value, 'readonly' => true];
-    } else {
-        unset($cfg['messenger']);
-    }
+    $cfg['messenger'] = ['value' => $value, 'readonly' => true];
 } else {
     out('RESULT=BAD_PARAMS'); exit(4);
 }
