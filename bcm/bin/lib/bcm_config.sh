@@ -194,6 +194,36 @@ bcm_mysql_host_pattern() {
     bcm_pxch_host_pattern "${BCM_NODE_IP[@]}"
 }
 
+# ──── Пароль БД портала: что РЕАЛЬНО использует приложение ───────────────────
+# Источник правды — bitrix/.settings.php на web-ноде: именно с ним ходит портал,
+# ProxySQL (mysql_users) и учётки PXC. [proxysql] bitrix_db_password в cluster.conf
+# — копия с момента установки, и она ОТСТАЁТ, если пароль меняли мимо BCM (портал
+# переехал со своим паролем; ловили вживую: selftest dbrouter и проверки из меню
+# давали «Access denied» при рабочем кластере). Поэтому инструменты читают пароль
+# отсюда, а cluster.conf — лишь фолбэк, когда .settings.php недоступен (brain-нода
+# не web, портал ещё не развёрнут).
+BCM_PORTAL_SETTINGS="${BCM_PORTAL_SETTINGS:-/home/bitrix/www/bitrix/.settings.php}"
+
+bcm_portal_settings_db_password() {
+    [[ -r "$BCM_PORTAL_SETTINGS" ]] && command -v php >/dev/null 2>&1 || return 1
+    php -r '$s=include $argv[1]; $d=$s["connections"]["value"]["default"] ?? []; echo (string)($d["password"] ?? "");'         "$BCM_PORTAL_SETTINGS" 2>/dev/null
+}
+
+bcm_portal_db_password() {
+    local p
+    p="$(bcm_portal_settings_db_password 2>/dev/null || true)"
+    [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+    bcm_conf_get proxysql bitrix_db_password 2>/dev/null
+}
+
+# 0 — cluster.conf расходится с .settings.php (оба прочитаны и различны).
+bcm_portal_db_password_mismatch() {
+    local a b
+    a="$(bcm_portal_settings_db_password 2>/dev/null || true)"; [[ -n "$a" ]] || return 1
+    b="$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null || true)"; [[ -n "$b" ]] || return 1
+    [[ "$a" != "$b" ]]
+}
+
 # ──── SSH ключ кластера ───────────────────────────────────────────────────────
 bcm_get_ssh_key() {
     bcm_conf_get "ssh" "private_key"

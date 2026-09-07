@@ -653,7 +653,9 @@ _psql_readsplit_enable() {
 
     local db_user db_pass ro_user hg_read
     db_user=$(bcm_conf_get proxysql bitrix_db_user 2>/dev/null || echo "")
-    db_pass=$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null || echo "")
+    # Живой пароль портала (.settings.php), cluster.conf — фолбэк: bitrix_ro обязан
+    # иметь тот же пароль, что и bitrix, иначе класс подключения BCM не пройдёт.
+    db_pass=$(bcm_portal_db_password 2>/dev/null || echo "")
     hg_read=$(_psql_get_hg_read)
     ro_user=$(bcm_conf_get proxysql reader_user 2>/dev/null || echo "")
     [[ -z "$ro_user" ]] && ro_user="${db_user}_ro"
@@ -876,6 +878,36 @@ _psql_readsplit_menu() {
     done
 }
 
+# ──── 8. Пароль БД: cluster.conf ↔ .settings.php ────────────────────────────
+# [proxysql] bitrix_db_password — копия с момента установки; если пароль меняли
+# мимо BCM (портал переехал со своим), она отстаёт, и всё, что читает cluster.conf
+# (selftest dbrouter, проверки меню, read-split), врёт «Access denied» при рабочем
+# кластере. Источник правды — .settings.php: с ним ходят портал, ProxySQL и PXC.
+_psql_dbpass_check() {
+    bcm_section_header "Пароль БД портала: cluster.conf ↔ bitrix/.settings.php"
+    local live conf
+    live="$(bcm_portal_settings_db_password 2>/dev/null || true)"
+    conf="$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null || true)"
+    if [[ -z "$live" ]]; then
+        bcm_warn "Не прочитать ${BCM_PORTAL_SETTINGS} на этой ноде (не web или портал не развёрнут)."
+        bcm_any_key; return
+    fi
+    printf "  %s %s\n" "$(bcm_pad '.settings.php:' 16)" "$(printf %s "$live" | sha256sum | cut -c1-12)… (${#live} симв.)"
+    printf "  %s %s\n" "$(bcm_pad 'cluster.conf:' 16)"  "$(printf %s "$conf" | sha256sum | cut -c1-12)… (${#conf} симв.)"
+    if [[ "$live" == "$conf" ]]; then
+        bcm_ok "Совпадают."; bcm_any_key; return
+    fi
+    bcm_warn "Расходятся: cluster.conf отстал от того, с чем реально ходит портал."
+    bcm_info "Синхронизация запишет пароль из .settings.php в [proxysql] bitrix_db_password"
+    bcm_info "и разошлёт cluster.conf по узлам. ProxySQL и учётки PXC не трогаются."
+    bcm_confirm "Синхронизировать cluster.conf?" || { bcm_info "Отменено."; bcm_any_key; return; }
+    bcm_conf_set proxysql bitrix_db_password "$live"
+    chmod 600 "$BCM_CONF_FILE" 2>/dev/null || true
+    bcm_conf_sync 2>/dev/null || true
+    bcm_ok "cluster.conf обновлён и разослан."
+    bcm_any_key
+}
+
 _psql_print_menu() {
     local hg_write hg_read proxy_port
     hg_write=$(_psql_get_hg_write)
@@ -890,6 +922,7 @@ _psql_print_menu() {
         "5.  Перезапустить ProxySQL на всех web-нодах"
         "6.  Синхронизировать конфиг между web-нодами"
         "7.  Разделение чтений (SELECT портала → реплики PXC)"
+        "8.  Сверить пароль БД: cluster.conf ↔ bitrix/.settings.php (и синхронизировать)"
         "9.  Свои настройки ProxySQL (${EDITOR:-vi}, SQL к admin)"
         "0.  Назад"
     )
@@ -944,6 +977,7 @@ main() {
             5) _psql_restart_all ;;
             6) _psql_sync_config ;;
             7) _psql_readsplit_menu ;;
+            8) _psql_dbpass_check ;;
             9) bcm_confedit_proxysql ;;
             0) break ;;
             "") : ;;

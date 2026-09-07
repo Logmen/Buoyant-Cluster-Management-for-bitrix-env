@@ -65,7 +65,12 @@ _dr_load_conf() {
     HG_WRITE=$(bcm_conf_get proxysql hg_write 2>/dev/null);         [[ -z "$HG_WRITE" ]] && HG_WRITE="10"
     HG_READ=$(bcm_conf_get proxysql hg_read 2>/dev/null);           [[ -z "$HG_READ" ]] && HG_READ="20"
     DB_USER=$(bcm_conf_get proxysql bitrix_db_user 2>/dev/null)
-    DB_PASS=$(bcm_conf_get proxysql bitrix_db_password 2>/dev/null)
+    # Пароль — тот, с которым реально ходит портал (.settings.php), cluster.conf —
+    # фолбэк: иначе selftest врал «Access denied» при рабочем кластере.
+    DB_PASS=$(bcm_portal_db_password 2>/dev/null)
+    if bcm_portal_db_password_mismatch 2>/dev/null; then
+        echo "WARN: [proxysql] bitrix_db_password в cluster.conf отличается от bitrix/.settings.php — синхронизируйте (меню 4)." >&2
+    fi
     RO_USER=$(bcm_conf_get proxysql reader_user 2>/dev/null);       [[ -z "$RO_USER" ]] && RO_USER="${DB_USER}_ro"
     if [[ -z "$DB_USER" || -z "$ADMIN_PASS" ]]; then
         _dr_err "в ${BCM_CONF_FILE} нет [proxysql] bitrix_db_user/admin_password."

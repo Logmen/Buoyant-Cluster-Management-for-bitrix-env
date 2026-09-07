@@ -353,6 +353,15 @@ sudo bash install.sh --dry-run
 
 ---
 
+## Пароль БД: cluster.conf ↔ `.settings.php`
+
+`[proxysql] bitrix_db_password` в `cluster.conf` — копия с момента установки. Если пароль
+меняли мимо BCM (портал переехал со своим), она отстаёт, и всё, что читало cluster.conf
+(selftest `bcm_dbrouter`, проверки меню, read-split), врало «Access denied» при рабочем
+кластере. Источник правды — `bitrix/.settings.php`: с ним ходят портал, ProxySQL и PXC.
+Инструменты теперь берут пароль оттуда (`bcm_portal_db_password`, cluster.conf — фолбэк),
+а меню **4 → 8** сверяет оба значения и синхронизирует cluster.conf по узлам.
+
 ## Доступ к базе: firewall, хосты учёток, root
 
 `install.sh` открывал на PXC-нодах `service mysql` и порты Galera **без источника**, а
