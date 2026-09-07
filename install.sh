@@ -84,6 +84,9 @@ if [[ -f "${BCM_LIB_DIR}/bcm_utils.sh" ]]; then
     source "${BCM_LIB_DIR}/bcm_utils.sh"
     # shellcheck disable=SC1091
     source "${BCM_LIB_DIR}/bcm_ssh.sh"
+    # Харднинг PXC (firewall по источникам, маска хостов учёток, auth_socket).
+    # shellcheck disable=SC1091
+    [[ -f "${BCM_LIB_DIR}/bcm_pxc_harden.sh" ]] && source "${BCM_LIB_DIR}/bcm_pxc_harden.sh"
 fi
 
 # ──── Аргументы командной строки ─────────────────────────────────────────────
@@ -1361,7 +1364,17 @@ configure_firewall_for_node() {
                 bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --remove-service=http 2>/dev/null; firewall-cmd --permanent --remove-service=https 2>/dev/null; firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null; firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null; ${fw_web_allow}firewall-cmd --permanent --add-port=6032-6033/tcp; firewall-cmd --permanent --add-port=8010-8015/tcp; firewall-cmd --permanent --add-protocol=vrrp; firewall-cmd --reload"
                 ;;
             pxc)
-                bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-service=mysql; firewall-cmd --permanent --add-port=4567/tcp; firewall-cmd --permanent --add-port=4567/udp; firewall-cmd --permanent --add-port=4568/tcp; firewall-cmd --permanent --add-port=4444/tcp; firewall-cmd --reload"
+                # ⚠️⚠️ НЕ service mysql и НЕ порты Galera «всем»: так было, и на кластере с
+                # публичными адресами 3306 и 4567 оказались доступны из интернета
+                # (ловили вживую, сентябрь 2026) — от базы отделял один пароль bitrix@%.
+                # 3306 — только с web-нод (ProxySQL) и PXC-пиров; 4567/4568/4444 —
+                # только с PXC-пиров. Исполнитель снимает и широкие правила прежних
+                # прогонов (идемпотентно, разрешения ставятся до снятия).
+                local pxc_ip_list="" web_ip_list="" n
+                for n in "${PXC_NODES[@]}"; do pxc_ip_list+="${PXC_IPS[$n]} "; done
+                for n in "${WEB_NODES[@]}"; do web_ip_list+="${WEB_IPS[$n]} "; done
+                bcm_pxch_firewall_node "$ip" "$pxc_ip_list" "$web_ip_list" \
+                    || log_warn "  $node_name: firewall PXC настроить не удалось — проверьте firewalld."
                 ;;
             s3)
                 bcm_ssh_exec_logged "$node_name" "$ip" "firewall-cmd --permanent --add-port=9000/tcp; firewall-cmd --permanent --add-port=9001/tcp; firewall-cmd --reload"
@@ -1606,20 +1619,30 @@ configure_services() {
         # Пользователь-читатель разделения чтений: тот же пароль, что у основного,
         # но только SELECT — через него класс подключения BCM шлёт чистые SELECT на
         # реплики (ProxySQL default_hostgroup=HG_READ). Ничего, кроме чтения, он не может.
+        # ⚠️ host учёток — маска подсети кластера («a.b.c.%»), не '%': от «откуда
+        # угодно» с ALL PRIVILEGES отделял бы один пароль. Все ноды в одной /24 —
+        # иначе маска вырождается в '%' с предупреждением (см. bcm_pxc_harden.sh).
+        # Повторный прогон на старом кластере: широкие учётки сперва ПЕРЕНОСИМ
+        # (RENAME USER — пароль/гранты целы), иначе CREATE завёл бы вторую копию.
+        local db_host
+        db_host="$(bcm_pxch_host_pattern "${LB_IPS[@]}" "${WEB_IPS[@]}" "${PXC_IPS[@]}" "${S3_IPS[@]}")"
+        [[ "$db_host" == "%" ]] && log_warn "Ноды кластера в разных подсетях — учётки БД получают host='%'."
+        bcm_pxch_scope_users "$writer_ip" "$db_host" "${PROXYSQL_MONITOR_USER} ${BITRIX_DB_USER} ${BITRIX_DB_USER}_ro" \
+            || log_warn "Перенос учёток на маску ${db_host} прошёл не полностью — см. выше."
         local ro_user_sql=""
         if [[ "$DB_READ_SPLIT" == "1" ]]; then
-            ro_user_sql="CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}_ro'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
-ALTER USER '${BITRIX_DB_USER}_ro'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
-GRANT SELECT ON *.* TO '${BITRIX_DB_USER}_ro'@'%';"
+            ro_user_sql="CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}_ro'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+ALTER USER '${BITRIX_DB_USER}_ro'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+GRANT SELECT ON *.* TO '${BITRIX_DB_USER}_ro'@'${db_host}';"
         fi
-        log_info "Создание пользователей monitor/${BITRIX_DB_USER}$( [[ "$DB_READ_SPLIT" == "1" ]] && echo "/${BITRIX_DB_USER}_ro" ) на $PXC_WRITER (native auth)..."
+        log_info "Создание пользователей monitor/${BITRIX_DB_USER}$( [[ "$DB_READ_SPLIT" == "1" ]] && echo "/${BITRIX_DB_USER}_ro" )@${db_host} на $PXC_WRITER (native auth)..."
         bcm_ssh_exec "$writer_ip" "mysql" <<SQL || log_warn "Не удалось создать пользователей БД (см. состояние кластера)."
-CREATE USER IF NOT EXISTS '${PROXYSQL_MONITOR_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
-ALTER USER '${PROXYSQL_MONITOR_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
-GRANT USAGE, REPLICATION CLIENT ON *.* TO '${PROXYSQL_MONITOR_USER}'@'%';
-CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
-ALTER USER '${BITRIX_DB_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
-GRANT ALL PRIVILEGES ON *.* TO '${BITRIX_DB_USER}'@'%';
+CREATE USER IF NOT EXISTS '${PROXYSQL_MONITOR_USER}'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
+ALTER USER '${PROXYSQL_MONITOR_USER}'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${PROXYSQL_MONITOR_PASS}';
+GRANT USAGE, REPLICATION CLIENT ON *.* TO '${PROXYSQL_MONITOR_USER}'@'${db_host}';
+CREATE USER IF NOT EXISTS '${BITRIX_DB_USER}'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+ALTER USER '${BITRIX_DB_USER}'@'${db_host}' IDENTIFIED WITH mysql_native_password BY '${BITRIX_DB_PASS}';
+GRANT ALL PRIVILEGES ON *.* TO '${BITRIX_DB_USER}'@'${db_host}';
 ${ro_user_sql}
 FLUSH PRIVILEGES;
 SQL
@@ -1663,6 +1686,18 @@ SQL
             fi
         done
         rm -rf "$temp_ssl_dir"
+
+        # root@localhost → auth_socket. ТОЛЬКО когда все ноды уже в кластере: сперва
+        # плагин на каждой (INSTALL PLUGIN не реплицируется), потом ALTER USER на
+        # writer (реплицируется TOI). Пустой пароль root'а — это «любой shell на
+        # ноде = root базы»; auth_socket оставляет доступ root'у ОС и никому больше.
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            local pxc_ip_list="" n
+            for n in "${PXC_NODES[@]}"; do pxc_ip_list+="${PXC_IPS[$n]} "; done
+            log_info "root@localhost → auth_socket на PXC..."
+            bcm_pxch_root_socket "$pxc_ip_list" "$writer_ip" \
+                || log_warn "auth_socket для root не применён — root@localhost остаётся с пустым паролем (меню 3 → 11)."
+        fi
     fi
 
     # 2. HAProxy конфигурация

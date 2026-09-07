@@ -186,6 +186,14 @@ bcm_upload_mirror_wanted() {
     esac
 }
 
+# ──── Хост-маска для учёток MySQL (bitrix, bitrix_ro, monitor) ────────────────
+# Все ноды в одной /24 → «a.b.c.%», иначе '%'. Логика — в bcm_pxc_harden.sh
+# (её же зовёт install.sh со своими массивами IP).
+bcm_mysql_host_pattern() {
+    [[ -f "${BCM_LIB_DIR}/bcm_pxc_harden.sh" ]] && source "${BCM_LIB_DIR}/bcm_pxc_harden.sh"
+    bcm_pxch_host_pattern "${BCM_NODE_IP[@]}"
+}
+
 # ──── SSH ключ кластера ───────────────────────────────────────────────────────
 bcm_get_ssh_key() {
     bcm_conf_get "ssh" "private_key"

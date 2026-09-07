@@ -18,6 +18,7 @@ source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_runtime.sh"
 source "${BCM_LIB_DIR}/bcm_confedit.sh"
+source "${BCM_LIB_DIR}/bcm_pxc_harden.sh"
 
 # ──── Загрузить топологию ─────────────────────────────────────────────────────
 if ! bcm_conf_exists; then
@@ -1104,6 +1105,102 @@ _pxc_import_dump() {
 # =============================================================================
 # Меню модуля
 # =============================================================================
+# Значение для option-файла mysql: в двойных кавычках, \ и " экранированы —
+# иначе парсер option-файла глотает \-последовательности и режет строку по '#'
+# (ловили вживую: пароль monitor со спецсимволами → «Access denied»). Затем —
+# экранирование одинарной кавычки для вставки в удалённую команду.
+_pxc_optval() {
+    local v="$1"
+    v="${v//\\/\\\\}"; v="${v//\"/\\\"}"
+    v="\"${v}\""
+    printf '%s' "${v//\'/\'\\\'\'}"
+}
+
+# ──── 11. Харднинг доступа к БД ──────────────────────────────────────────────
+# Три дыры, найденные вживую: 3306/Galera открыты всему миру (install.sh ставил
+# service mysql без источника), учётки с host='%', root@localhost с пустым
+# паролем. Шаги идемпотентны; исполнители — bcm_pxc_harden.sh.
+_pxc_harden() {
+    bcm_section_header "Харднинг доступа к PXC (firewall, хосты учёток, root)"
+    local pxc_ips="" web_ips="" n ip
+    for n in "${BCM_NODES_PXC[@]}"; do [[ -n "$n" ]] && pxc_ips+="${BCM_NODE_IP[$n]} "; done
+    for n in "${BCM_NODES_WEB[@]}"; do [[ -n "$n" ]] && web_ips+="${BCM_NODE_IP[$n]} "; done
+    local writer writer_ip
+    writer=$(bcm_get_pxc_writer 2>/dev/null || echo "${BCM_NODES_PXC[0]:-}")
+    writer_ip="${BCM_NODE_IP[$writer]:-}"
+    [[ -z "$writer_ip" ]] && { bcm_error "Не найден writer PXC."; bcm_any_key; return; }
+    local pattern; pattern="$(bcm_mysql_host_pattern)"
+
+    bcm_info "Сейчас:"
+    local st_fw st_root anyusers
+    for n in "${BCM_NODES_PXC[@]}"; do
+        [[ -n "$n" ]] || continue
+        ip="${BCM_NODE_IP[$n]}"
+        st_fw="только пиры"; bcm_pxch_firewall_is_open "$ip" && st_fw="ОТКРЫТ ВСЕМ (service mysql / порты Galera без источника)"
+        printf "    %-8s firewall 3306/Galera: %s\n" "$n" "$st_fw"
+    done
+    st_root=$(bcm_ssh_exec "$writer_ip" "mysql -N -e \"SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost'\"" </dev/null 2>/dev/null | tr -d '[:space:]')
+    printf "    root@localhost: %s\n" "${st_root:-?}"
+    anyusers=$(bcm_pxch_any_host_users "$writer_ip")
+    printf "    учётки с host='%%%%': %s\n" "${anyusers:-нет}"
+    printf "    маска подсети кластера: %s\n" "$pattern"
+    echo
+    bcm_info "Шаги (идемпотентны, аддитивны; откат — в шапке bcm_pxc_harden.sh):"
+    bcm_info "  1. firewall PXC-нод: 3306 только с web/pxc, Galera только с pxc, service mysql снять"
+    bcm_info "  2. root@localhost → auth_socket (плагин на всех нодах, затем ALTER USER на writer)"
+    bcm_info "  3. учётки с host='%' → '${pattern}' (RENAME USER: пароль и гранты сохраняются)"
+    bcm_confirm "Применить?" || { bcm_info "Отменено."; bcm_any_key; return; }
+
+    echo; bcm_info "1/3 firewall:"
+    for n in "${BCM_NODES_PXC[@]}"; do
+        [[ -n "$n" ]] && { bcm_pxch_firewall_node "${BCM_NODE_IP[$n]}" "$pxc_ips" "$web_ips" || true; }
+    done
+    echo; bcm_info "2/3 root@localhost → auth_socket:"
+    bcm_pxch_root_socket "$pxc_ips" "$writer_ip" || true
+    echo; bcm_info "3/3 хосты учёток:"
+    bcm_pxch_scope_users "$writer_ip" "$pattern" "${anyusers}" || true
+
+    # Проверка сквозная: НОВОЕ TCP-соединение с каждой web-ноды на каждую PXC —
+    # значит, firewall пропускает, а переименованная учётка принимает.
+    # ⚠️ Учётка приложения для этого не годится: [proxysql] bitrix_db_password в
+    # cluster.conf может отставать от .settings.php (портал переехал со своим
+    # паролем) — ловили вживую ложный «Access denied» при рабочем ProxySQL. Берём
+    # monitor: его пароль ProxySQL читает из того же cluster.conf, он заведомо верный.
+    # ⚠️ Пароль — ТОЛЬКО через временный --defaults-file (0600). Не argv (виден в
+    # ps) и не MYSQL_PWD / --defaults-extra-file: на web-нодах bitrix-env кладёт
+    # /root/.my.cnf с [client] password локального MySQL, и он ПЕРЕКРЫВАЕТ и
+    # переменную окружения, и extra-file → ложный «Access denied» (ловили вживую).
+    # --defaults-file читается ОДИН, ~/.my.cnf игнорируется.
+    local mon_user mon_pass
+    mon_user="$(bcm_conf_get proxysql monitor_user 2>/dev/null || echo monitor)"
+    mon_pass="$(bcm_conf_get proxysql monitor_password 2>/dev/null || echo '')"
+    echo; bcm_info "Проверка: web → PXC:3306 новым соединением как ${mon_user}:"
+    local wip pip res
+    for n in "${BCM_NODES_WEB[@]}"; do
+        [[ -n "$n" ]] || continue; wip="${BCM_NODE_IP[$n]}"
+        for pip in $pxc_ips; do
+            res=$(bcm_ssh_exec "$wip" "t=\$(mktemp); chmod 600 \"\$t\"; printf '[client]\nuser=%s\npassword=%s\n' '${mon_user}' '$(_pxc_optval "$mon_pass")' > \"\$t\"; mysql --defaults-file=\"\$t\" -h${pip} -N -e 'SELECT @@hostname' 2>&1 | tail -1; rm -f \"\$t\"" </dev/null)
+            printf "    %-8s → %-15s %s\n" "$n" "$pip" "${res:-нет ответа}"
+        done
+    done
+    # ProxySQL на web-нодах: пул бэкендов (ConnERR должен быть 0) и последние
+    # подключения монитора (уже после переименования учётки). Тот же приём с
+    # --defaults-file: ~/.my.cnf перекрыл бы пароль админки ProxySQL.
+    echo; bcm_info "ProxySQL: пул бэкендов и коннекты монитора:"
+    local au ap aport out
+    au="$(bcm_conf_get proxysql admin_user 2>/dev/null || echo admin)"
+    ap="$(bcm_conf_get proxysql admin_password 2>/dev/null || echo '')"
+    aport="$(bcm_conf_get proxysql admin_port 2>/dev/null || echo 6032)"
+    for n in "${BCM_NODES_WEB[@]}"; do
+        [[ -n "$n" ]] || continue; wip="${BCM_NODE_IP[$n]}"
+        out=$(bcm_ssh_exec "$wip" "t=\$(mktemp); chmod 600 \"\$t\"; printf '[client]\nuser=%s\npassword=%s\nhost=127.0.0.1\nport=%s\n' '${au}' '$(_pxc_optval "$ap")' '${aport}' > \"\$t\"; \
+            mysql --defaults-file=\"\$t\" -N -e 'SELECT hostgroup, srv_host, status, ConnERR FROM stats_mysql_connection_pool ORDER BY hostgroup, srv_host' 2>/dev/null | awk '{printf \"%s/%s %s err=%s; \", \$1, \$2, \$3, \$4}'; echo; \
+            mysql --defaults-file=\"\$t\" -N -e \"SELECT hostname, IFNULL(connect_error,'ok') FROM monitor.mysql_server_connect_log ORDER BY time_start_us DESC LIMIT 3\" 2>/dev/null | awk '{printf \"монитор %s:%s  \", \$1, \$2}'; rm -f \"\$t\"" </dev/null)
+        printf "    %-8s %s\n" "$n" "${out:-нет данных}"
+    done
+    bcm_any_key
+}
+
 _pxc_print_menu() {
     local -a items=(
         "1.  Статус кластера (wsrep_cluster_status, wsrep_ready, cluster_size)"
@@ -1116,6 +1213,7 @@ _pxc_print_menu() {
         "8.  Остановить базы данных на всех узлах (корректный шатдаун)"
         "9.  Редактировать общие настройки MySQL (drop-in, все PXC)"
         "10. Импорт mysqldump в PXC (на writer, реплицируется Galera)"
+        "11. Харднинг доступа к БД (firewall 3306/Galera, хосты учёток, root → auth_socket)"
         "0.  Назад"
     )
     bcm_print_menu items
@@ -1155,9 +1253,10 @@ main() {
             8) _pxc_stop_cluster  ;;
             9) bcm_confedit_mysql ;;
             10) _pxc_import_dump  ;;
+            11) _pxc_harden       ;;
             0) break              ;;
             "") : ;;
-            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 10." ;;
+            *) bcm_warn "Неверный выбор: '${choice}'. Введите число от 0 до 11." ;;
         esac
     done
 }

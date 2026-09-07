@@ -688,11 +688,14 @@ _psql_readsplit_enable() {
     [[ -z "$writer_ip" ]] && { writer="${pxc_nodes[0]}"; writer_ip=$(bcm_get_node_ip "pxc" "$writer"); }
     local pass_lit
     pass_lit=$(_rs_mysql_lit "$db_pass")
-    bcm_info "PXC: пользователь ${ro_user} на ${writer}..."
+    # host — маска подсети кластера, не '%': 3306 ProxySQL'у нужен только с
+    # web-нод, а «откуда угодно» держится на одном пароле (см. bcm_pxc_harden.sh).
+    local ro_host; ro_host="$(bcm_mysql_host_pattern)"
+    bcm_info "PXC: пользователь ${ro_user}@${ro_host} на ${writer}..."
     if ! bcm_ssh_exec "$writer_ip" "mysql" <<SQL
-CREATE USER IF NOT EXISTS '${ro_user}'@'%' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
-ALTER USER '${ro_user}'@'%' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
-GRANT SELECT ON *.* TO '${ro_user}'@'%';
+CREATE USER IF NOT EXISTS '${ro_user}'@'${ro_host}' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
+ALTER USER '${ro_user}'@'${ro_host}' IDENTIFIED WITH mysql_native_password BY '${pass_lit}';
+GRANT SELECT ON *.* TO '${ro_user}'@'${ro_host}';
 FLUSH PRIVILEGES;
 SQL
     then
@@ -815,7 +818,8 @@ _psql_readsplit_disable() {
         local writer writer_ip
         writer=$(bcm_get_pxc_writer 2>/dev/null || echo "${pxc_nodes[0]}")
         writer_ip=$(bcm_get_node_ip "pxc" "$writer" 2>/dev/null) || writer_ip=$(bcm_get_node_ip "pxc" "${pxc_nodes[0]}")
-        if bcm_ssh_exec "$writer_ip" "mysql -e \"DROP USER IF EXISTS '${ro_user}'@'%'\"" </dev/null >/dev/null 2>&1; then
+        # Снимаем обе формы: широкую (старые установки) и по маске подсети.
+        if bcm_ssh_exec "$writer_ip" "mysql -e \"DROP USER IF EXISTS '${ro_user}'@'%', '${ro_user}'@'$(bcm_mysql_host_pattern)'\"" </dev/null >/dev/null 2>&1; then
             bcm_ok "  ${writer}: пользователь ${ro_user} удалён из PXC."
         else
             bcm_warn "  ${writer}: не удалось удалить ${ro_user} из PXC (сделайте вручную)."
