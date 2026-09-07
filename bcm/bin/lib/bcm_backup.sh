@@ -211,13 +211,26 @@ _bk_dir_size() {
     fi
 }
 
+# Последняя запись под префиксом. ⚠️ Второй аргумент 'r' — рекурсивно, и он
+# ОБЯЗАТЕЛЕН там, где под префиксом лежат каталоги (db/<дата>/): нерекурсивный
+# листинг вернул бы саму «папку», а её время mc подставляет ТЕКУЩЕЕ — портал
+# показывал бы свежую копию БД всегда, даже если её не делали неделю.
 _bk_list() {
-    local rel="$1"
+    local rel="$1" mode="${2:-}"
     if [[ "$BACKUP_TARGET" == "s3" ]]; then
-        _mc ls "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | tail -1 | tr -s ' '
+        if [[ "$mode" == "r" ]]; then
+            _mc ls --recursive "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | tail -1 | tr -s ' '
+        else
+            _mc ls "${ALIAS}/${BUCKET}/${rel}" 2>/dev/null | tail -1 | tr -s ' '
+        fi
     else
         local d; d="$(_nfs_root)/${rel}"
-        [[ -d "$d" ]] && ls -1t "$d" 2>/dev/null | head -1
+        [[ -d "$d" ]] || return 0
+        if [[ "$mode" == "r" ]]; then
+            find "$d" -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' 2>/dev/null | sort -r | head -1
+        else
+            ls -1t "$d" 2>/dev/null | head -1
+        fi
     fi
 }
 
@@ -395,7 +408,7 @@ status() {
     _require_tools || return 1
     echo "target|${BACKUP_TARGET}$([[ "$BACKUP_TARGET" == nfs ]] && echo " ($(_nfs_root))")"
     echo "conf|$(_bk_list "conf/${SELF_NODE}/")"
-    echo "db|$(_bk_list "db/")"
+    echo "db|$(_bk_list "db/" r)"
     echo "files_marker|$(_bk_list "files/")"
     # Размер копии кода — из кэша, записанного последним backup_files (одно GET),
     # а не пересчётом: --status зовёт зонд портала раз в минуту.
