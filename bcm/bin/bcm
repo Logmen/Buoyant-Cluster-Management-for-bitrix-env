@@ -30,6 +30,8 @@ source "${BCM_LIB_DIR}/bcm_runtime.sh"
 source "${BCM_LIB_DIR}/bcm_cluster_mode.sh"
 # shellcheck source=bin/lib/bcm_update.sh
 source "${BCM_LIB_DIR}/bcm_update.sh"
+# shellcheck source=bin/lib/bcm_modules.sh
+source "${BCM_LIB_DIR}/bcm_modules.sh"
 
 # ──── Параметры командной строки ─────────────────────────────────────────────
 BCM_STATUS_ONLY=0
@@ -220,7 +222,10 @@ _show_full_menu() {
     # применять — помечаем прямо в списке, сами меню объясняют подробности.
     local s3_note=""
     bcm_s3_storage_enabled || s3_note=" — нет S3-хранилища"
-    local menu_items=(
+    local mod_note="" mod_on
+    mod_on="$(bcm_mod_list_enabled 2>/dev/null | grep -c . || true)"
+    [[ "${mod_on:-0}" -gt 0 ]] && mod_note=" — включено: ${mod_on}"
+    local -a menu_items=(
         "1.  Управление узлами кластера"
         "2.  Настройка локального хоста"
         "3.  Кластер БД (Percona XtraDB Cluster)"
@@ -236,8 +241,15 @@ _show_full_menu() {
         "13. Резервное копирование (S3, HA-aware)${s3_note}"
         "14. Генератор документов (Transformer) — нужен портал+Enterprise"
         "15. Почта (HA Postfix smarthost-релей)"
-        "0.  Выход"
+        "16. Модули (расширения BCM)${mod_note}"
     )
+    # Пункты включённых модулей — после встроенных, нумерация с 20 (запас оставлен,
+    # чтобы новый раздел ядра не сдвигал номера, к которым привыкли операторы).
+    local num name title
+    while IFS='|' read -r num name title; do
+        [[ -n "$num" ]] && menu_items+=("${num}. ${title}")
+    done < <(bcm_mod_menu_entries 2>/dev/null)
+    menu_items+=("0.  Выход")
     bcm_print_menu menu_items
 }
 
@@ -298,9 +310,17 @@ _handle_full_menu_choice() {
         13) bash "${BCM_MENU_DIR}/13_backup.sh" ;;
         14) bash "${BCM_MENU_DIR}/14_transformer.sh" ;;
         15) bash "${BCM_MENU_DIR}/15_mail.sh" ;;
+        16) bash "${BCM_MENU_DIR}/16_modules.sh" ;;
         0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
         "") : ;;  # пустой ввод — просто обновить экран
-        *) bcm_warn "Неверный выбор: ${choice}. Введите число от 0 до 15." ;;
+        # Номера от 20 принадлежат модулям: их выдаёт bcm_mod_menu_entries, он же
+        # знает, какому модулю какой номер достался в этом запуске.
+        *)  if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge ${BCM_MODULES_MENU_BASE} ]] \
+                && bcm_mod_menu_run "$choice"; then
+                :
+            else
+                bcm_warn "Неверный выбор: ${choice}."
+            fi ;;
     esac
 }
 

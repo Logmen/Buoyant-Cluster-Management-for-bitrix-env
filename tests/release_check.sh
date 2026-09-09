@@ -269,6 +269,49 @@ done < <(awk '
 [[ $loop_fail -eq 0 ]] && pass "циклов while-read с ssh в теле нет"
 
 # ──────────────────────────────────────────────────────────────────────────
+section "14. Модули в составе релиза"
+# Модуль приезжает к оператору как есть и ставится одной командой — битый манифест
+# или неисполняемый хук обнаружились бы уже на кластере. Проверяем статикой:
+# обязательные поля, совпадение NAME с именем каталога, объявленные слои, наличие
+# заявленного меню и исполнимость хуков.
+mod_fail=0
+if compgen -G 'bcm/modules/*/module.conf' >/dev/null; then
+    for mconf in bcm/modules/*/module.conf; do
+        mdir="$(dirname "$mconf")"; mbase="$(basename "$mdir")"
+        # Читаем в подоболочке: module.conf — обычный KEY=VALUE, но source в наш
+        # процесс затёр бы переменные проверок.
+        eval "$(
+            set +u
+            NAME=""; TITLE=""; VERSION=""; ROLES=""; MENU_TITLE=""; MENU_SCRIPT=""
+            # shellcheck disable=SC1090
+            source "$mconf" 2>/dev/null
+            printf 'M_NAME=%q\nM_TITLE=%q\nM_VERSION=%q\nM_ROLES=%q\nM_MENU_TITLE=%q\nM_MENU_SCRIPT=%q\n' \
+                "$NAME" "$TITLE" "$VERSION" "$ROLES" "$MENU_TITLE" "${MENU_SCRIPT:-menu.sh}"
+        )"
+        for req in M_NAME M_TITLE M_VERSION; do
+            [[ -n "${!req}" ]] || { fail "модуль ${mbase}: в module.conf нет ${req#M_}"; mod_fail=1; }
+        done
+        [[ "$M_NAME" == "$mbase" ]] || { fail "модуль ${mbase}: NAME='${M_NAME}' не совпадает с именем каталога"; mod_fail=1; }
+        for r in $M_ROLES; do
+            case "$r" in
+                web|lb|pxc|s3) : ;;
+                *) fail "модуль ${mbase}: неизвестный слой в ROLES: ${r}"; mod_fail=1 ;;
+            esac
+        done
+        if [[ -n "$M_MENU_TITLE" && ! -f "${mdir}/${M_MENU_SCRIPT}" ]]; then
+            fail "модуль ${mbase}: объявлен MENU_TITLE, но нет ${M_MENU_SCRIPT}"; mod_fail=1
+        fi
+        for h in "${mdir}"/hooks/*; do
+            [[ -e "$h" ]] || continue
+            [[ -x "$h" ]] || { fail "модуль ${mbase}: хук $(basename "$h") не исполняемый"; mod_fail=1; }
+        done
+    done
+    [[ $mod_fail -eq 0 ]] && pass "манифесты модулей корректны"
+else
+    pass "модулей в составе релиза нет — проверять нечего"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
 echo
 if [[ $FAILED -eq 0 ]]; then
     printf '\033[32m✓ Все предрелизные проверки пройдены.\033[0m\n'

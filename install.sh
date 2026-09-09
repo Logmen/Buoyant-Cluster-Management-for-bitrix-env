@@ -87,6 +87,9 @@ if [[ -f "${BCM_LIB_DIR}/bcm_utils.sh" ]]; then
     # Харднинг PXC (firewall по источникам, маска хостов учёток, auth_socket).
     # shellcheck disable=SC1091
     [[ -f "${BCM_LIB_DIR}/bcm_pxc_harden.sh" ]] && source "${BCM_LIB_DIR}/bcm_pxc_harden.sh"
+    # Подключаемые модули (портал и прочие расширения) — раскатка после deploy_bcm.
+    # shellcheck disable=SC1091
+    [[ -f "${BCM_LIB_DIR}/bcm_modules.sh" ]] && source "${BCM_LIB_DIR}/bcm_modules.sh"
 fi
 
 # ──── Аргументы командной строки ─────────────────────────────────────────────
@@ -3068,6 +3071,24 @@ configure_lsyncd_upload_mirror() {
     fi
 }
 
+# ──── Подключаемые модули ────────────────────────────────────────────────────
+# Модули (веб-портал и прочие расширения) живут в /opt/bcm-modules и раскатываются
+# по слоям из своих манифестов. Установщик их НЕ включает сам: что ставить —
+# решает оператор (меню 16). Здесь только доводим до узлов уже включённое, чтобы
+# после install.sh кластер не оказался с модулем на части нод.
+# Вызывать ПОСЛЕ deploy_bcm (нужен /opt/bcm/bin/lib/bcm_modules.sh на узлах).
+deploy_modules() {
+    declare -f bcm_mod_list_enabled >/dev/null 2>&1 || return 0
+    local enabled; enabled="$(bcm_mod_list_enabled 2>/dev/null | tr '\n' ' ')"
+    if [[ -z "${enabled// }" ]]; then
+        log_info "Подключаемые модули не включены — пропуск (меню 16 «Модули»)."
+        return 0
+    fi
+    log_info "Раскатка модулей: ${enabled}"
+    [[ "$DRY_RUN" -eq 1 ]] && { log_info "[DRY RUN] bcm_mod_deploy_all"; return 0; }
+    bcm_mod_deploy_all || log_warn "Модули раскатаны не полностью — меню 16 → «Раскатать на узлы»."
+}
+
 # ──── Общий HA push-redis (active-active Push&Pull) ──────────────────────────
 # Выделенный redis-инстанс для каналов bx-push-server, ОБЩИЙ для всех web-нод
 # через плавающий PUSH_VIP (master-replica + keepalived), по образцу session-redis.
@@ -4113,6 +4134,8 @@ main() {
     configure_portal_db
 
     deploy_bcm
+
+    deploy_modules
 
     configure_ssl_renew
 

@@ -263,6 +263,26 @@ bcm_self_update() {
         fi
     done
 
+    # 7b. Модули. ⚠️ Установленные модули живут в /opt/bcm-modules — ВНЕ /opt/bcm,
+    # который выше перезаписан rsync --delete: иначе апдейт ядра сносил бы их.
+    # Что делаем: bundled-модули, уже установленные оператором, переустанавливаем
+    # из свежего релиза (иначе они застыли бы на версии установки), затем даём
+    # включённым модулям событие update.post и раскатываем их на ноды.
+    if declare -f bcm_mod_list >/dev/null 2>&1; then
+        local m
+        while read -r m; do
+            [[ -n "$m" ]] || continue
+            bcm_mod_src_dir "$m" >/dev/null 2>&1 || continue
+            bcm_info "Модуль ${m}: обновляю из состава релиза…"
+            bcm_mod_install "$m" >/dev/null 2>&1 || bcm_warn "  ${m}: не удалось обновить."
+        done < <(bcm_mod_list 2>/dev/null)
+        bcm_mod_event update.post "$pkg_ver"
+        if [[ -n "$(bcm_mod_list_enabled 2>/dev/null)" ]]; then
+            bcm_info "Раскатываю включённые модули на узлы…"
+            bcm_mod_deploy_all || true
+        fi
+    fi
+
     if [[ ${#failed[@]} -gt 0 ]]; then
         bcm_error "Обновление дошло не до всех нод: ${failed[*]}"
         bcm_warn "Локальный /opt/bcm обновлён до ${pkg_ver}; повторите 'bcm --update' для отставших нод."
