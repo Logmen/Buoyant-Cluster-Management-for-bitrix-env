@@ -29,17 +29,32 @@
 #     REQUIRES_BCM=1.0.19         минимальная версия ядра
 #     MENU_TITLE="Веб-портал"     если задано — пункт в главном меню bcm
 #     MENU_SCRIPT=menu.sh         скрипт пункта (по умолчанию menu.sh)
+#     STATE_DIRS="payload"        каталоги, которые модуль создаёт НА УЗЛЕ сам
 #     VENDOR="ООО «Ромашка»"      кто выпустил (видно оператору в меню)
 #     LICENSE="proprietary"       условия использования
 #     SUPPORT=https://…           куда писать по проблемам модуля
 #     HOMEPAGE=https://…          где живёт модуль
 #
-#   hooks/ (исполняемые, окружение BCM_MODULE_{NAME,DIR,ROLE}, BCM_CONF_FILE):
+#   hooks/ (исполняемые, окружение BCM_MODULE_{NAME,DIR,ROLE}, BCM_CONF_FILE и
+#   BCM_MODCFG_<ключ> на каждый ключ секции [module.<name>]):
 #     install  — после раскатки на ноду (роль в BCM_MODULE_ROLE)
-#     remove   — снятие с ноды
+#     remove   — снятие с ноды (ядро зовёт его и удалённо: bcm_mod_undeploy)
 #     status   — печатает key=value для меню и портала
 #     health   — rc 0/1 + строка причины (главный экран bcm)
 #     event    — точки расширения ядра: event <имя> [аргументы]
+#
+# ⚠️ STATE_DIRS — про право собственности на файлы. Каталог модуля ядро копирует
+# только целиком (rsync --delete): и при установке новой версии, и при раскатке.
+# Модулю при этом часто нужно место под то, что рождается уже НА КЛАСТЕРЕ и в
+# пакет поставщика не входит: портал собирает payload/ из установленного на web
+# приложения. Две операции обходятся с таким каталогом ПО-РАЗНОМУ, и это важно:
+#   • установка новой версии модуля — каталог НЕ трогаем: пакет поставщика приносит
+#     его пустым, и без исключения обновление модуля стирало бы собранное на
+#     кластере (а следующая раскатка разносила бы пустоту по узлам, рапортуя успех);
+#   • раскатка на узлы — каталог едет как все: собран он ровно на одной ноде, а
+#     нужен на остальных (портал собирает на web, а скрипты нужны на pxc и lb).
+# Исключение при установке снимается для ПЕРВОЙ установки: если каталога ещё нет,
+# содержимое из пакета поставщика кладётся как есть.
 #
 # ⚠️⚠️ ДВА каталога, и это осознанно:
 #   /opt/bcm/modules/<name>     — модули В СОСТАВЕ релиза (источник). Обновляются
@@ -80,14 +95,14 @@ _bcm_mod_manifest() {
     (
         set +u
         NAME=""; TITLE=""; VERSION=""; ROLES=""; REQUIRES_BCM=""
-        MENU_TITLE=""; MENU_SCRIPT=""; HOMEPAGE=""
+        MENU_TITLE=""; MENU_SCRIPT=""; HOMEPAGE=""; STATE_DIRS=""
         MODULE_API=""; VENDOR=""; LICENSE=""; SUPPORT=""
         # shellcheck disable=SC1091
         source "${dir}/module.conf" 2>/dev/null || exit 1
-        printf 'MOD_NAME=%q\nMOD_TITLE=%q\nMOD_VERSION=%q\nMOD_ROLES=%q\nMOD_REQUIRES=%q\nMOD_MENU_TITLE=%q\nMOD_MENU_SCRIPT=%q\nMOD_HOMEPAGE=%q\nMOD_API=%q\nMOD_VENDOR=%q\nMOD_LICENSE=%q\nMOD_SUPPORT=%q\n' \
+        printf 'MOD_NAME=%q\nMOD_TITLE=%q\nMOD_VERSION=%q\nMOD_ROLES=%q\nMOD_REQUIRES=%q\nMOD_MENU_TITLE=%q\nMOD_MENU_SCRIPT=%q\nMOD_HOMEPAGE=%q\nMOD_API=%q\nMOD_VENDOR=%q\nMOD_LICENSE=%q\nMOD_SUPPORT=%q\nMOD_STATE_DIRS=%q\n' \
             "$NAME" "$TITLE" "$VERSION" "$ROLES" "$REQUIRES_BCM" \
             "$MENU_TITLE" "${MENU_SCRIPT:-menu.sh}" "$HOMEPAGE" \
-            "${MODULE_API:-1}" "$VENDOR" "$LICENSE" "$SUPPORT"
+            "${MODULE_API:-1}" "$VENDOR" "$LICENSE" "$SUPPORT" "$STATE_DIRS"
     )
 }
 
@@ -128,6 +143,61 @@ bcm_mod_get() {
     [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "${3:-}"
 }
 
+# ──── Окружение хука ─────────────────────────────────────────────────────────
+# Параметры модуля из [module.<name>] уезжают в хук как BCM_MODCFG_<ключ>.
+# ⚠️ Зачем: хук выполняется НА УЗЛЕ, где нет ни функций ядра, ни знания о том,
+# как устроен cluster.conf. Без этого каждый модуль пишет свой разбор INI (и
+# пишет его неправильно: ловили awk без учёта секции — он брал первый ключ с
+# таким именем из всего файла, а секций [module.*] у нас теперь много).
+# Точки в имени ключа (app.path) заменяем на подчёркивание: имя переменной
+# окружения — [A-Za-z0-9_]. Ключи не из этого алфавита пропускаем молча.
+_bcm_mod_cfg_env() {
+    local name="$1" k v var
+    local -a seen=()
+    while read -r k; do
+        [[ -n "$k" ]] || continue
+        [[ "$k" =~ ^(enabled|version)$ ]] && continue    # служебные поля ядра
+        var="BCM_MODCFG_${k//./_}"
+        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        [[ " ${seen[*]:-} " == *" $var "* ]] && continue
+        seen+=("$var")
+        v="$(bcm_conf_get "module.${name}" "$k" 2>/dev/null || echo '')"
+        printf '%s=%s\n' "$var" "$v"
+    done < <(bcm_conf_keys "module.${name}" 2>/dev/null)
+    return 0
+}
+
+# Строка присваиваний для запуска хука ЧЕРЕЗ SSH: KEY=значение через printf %q.
+_bcm_mod_hook_env_str() {
+    local name="$1" dir="$2" role="$3" line k v out=""
+    out+="BCM_MODULE_NAME=$(printf '%q' "$name") "
+    out+="BCM_MODULE_DIR=$(printf '%q' "$dir") "
+    out+="BCM_MODULE_ROLE=$(printf '%q' "$role") "
+    out+="BCM_CONF_FILE=$(printf '%q' "${BCM_CONF_FILE:-/etc/bitrix-cluster/cluster.conf}") "
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
+        out+="${k}=$(printf '%q' "$v") "
+    done < <(_bcm_mod_cfg_env "$name")
+    printf '%s' "$out"
+}
+
+# ──── Каталоги состояния (STATE_DIRS манифеста) ──────────────────────────────
+# Печатает вычищенные относительные пути; вызывать ПОСЛЕ bcm_mod_load.
+# ⚠️ Пути проверяем: значение приходит из чужого манифеста, а подставляется в
+# --exclude и в rm/mv. Абсолютный путь и '..' отбрасываем молча.
+_bcm_mod_state_list() {
+    local d
+    for d in ${MOD_STATE_DIRS:-}; do
+        d="${d#/}"; d="${d%/}"
+        [[ -z "$d" ]] && continue
+        [[ "$d" == *".."* ]] && continue
+        [[ "$d" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*$ ]] || continue
+        echo "$d"
+    done
+    return 0
+}
+
 # Включённые модули (установлен + enabled = Y).
 bcm_mod_list_enabled() {
     local n; while read -r n; do [[ -n "$n" ]] && bcm_mod_enabled "$n" && echo "$n"; done < <(bcm_mod_list)
@@ -150,11 +220,37 @@ bcm_mod_run() {
     local f="${dir}/hooks/${hook}"
     # Хука нет — делать нечего, это не ошибка (модуль объявляет только нужные ему).
     [[ -e "$f" ]] || return 0
-    [[ -x "$f" ]] || { bash "$f" "$@"; return $?; }
-    BCM_MODULE_NAME="$name" BCM_MODULE_DIR="$dir" \
-    BCM_MODULE_ROLE="${BCM_MODULE_ROLE:-$(bcm_get_current_role 2>/dev/null || echo unknown)}" \
-    BCM_CONF_FILE="${BCM_CONF_FILE:-/etc/bitrix-cluster/cluster.conf}" \
-        "$f" "$@"
+    # ⚠️ env со списком, а не префикс присваиваний: параметров модуля произвольное
+    # число, массив в префикс не подставить. Заодно окружение достаётся и
+    # неисполняемому хуку (ветка с bash) — раньше он стартовал вообще без переменных.
+    local -a envv=()
+    mapfile -t envv < <(_bcm_mod_cfg_env "$name")
+    local -a cmd=( env
+        "BCM_MODULE_NAME=${name}" "BCM_MODULE_DIR=${dir}"
+        "BCM_MODULE_ROLE=${BCM_MODULE_ROLE:-$(bcm_get_current_role 2>/dev/null || echo unknown)}"
+        "BCM_CONF_FILE=${BCM_CONF_FILE:-/etc/bitrix-cluster/cluster.conf}" )
+    [[ ${#envv[@]} -gt 0 ]] && cmd+=( "${envv[@]}" )
+    if [[ -x "$f" ]]; then cmd+=( "$f" ); else cmd+=( bash "$f" ); fi
+    "${cmd[@]}" "$@"
+}
+
+# ──── Хук на УДАЛЁННОМ узле ──────────────────────────────────────────────────
+# bcm_mod_run_remote <name> <ip> <role> <hook> <таймаут> [аргументы хука…]
+# Один вход для всех удалённых хуков: раскатка, снятие, состояние. Раньше его не
+# было, и каждый модуль писал свой обход узлов по ssh — вместе со всеми граблями
+# (окружение перед хуком, </dev/null, таймаут). Хука на узле нет → rc 0 и тишина.
+bcm_mod_run_remote() {
+    [[ $# -ge 5 ]] || { bcm_error "bcm_mod_run_remote: нужны name, ip, роль, хук, таймаут."; return 2; }
+    local name="$1" ip="$2" role="$3" hook="$4" tmo="$5"; shift 5
+    local rdir="${BCM_MODULES_DIR}/${name}"
+    local f="${rdir}/hooks/${hook}"
+    local envs; envs="$(_bcm_mod_hook_env_str "$name" "$rdir" "$role")"
+    local args=""
+    local a; for a in "$@"; do args+=" $(printf '%q' "$a")"; done
+    # ⚠️⚠️ Присваивания окружения — ПЕРЕД САМИМ хуком, а не перед `[ -x … ]`:
+    # в `VAR=x [ -x f ] && f` переменные достаются test, а хук стартует без них.
+    bcm_ssh_exec_timeout "$ip" "$tmo" \
+        "[ -x '${f}' ] || exit 0; ${envs} '${f}'${args}" </dev/null
 }
 
 # Событие ядра: прогнать hooks/event по всем ВКЛЮЧЁННЫМ модулям.
@@ -225,6 +321,10 @@ _bcm_mod_verify_pkg() {
 # ядра ДО копирования — половинчато установленный модуль хуже отсутствующего.
 bcm_mod_install() {
     local src="$1" tmp="" dir name out
+    # Каталог ключей поставщиков создаём сами: на кластерах, поставленных до этого
+    # релиза, install.sh его не заводил, а без каталога подписанный пакет получал
+    # отказ «нет ключей» — при том что положить ключ было некуда.
+    mkdir -p "${BCM_MODULE_KEYS_DIR}" 2>/dev/null || true
     if [[ -d "$src" ]]; then dir="$src"
     elif [[ -f "$src" && "$src" == *.tar.gz ]]; then
         _bcm_mod_verify_pkg "$src" || return 1
@@ -258,13 +358,38 @@ bcm_mod_install() {
     name="$MOD_NAME"
     mkdir -p "${BCM_MODULES_DIR}"
     # Каталог модуля заменяем целиком (rsync --delete): остатки прежней версии —
-    # источник загадочных различий между узлами.
+    # источник загадочных различий между узлами. Исключение — STATE_DIRS: то, что
+    # модуль собирает уже на кластере, переживает установку новой версии.
+    local -a state=() ex=(); local s
+    mapfile -t state < <(_bcm_mod_state_list)
+    # Исключаем только то, что на этой ноде УЖЕ собрано: первая установка должна
+    # положить содержимое из пакета поставщика, если он что-то туда положил.
+    for s in "${state[@]}"; do
+        [[ -d "${BCM_MODULES_DIR}/${name}/${s}" ]] && ex+=( "--exclude=/${s}/" )
+    done
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete "${dir%/}/" "${BCM_MODULES_DIR}/${name}/"
+        rsync -a --delete "${ex[@]}" "${dir%/}/" "${BCM_MODULES_DIR}/${name}/"
     else
+        # Без rsync состояние сохраняем руками: отодвинуть, переложить, вернуть.
+        local keep=""; [[ ${#state[@]} -gt 0 ]] && keep="$(mktemp -d)"
+        for s in "${state[@]}"; do
+            [[ -d "${BCM_MODULES_DIR}/${name}/${s}" ]] || continue
+            mkdir -p "$(dirname "${keep}/${s}")"; mv "${BCM_MODULES_DIR}/${name}/${s}" "${keep}/${s}"
+        done
         rm -rf "${BCM_MODULES_DIR:?}/${name}"; mkdir -p "${BCM_MODULES_DIR}/${name}"; cp -a "${dir%/}/." "${BCM_MODULES_DIR}/${name}/"
+        for s in "${state[@]}"; do
+            [[ -n "$keep" && -d "${keep}/${s}" ]] || continue
+            rm -rf "${BCM_MODULES_DIR:?}/${name:?}/${s:?}"; mkdir -p "$(dirname "${BCM_MODULES_DIR}/${name}/${s}")"
+            mv "${keep}/${s}" "${BCM_MODULES_DIR}/${name}/${s}"
+        done
+        [[ -n "$keep" ]] && rm -rf "$keep"
     fi
-    chmod +x "${BCM_MODULES_DIR}/${name}"/hooks/* "${BCM_MODULES_DIR}/${name}"/*.sh 2>/dev/null || true
+    # Каталог состояния должен существовать даже у свежей установки: пакет
+    # поставщика его не несёт (нечего нести), а модуль на него рассчитывает.
+    for s in "${state[@]}"; do mkdir -p "${BCM_MODULES_DIR}/${name}/${s}"; done
+    # ⚠️ bin/ тоже: у модуля там свои утилиты (портал собирает payload сборщиком
+    # из bin/), а права из tar.gz или чужого каталога могут приехать без +x.
+    chmod +x "${BCM_MODULES_DIR}/${name}"/hooks/* "${BCM_MODULES_DIR}/${name}"/bin/* "${BCM_MODULES_DIR}/${name}"/*.sh 2>/dev/null || true
     [[ -n "$tmp" ]] && rm -rf "$tmp"
     bcm_conf_set "module.${name}" version "$MOD_VERSION"
     bcm_ok "Модуль ${name} ${MOD_VERSION}${MOD_VENDOR:+ (${MOD_VENDOR})} установлен в ${BCM_MODULES_DIR}/${name}."
@@ -278,7 +403,7 @@ bcm_mod_remove() {
     rm -rf "${dir:?}"
     bcm_conf_set "module.${name}" enabled "N"
     bcm_conf_sync 2>/dev/null || true
-    bcm_ok "Модуль ${name} снят с этого узла (на остальных — раскатка ещё раз или вручную)."
+    bcm_ok "Модуль ${name} снят с этого узла (с остальных — bcm_mod_undeploy, меню 16 → «Удалить»)."
 }
 
 # ──── Раскатка по нодам ──────────────────────────────────────────────────────
@@ -296,13 +421,32 @@ bcm_mod_deploy() {
         return 0
     fi
     bcm_load_topology || true
-    local node ip layer ok=0 fail=0
+    # ⚠️ STATE_DIRS здесь, в отличие от установки, едут на узлы как всё остальное:
+    # собраны они на одной ноде, а нужны на других. Но если каталог пуст — узлы
+    # получат пустоту (--delete), и молчать об этом нельзя: именно так «раскатал
+    # успешно» и «на узлах ничего не поменялось» уживались в одном отчёте.
+    local -a state=(); local s
+    mapfile -t state < <(_bcm_mod_state_list)
+    for s in "${state[@]}"; do
+        [[ -d "${MOD_DIR}/${s}" && -z "$(ls -A "${MOD_DIR}/${s}" 2>/dev/null)" ]] || continue
+        bcm_warn "  ${name}: каталог ${s}/ на этой ноде пуст — узлы получат его пустым."
+        bcm_warn "  ${name}: соберите его средствами модуля и повторите раскатку."
+    done
+    local node ip layer ok=0 fail=0 nver
     for node in "${!BCM_NODE_IP[@]}"; do
         ip="${BCM_NODE_IP[$node]}"; layer="${BCM_NODE_LAYER[$node]:-}"
         [[ -z "$ip" || -z "$layer" ]] && continue
         [[ " $roles " == *" $layer "* ]] || continue
         if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
             bcm_warn "  ${node} (${ip}): недоступен — пропуск."; fail=$((fail+1)); continue
+        fi
+        # Версию ядра сверяем НА КАЖДОМ узле: bcm_mod_install проверил только ту
+        # ноду, где стоял оператор, а отставшая нода (не долетело обновление) молча
+        # получила бы модуль, которому там не на что опереться.
+        nver="$(bcm_ssh_exec_timeout "$ip" 10 "cat ${BCM_BASE_DIR:-/opt/bcm}/VERSION 2>/dev/null" </dev/null | tr -d '[:space:]')"
+        if [[ -n "${MOD_REQUIRES:-}" && -n "$nver" ]] && ! _bcm_mod_ver_ge "$nver" "$MOD_REQUIRES"; then
+            bcm_warn "  ${node} (${layer}): BCM ${nver} < ${MOD_REQUIRES} — пропуск, сначала обновите ядро там."
+            fail=$((fail+1)); continue
         fi
         bcm_ssh_exec "$ip" "mkdir -p ${BCM_MODULES_DIR}" </dev/null >/dev/null 2>&1
         if command -v rsync >/dev/null 2>&1; then
@@ -312,21 +456,81 @@ bcm_mod_deploy() {
         else
             bcm_error "  ${node}: нет rsync на brain-ноде."; fail=$((fail+1)); continue
         fi
-        bcm_ssh_exec "$ip" "chmod +x ${BCM_MODULES_DIR}/${name}/hooks/* ${BCM_MODULES_DIR}/${name}/*.sh 2>/dev/null; true" </dev/null >/dev/null 2>&1
-        # ⚠️⚠️ Присваивания окружения ставим ПЕРЕД САМИМ хуком, а не перед `[ -x … ]`:
-        # в конструкции `VAR=x [ -x f ] && f` переменные достаются команде test, а
-        # хук запускается уже без них. Ловили вживую: install-хук получал пустой
-        # BCM_MODULE_ROLE, падал в ветку «для этой роли ничего не ставим» и НИЧЕГО
-        # не делал, а раскатка при этом рапортовала успех.
-        local hook="${BCM_MODULES_DIR}/${name}/hooks/install"
-        if bcm_ssh_exec_timeout "$ip" 600 \
-            "[ -x '${hook}' ] || exit 0; BCM_MODULE_NAME='${name}' BCM_MODULE_DIR='${BCM_MODULES_DIR}/${name}' BCM_MODULE_ROLE='${layer}' '${hook}'" </dev/null >/dev/null 2>&1; then
+        local mk=""; for s in "${state[@]}"; do mk+="mkdir -p ${BCM_MODULES_DIR}/${name}/${s}; "; done
+        bcm_ssh_exec "$ip" "${mk}chmod +x ${BCM_MODULES_DIR}/${name}/hooks/* ${BCM_MODULES_DIR}/${name}/bin/* ${BCM_MODULES_DIR}/${name}/*.sh 2>/dev/null; true" </dev/null >/dev/null 2>&1
+        # Окружение хука (роль, BCM_CONF_FILE, параметры [module.<name>]) собирает
+        # bcm_mod_run_remote — он же держит и оба разбора граблей: env перед самим
+        # хуком и </dev/null, чтобы хук не съел stdin вызывающего меню.
+        if bcm_mod_run_remote "$name" "$ip" "$layer" install 600 >/dev/null 2>&1; then
             bcm_ok "  ${node} (${layer}): модуль раскатан."; ok=$((ok+1))
         else
             bcm_warn "  ${node} (${layer}): install-хук вернул ошибку (см. модуль)."; fail=$((fail+1))
         fi
     done
     [[ $fail -eq 0 ]]
+}
+
+# ──── Снятие с узлов ─────────────────────────────────────────────────────────
+# Зеркало раскатки: hooks/remove на каждом узле ROLES и удаление каталога модуля
+# там же. Без этого remove-хук на удалённых узлах не вызывался НИКОГДА (ядро
+# звало его только локально), и после «удалить модуль» на нодах оставались чужие
+# таймеры, юниты и фрагменты конфигов — снимать руками, зная, что искать.
+# Текущую ноду не трогаем: с неё модуль снимает bcm_mod_remove.
+bcm_mod_undeploy() {
+    local name="$1"
+    bcm_mod_load "$name" || { bcm_error "модуль ${name} не установлен."; return 1; }
+    local roles="${MOD_ROLES:-}"
+    [[ -z "${roles// }" ]] && { bcm_info "  ${name}: ROLES пуст — снимать с других узлов нечего."; return 0; }
+    bcm_load_topology || true
+    local self; self="$(bcm_get_current_node_name 2>/dev/null || hostname -s)"
+    local node ip layer fail=0 out
+    for node in "${!BCM_NODE_IP[@]}"; do
+        ip="${BCM_NODE_IP[$node]}"; layer="${BCM_NODE_LAYER[$node]:-}"
+        [[ -z "$ip" || -z "$layer" ]] && continue
+        [[ " $roles " == *" $layer "* ]] || continue
+        [[ "$node" == "$self" ]] && continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            bcm_warn "  ${node} (${ip}): недоступен — модуль там остался."; fail=$((fail+1)); continue
+        fi
+        out="$(bcm_mod_run_remote "$name" "$ip" "$layer" remove 300 2>&1)" || \
+            bcm_warn "  ${node}: remove-хук вернул ошибку — каталог всё равно убираю."
+        [[ -n "$out" ]] && echo "$out" | sed 's/^/      /'
+        if bcm_ssh_exec_timeout "$ip" 60 "rm -rf '${BCM_MODULES_DIR:?}/${name}'" </dev/null >/dev/null 2>&1; then
+            bcm_ok "  ${node} (${layer}): модуль снят."
+        else
+            bcm_error "  ${node} (${layer}): каталог модуля не удалён."; fail=$((fail+1))
+        fi
+    done
+    [[ $fail -eq 0 ]]
+}
+
+# ──── Состояние со всех узлов ────────────────────────────────────────────────
+# hooks/status по узлам ROLES. Печатает «<нода> (<роль>, <ip>)» и вывод хука.
+bcm_mod_status_all() {
+    local name="$1"
+    bcm_mod_load "$name" || { bcm_error "модуль ${name} не установлен."; return 1; }
+    local roles="${MOD_ROLES:-}"
+    [[ -z "${roles// }" ]] && { bcm_mod_run "$name" status; return 0; }
+    bcm_load_topology || true
+    # ⚠️ Список узлов СНАЧАЛА в массив: ниже на каждый узел идёт ssh, а в теле
+    # `while read < <(…)` он съел бы остаток списка — обошёлся бы только первый.
+    local -a rows=(); local row node ip layer out
+    for node in "${!BCM_NODE_IP[@]}"; do
+        layer="${BCM_NODE_LAYER[$node]:-}"
+        [[ -n "$layer" && " $roles " == *" $layer "* ]] && rows+=("${node} ${BCM_NODE_IP[$node]} ${layer}")
+    done
+    mapfile -t rows < <(printf '%s\n' "${rows[@]}" | sort)
+    for row in "${rows[@]}"; do
+        read -r node ip layer <<< "$row"
+        [[ -n "$node" ]] || continue
+        bcm_color "WHITE" "  ── ${node} (${layer}, ${ip}) ──"
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then
+            echo "      узел недоступен"; continue
+        fi
+        out="$(bcm_mod_run_remote "$name" "$ip" "$layer" status 30 2>/dev/null)" || true
+        echo "${out:-модуль на узле не отвечает (хука status нет или он молчит)}" | sed 's/^/      /'
+    done
+    return 0
 }
 
 bcm_mod_deploy_all() {

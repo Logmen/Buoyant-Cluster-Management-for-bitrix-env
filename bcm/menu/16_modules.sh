@@ -178,13 +178,22 @@ _mod_status() {
     [[ -n "$MOD_HOMEPAGE" ]] && printf "  %s %s\n" "$(bcm_pad 'Исходники:' 16)"  "$MOD_HOMEPAGE"
     printf "  %s %s\n" "$(bcm_pad 'Состояние:' 16)" "$(bcm_mod_enabled "$name" && echo включён || echo выключен)"
     echo
-    local out
-    out="$(bcm_mod_run "$name" status 2>&1)" || true
-    if [[ -n "$out" ]]; then
-        bcm_color "WHITE" "  ── что сообщает сам модуль ──"
-        echo "$out" | sed 's/^/    /'
+    # ⚠️ Состояние спрашиваем У ВСЕХ узлов слоёв модуля, а не только у этой ноды.
+    # Модуль на разных слоях ставит разное (портал: скрипты копий на pxc, фронт
+    # HAProxy на lb), и локальный status показывал ровно одну седьмую картины —
+    # из-за чего обход по узлам писал у себя каждый модуль отдельно.
+    if [[ -n "${MOD_ROLES// }" ]]; then
+        bcm_color "WHITE" "  ── что сообщают узлы (${MOD_ROLES}) ──"
+        bcm_mod_status_all "$name" || true
     else
-        bcm_info "  Модуль не отдаёт status (хук hooks/status не задан)."
+        local out
+        out="$(bcm_mod_run "$name" status 2>&1)" || true
+        if [[ -n "$out" ]]; then
+            bcm_color "WHITE" "  ── что сообщает сам модуль ──"
+            echo "$out" | sed 's/^/    /'
+        else
+            bcm_info "  Модуль не отдаёт status (хук hooks/status не задан)."
+        fi
     fi
     echo
     bcm_any_key
@@ -194,10 +203,33 @@ _mod_remove() {
     bcm_section_header "Удалить модуль"
     local name; name="$(_mod_pick "Модуль")" || { bcm_info "Модулей нет."; bcm_any_key; return; }
     [[ -z "$name" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
-    bcm_warn "Модуль будет снят С ЭТОЙ ноды: отработает hooks/remove и каталог удалится."
-    bcm_warn "На остальных узлах он останется — уберите его там тем же пунктом."
-    bcm_confirm "Удалить ${name} с этой ноды?" || { bcm_info "Отменено."; bcm_any_key; return; }
-    bcm_mod_remove "$name" || true
+    bcm_mod_load "$name" || { bcm_error "Манифест ${name} нечитаем."; bcm_any_key; return; }
+    bcm_info "На каждом узле отработает hooks/remove и удалится каталог модуля."
+    bcm_info "Что уберёт за собой сам модуль — его дело; чужие данные он трогать не обязан."
+    echo
+    if [[ -n "${MOD_ROLES// }" ]]; then
+        echo "    1. Со всех узлов слоёв ${MOD_ROLES} (и с этой ноды)"
+        echo "    2. Только с этой ноды"
+        echo "    0. Отмена"
+        echo
+        local ch; bcm_read_choice "Ваш выбор" ch
+        case "$ch" in
+            1)
+                bcm_confirm "Снять ${name} со ВСЕХ узлов?" || { bcm_info "Отменено."; bcm_any_key; return; }
+                bcm_mod_undeploy "$name" || bcm_warn "На части узлов модуль остался — см. сообщения выше."
+                bcm_mod_remove "$name" || true
+                ;;
+            2)
+                bcm_warn "На остальных узлах модуль останется вместе со своими службами."
+                bcm_confirm "Удалить ${name} только с этой ноды?" || { bcm_info "Отменено."; bcm_any_key; return; }
+                bcm_mod_remove "$name" || true
+                ;;
+            *) bcm_info "Отменено." ;;
+        esac
+    else
+        bcm_confirm "Удалить ${name} с этой ноды?" || { bcm_info "Отменено."; bcm_any_key; return; }
+        bcm_mod_remove "$name" || true
+    fi
     bcm_any_key
 }
 
@@ -209,8 +241,8 @@ _mod_menu() {
             "1.  Установить модуль (из состава BCM, каталога или tar.gz)"
             "2.  Включить / выключить"
             "3.  Раскатать на узлы (по слоям из манифеста)"
-            "4.  Состояние модуля"
-            "5.  Удалить с этой ноды"
+            "4.  Состояние модуля (опрос всех узлов его слоёв)"
+            "5.  Удалить (со всех узлов или только с этой ноды)"
             "0.  Назад"
         )
         bcm_print_menu items

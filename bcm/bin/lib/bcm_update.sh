@@ -269,6 +269,8 @@ bcm_self_update() {
     # из свежего релиза (иначе они застыли бы на версии установки), затем даём
     # включённым модулям событие update.post и раскатываем их на ноды.
     if declare -f bcm_mod_list >/dev/null 2>&1; then
+        # Каталог ключей поставщиков — на кластерах, поставленных до 1.0.23, его нет.
+        mkdir -p "${BCM_MODULE_KEYS_DIR:-/etc/bitrix-cluster/module-keys}" 2>/dev/null || true
         local m
         while read -r m; do
             [[ -n "$m" ]] || continue

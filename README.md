@@ -360,10 +360,15 @@ sudo bash install.sh --dry-run
 `bin/lib/*.sh` (их всё равно затирал бы `bcm --update`).
 
 Модуль — каталог с манифестом `module.conf` (`NAME`, `TITLE`, `VERSION`, `ROLES`,
-`REQUIRES_BCM`, `MENU_TITLE`) и необязательными хуками `install/remove/status/health/event`.
-BCM берёт на себя раскатку по слоям тем же ключом кластера, включение
-(`[module.<name>] enabled` в `cluster.conf`, рассылается по узлам), пункт в
-главном меню и события ядра.
+`REQUIRES_BCM`, `MENU_TITLE`, `STATE_DIRS`) и необязательными хуками
+`install/remove/status/health/event`. BCM берёт на себя раскатку по слоям тем же
+ключом кластера, снятие с узлов (`remove` отрабатывает на каждом), опрос
+состояния со всех узлов, включение (`[module.<name>] enabled` в `cluster.conf`,
+рассылается по узлам), пункт в главном меню и события ядра.
+
+Хуку на узле ядро передаёт роль, путь к `cluster.conf` и параметры модуля
+(`BCM_MODCFG_<ключ>` на каждый ключ секции `[module.<name>]`) — разбирать конфиг
+самому модулю не нужно и не следует.
 
 ⚠️ Установленные модули лежат в **`/opt/bcm-modules`**, вне `/opt/bcm`: обновление
 ядра перезаписывает `/opt/bcm` целиком (`rsync --delete`) и снесло бы их.

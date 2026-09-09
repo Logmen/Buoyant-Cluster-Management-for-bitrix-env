@@ -282,11 +282,11 @@ if compgen -G 'bcm/modules/*/module.conf' >/dev/null; then
         # процесс затёр бы переменные проверок.
         eval "$(
             set +u
-            NAME=""; TITLE=""; VERSION=""; ROLES=""; MENU_TITLE=""; MENU_SCRIPT=""
+            NAME=""; TITLE=""; VERSION=""; ROLES=""; MENU_TITLE=""; MENU_SCRIPT=""; STATE_DIRS=""
             # shellcheck disable=SC1090
             source "$mconf" 2>/dev/null
-            printf 'M_NAME=%q\nM_TITLE=%q\nM_VERSION=%q\nM_ROLES=%q\nM_MENU_TITLE=%q\nM_MENU_SCRIPT=%q\n' \
-                "$NAME" "$TITLE" "$VERSION" "$ROLES" "$MENU_TITLE" "${MENU_SCRIPT:-menu.sh}"
+            printf 'M_NAME=%q\nM_TITLE=%q\nM_VERSION=%q\nM_ROLES=%q\nM_MENU_TITLE=%q\nM_MENU_SCRIPT=%q\nM_STATE_DIRS=%q\n' \
+                "$NAME" "$TITLE" "$VERSION" "$ROLES" "$MENU_TITLE" "${MENU_SCRIPT:-menu.sh}" "$STATE_DIRS"
         )"
         for req in M_NAME M_TITLE M_VERSION; do
             [[ -n "${!req}" ]] || { fail "модуль ${mbase}: в module.conf нет ${req#M_}"; mod_fail=1; }
@@ -301,6 +301,14 @@ if compgen -G 'bcm/modules/*/module.conf' >/dev/null; then
         if [[ -n "$M_MENU_TITLE" && ! -f "${mdir}/${M_MENU_SCRIPT}" ]]; then
             fail "модуль ${mbase}: объявлен MENU_TITLE, но нет ${M_MENU_SCRIPT}"; mod_fail=1
         fi
+        # STATE_DIRS подставляется в --exclude и в rm/mv на узле: пути обязаны быть
+        # относительными и без '..'. Ядро такие значения отбрасывает молча — здесь
+        # шумим, иначе поставщик узнает о своей опечатке по «каталог не сохранился».
+        for sd in $M_STATE_DIRS; do
+            case "$sd" in
+                /*|*..*) fail "модуль ${mbase}: STATE_DIRS='${sd}' — нужен относительный путь без '..'"; mod_fail=1 ;;
+            esac
+        done
         for h in "${mdir}"/hooks/*; do
             [[ -e "$h" ]] || continue
             [[ -x "$h" ]] || { fail "модуль ${mbase}: хук $(basename "$h") не исполняемый"; mod_fail=1; }

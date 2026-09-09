@@ -2554,6 +2554,11 @@ deploy_bcm() {
         bcm_deploy_to_node "$ip" "$role"
 
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /etc/bitrix-cluster && chmod 700 /etc/bitrix-cluster"
+        # Каталог открытых ключей поставщиков модулей. Пустой, но существующий:
+        # bcm_mod_install проверяет им подписи пакетов, и без каталога подписанный
+        # модуль поставить НЕЛЬЗЯ (fail-closed) — оператор упирается в это уже с
+        # пакетом в руках, вместо того чтобы просто положить туда ключ.
+        bcm_ssh_exec "$ip" "mkdir -p /etc/bitrix-cluster/module-keys && chmod 755 /etc/bitrix-cluster/module-keys"
         bcm_ssh_copy_file "$BCM_CONF_FILE" "$ip" "/etc/bitrix-cluster/cluster.conf"
         # cluster.conf содержит пароли БД/ProxySQL/MinIO в открытом виде — закрываем от
         # непривилегированных пользователей ноды (scp приносит ~644 по umask).
@@ -4162,6 +4167,8 @@ main() {
             log_info "Копирование конфигурации в системный каталог /etc/bitrix-cluster (так как локальный хост входит в кластер)..."
             mkdir -p /etc/bitrix-cluster
             chmod 700 /etc/bitrix-cluster
+            mkdir -p /etc/bitrix-cluster/module-keys
+            chmod 755 /etc/bitrix-cluster/module-keys
             cp "$BCM_CONF_FILE" "/etc/bitrix-cluster/cluster.conf"
             chmod 600 "/etc/bitrix-cluster/cluster.conf"
             cp "$BCM_SSH_KEY" "/etc/bitrix-cluster/cluster_id_rsa"

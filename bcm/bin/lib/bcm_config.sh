@@ -59,6 +59,27 @@ bcm_conf_get() {
     return 1
 }
 
+# ──── Перечислить ключи секции ───────────────────────────────────────────────
+# bcm_conf_keys <section> → имена ключей секции, по одному в строке.
+# Нужна там, где секция заранее не известна целиком: параметры модуля
+# [module.<name>] пишет сам модуль, и ядро обязано отдать хуку всё, что там есть,
+# не зная имён. Разбор — тот же, что в bcm_conf_get (комментарии, секции).
+bcm_conf_keys() {
+    local section="$1" line in_section=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            [[ "${BASH_REMATCH[1]}" == "$section" ]] && in_section=1 || in_section=0
+            continue
+        fi
+        if [[ $in_section -eq 1 && "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]*= ]]; then
+            echo "${BASH_REMATCH[1]}"
+        fi
+    done < "$BCM_CONF_FILE"
+    return 0
+}
+
 # ──── Получить список узлов слоя ─────────────────────────────────────────────
 # bcm_get_nodes <layer>  → выводит имена через пробел
 # layer: lb | web | pxc | s3
