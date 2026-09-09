@@ -355,14 +355,23 @@ bcm_mod_menu_entries() {
 }
 
 # Запустить меню модуля по номеру из bcm_mod_menu_entries. rc 1 — номер не наш.
+# ⚠️⚠️ Список СНАЧАЛА в массив, и только потом запуск меню. Внутри
+# `while read … done < <(…)` у тела цикла stdin — это подстановка процесса, и
+# запущенное там ИНТЕРАКТИВНОЕ меню читало бы ввод оператора оттуда: первый же
+# bcm_read_choice получал EOF, меню закрывалось мгновенно, и со стороны выглядело
+# как «пункт не открывается» (ловили вживую). Тот же корень, что у запрета ssh в
+# теле while-read, только жертва другая — не ssh, а дочерний интерактивный процесс.
 bcm_mod_menu_run() {
     local want="$1" line num name
-    while IFS='|' read -r num name _; do
+    local -a entries=()
+    mapfile -t entries < <(bcm_mod_menu_entries)
+    for line in "${entries[@]}"; do
+        IFS='|' read -r num name _ <<< "$line"
         [[ "$num" == "$want" ]] || continue
         bcm_mod_load "$name" || return 1
         BCM_MODULE_NAME="$name" BCM_MODULE_DIR="$MOD_DIR" bash "${MOD_DIR}/${MOD_MENU_SCRIPT}"
         return 0
-    done < <(bcm_mod_menu_entries)
+    done
     return 1
 }
 
