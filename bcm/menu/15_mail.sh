@@ -90,15 +90,28 @@ _mail_configure() {
     bcm_read_choice "TLS-режим: starttls|wrapper|none [${tls_def}]" tls
     [[ -z "$tls" ]] && tls="$tls_def"
 
-    bcm_read_choice "Домен отправителя для SPF/DKIM/DMARC${cur_dom:+ [${cur_dom}]}" from_dom
+    bcm_read_choice "Домен отправителя для SPF/DKIM/DMARC (только домен, без user@)${cur_dom:+ [${cur_dom}]}" from_dom
     [[ -z "$from_dom" ]] && from_dom="$cur_dom"
+    # Идёт в smtp_helo_name, где обязан быть FQDN. Если ввели адрес — берём домен.
+    if [[ "$from_dom" == *@* ]]; then
+        bcm_warn "FROM_DOMAIN — это домен, а не адрес: '${from_dom}' → '${from_dom##*@}'."
+        from_dom="${from_dom##*@}"
+    fi
 
-    bcm_read_choice "Переписать envelope-from на единый адрес (пусто — не переписывать)${cur_from:+ [${cur_from}]}" from_addr
+    bcm_read_choice "envelope-from (Return-Path) для всех писем${cur_from:+ [${cur_from}]}${user:+ (пусто — ${user})}" from_addr
     [[ -z "$from_addr" ]] && from_addr="$cur_from"
+    # Пусто — подставляем логин релея. Оставить envelope-from незаданным нельзя:
+    # Postfix подставит <систюзер>@$myhostname, домен ноды не резолвится,
+    # и релей с verify=sender отобьёт письмо на RCPT TO (550 Sender verify failed).
+    [[ -z "$from_addr" ]] && from_addr="$user"
+    if [[ "$from_addr" != *@*.* ]]; then
+        bcm_error "envelope-from должен быть полным адресом (user@domain): '${from_addr}'."
+        bcm_any_key; return
+    fi
 
     echo
     bcm_info "Релей: [${host}]:${port}  логин: ${user:-—}  TLS: ${tls}  домен: ${from_dom:-—}"
-    [[ -n "$from_addr" ]] && bcm_info "envelope-from → ${from_addr}"
+    bcm_info "envelope-from → ${from_addr} (заголовок From: приложения не меняется)"
     if ! bcm_confirm "Раскатать и применить на ВСЕХ web-нодах (${BCM_NODES_WEB[*]})?"; then
         bcm_info "Отменено."; bcm_any_key; return
     fi

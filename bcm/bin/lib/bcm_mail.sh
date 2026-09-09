@@ -14,7 +14,12 @@
 #   • dnf install postfix cyrus-sasl-plain
 #   • postconf -e: relayhost=[HOST]:PORT, SASL-auth, TLS, inet_interfaces=loopback-only
 #   • /etc/postfix/sasl_passwd ([HOST]:PORT user:pass) + postmap, 0600
-#   • (опц.) sender_canonical: переписать envelope-from на FROM_ADDRESS (SPF-alignment)
+#   • sender_canonical: envelope-from → FROM_ADDRESS (по умолчанию RELAY_USER).
+#     Переписывание ВСЕГДА включено: без него envelope-from = <систюзер>@$myhostname
+#     (напр. bitrix@web01.crm.onelab.kz), а такой домен обычно не резолвится, и релей
+#     с проверкой отправителя (cPanel senderverify, verify=sender) режет письмо
+#     на RCPT TO: "550 Sender verify failed". Затрагивается только конверт —
+#     заголовок From: приложения сохраняется (sender_canonical_classes).
 #   • alternatives mta → postfix; php.d drop-in zz-bcm-mail.ini (sendmail_path → postfix)
 #   • enable --now postfix; restart httpd (mod_php перечитывает sendmail_path)
 #
@@ -57,6 +62,15 @@ _m_postfix_sendmail() {
 
 _m_require_root() { [[ "$(id -u)" -eq 0 ]] || { _m_err "нужен root."; exit 1; }; }
 
+# Нормализовать значение в имя хоста для HELO: если задан адрес (user@dom) — берём dom.
+# smtp_helo_name обязан быть FQDN (RFC 5321); адрес там ломает HELO у строгих релеев.
+_m_helo_from() {
+    local v="${1:-}"
+    v="${v##*@}"
+    [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]] || v=""
+    echo "$v"
+}
+
 # ──── --configure ────────────────────────────────────────────────────────────
 _mail_configure() {
     _m_require_root
@@ -84,7 +98,15 @@ _mail_configure() {
         rpm -q cyrus-sasl-plain >/dev/null 2>&1 || dnf -y install cyrus-sasl-plain >/dev/null 2>&1 || true
     fi
 
-    helo="$from_dom"; [[ -z "$helo" ]] && helo="$(hostname -f 2>/dev/null || hostname)"
+    helo=$(_m_helo_from "$from_dom")
+    [[ -z "$helo" ]] && helo="$(hostname -f 2>/dev/null || hostname)"
+
+    # envelope-from обязателен. Пусто → берём RELAY_USER: он заведомо существует
+    # на релее (под ним же идёт SASL-auth), значит пройдёт verify=sender и SPF.
+    if [[ -z "$from_addr" ]]; then
+        from_addr="$user"
+        _m_info "→ FROM_ADDRESS не задан — envelope-from берём из RELAY_USER (${from_addr})."
+    fi
 
     _m_info "→ postconf (relayhost=[${host}]:${port}, TLS=${tls})..."
     postconf -e \
@@ -114,16 +136,17 @@ _mail_configure() {
     postmap "$SASL_PASSWD" || { _m_err "postmap sasl_passwd не удался."; exit 1; }
     chmod 600 "${SASL_PASSWD}.db" 2>/dev/null || true
 
-    # Опционально: переписать envelope-from (Return-Path) на единый адрес → SPF-alignment
-    if [[ -n "$from_addr" ]]; then
-        postconf -e "sender_canonical_maps = regexp:${SENDER_CANON}"
-        printf '/.+/    %s\n' "$from_addr" > "$SENDER_CANON"
-        chmod 644 "$SENDER_CANON"
-        _m_info "→ envelope-from будет переписан на ${from_addr}."
-    else
-        postconf -e "sender_canonical_maps =" 2>/dev/null || true
-        rm -f "$SENDER_CANON" 2>/dev/null || true
-    fi
+    # Переписать envelope-from (Return-Path) на единый адрес → verify=sender + SPF-alignment.
+    # sender_canonical_classes ограничиваем конвертом: дефолт "envelope_sender, header_sender"
+    # переписал бы и заголовок From:, а Bitrix ставит там адрес конкретного ящика
+    # (b24sales@…, sales@… и т.д.) — его затирать нельзя.
+    postconf -e \
+        "sender_canonical_classes = envelope_sender" \
+        "sender_canonical_maps = regexp:${SENDER_CANON}" \
+        || { _m_err "postconf -e (sender_canonical) не удался."; exit 1; }
+    printf '/.+/    %s\n' "$from_addr" > "$SENDER_CANON"
+    chmod 644 "$SENDER_CANON"
+    _m_info "→ envelope-from переписывается на ${from_addr} (заголовок From: не трогаем)."
 
     systemctl enable postfix >/dev/null 2>&1 || true
     if systemctl is-active --quiet postfix; then
@@ -154,7 +177,23 @@ _mail_status() {
     tls=$(postconf -h smtp_tls_security_level 2>/dev/null || echo "—")
     sm=$(php -r 'echo ini_get("sendmail_path");' 2>/dev/null || echo "?")
     qn=$(mailq 2>/dev/null | grep -c '^[A-F0-9]' 2>/dev/null); [[ "$qn" =~ ^[0-9]+$ ]] || qn=0
+    local canon canon_cls
+    canon=$(postconf -h sender_canonical_maps 2>/dev/null || echo "")
+    canon_cls=$(postconf -h sender_canonical_classes 2>/dev/null || echo "")
     echo "postfix=${act} relayhost=${relay} tls=${tls} queue=${qn}"
+    if [[ -z "$canon" ]]; then
+        echo "envelope-from=НЕ переписывается (<систюзер>@$(postconf -h myhostname 2>/dev/null)) ⚠ релей с verify=sender отобьёт письма"
+    else
+        # Значение достаём по ТИПУ карты: BCM пишет regexp-файл, но оператор мог
+        # поставить static: руками (так чинили инцидент 09.09 до патча) — читать
+        # в этом случае $SENDER_CANON бессмысленно, файла нет, и строка выходила пустой.
+        local canon_val=""
+        case "$canon" in
+            static:*)                    canon_val="${canon#static:}" ;;
+            regexp:*|hash:*|texthash:*)  canon_val=$(sed -n 's|^/\.+/[[:space:]]*||p' "${canon#*:}" 2>/dev/null | head -1) ;;
+        esac
+        echo "envelope-from=${canon_val:-?} (${canon}, classes=${canon_cls})"
+    fi
     echo "sendmail_path=${sm}"
     if [[ -r /var/log/maillog ]]; then
         echo "-- последние записи maillog --"
@@ -167,7 +206,17 @@ _mail_test() {
     local to="$1"
     [[ -z "$to" ]] && { _m_err "укажите адрес получателя."; exit 1; }
     local from_addr; from_addr=$(_m_env FROM_ADDRESS)
-    [[ -z "$from_addr" ]] && from_addr="bcm-test@$(_m_env FROM_DOMAIN 2>/dev/null || hostname -f 2>/dev/null || hostname)"
+    # Fallback-цепочка: RELAY_USER → bcm-test@<нормализованный FROM_DOMAIN> → bcm-test@<FQDN>.
+    # Раньше здесь клеилось "bcm-test@" + FROM_DOMAIN без нормализации: при FROM_DOMAIN
+    # вида 'crm@onelab.kz' получался невалидный 'bcm-test@crm@onelab.kz'.
+    if [[ -z "$from_addr" ]]; then
+        from_addr=$(_m_env RELAY_USER)
+    fi
+    if [[ -z "$from_addr" ]]; then
+        local _d; _d=$(_m_helo_from "$(_m_env FROM_DOMAIN)")
+        [[ -z "$_d" ]] && _d="$(hostname -f 2>/dev/null || hostname)"
+        from_addr="bcm-test@${_d}"
+    fi
     local pf_sm; pf_sm=$(_m_postfix_sendmail)
     # ⚠️ MIME-заголовки обязательны: тело на кириллице (UTF-8). Без charset=UTF-8 клиент
     # читает байты как Latin-1 → мохибейк (Subject ASCII — без encoded-word достаточно).
