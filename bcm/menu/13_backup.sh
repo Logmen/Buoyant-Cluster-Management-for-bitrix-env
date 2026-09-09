@@ -35,7 +35,7 @@ bcm_load_topology
 _bk_setup_nfs() {
     bcm_section_header "Хранилище резервных копий на NFS"
 
-    local srv exp mnt sub ret
+    local srv exp mnt sub ret retw retm
     read -r -p "  Сервер NFS (хост или IP, 0 — отмена): " srv
     [[ "$srv" == "0" || -z "$srv" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
     read -r -p "  Экспортируемый путь (напр. /export/backup): " exp
@@ -45,9 +45,18 @@ _bk_setup_nfs() {
     [[ -z "$mnt" ]] && mnt="/mnt/bcm-backup"
     read -r -p "  Подкаталог под этот кластер (пусто — корень экспорта): " sub
     [[ "$sub" == "0" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
-    read -r -p "  Хранить копий, дней [14]: " ret
-    [[ "$ret" == "0" ]] && { bcm_info "Отменено."; bcm_any_key; return; }
-    [[ -z "$ret" ]] && ret=14
+    read -r -p "  Хранить ежедневных копий, дней [7]: " ret
+    [[ -z "$ret" ]] && ret=7
+    # ⚠️ Здесь 0 — это не «отмена», а «уровень выключен»: схема «дед-отец-сын»
+    # набирается из трёх независимых сроков, и любой из них может быть нулевым.
+    read -r -p "  Сверх них — еженедельных копий, недель [4, 0 — не хранить]: " retw
+    [[ -z "$retw" ]] && retw=4
+    read -r -p "  Сверх них — ежемесячных копий, месяцев [12, 0 — не хранить]: " retm
+    [[ -z "$retm" ]] && retm=12
+    if ! [[ "$ret" =~ ^[0-9]+$ && "$retw" =~ ^[0-9]+$ && "$retm" =~ ^[0-9]+$ ]] || [[ "$ret" -lt 1 ]]; then
+        bcm_error "Сроки задаются целыми числами, ежедневных — не меньше одного дня."
+        bcm_any_key; return
+    fi
 
     echo
     bcm_info "Проверяю доступность экспорта с этой ноды..."
@@ -80,6 +89,8 @@ _bk_setup_nfs() {
     bcm_conf_set backup nfs_mount "$mnt"
     bcm_conf_set backup nfs_subdir "$sub"
     bcm_conf_set backup retention_days "$ret"
+    bcm_conf_set backup retention_weeks "$retw"
+    bcm_conf_set backup retention_months "$retm"
 
     bcm_info "Параметры записаны в cluster.conf."
     bcm_conf_sync 2>/dev/null || true
@@ -177,6 +188,18 @@ _bk_mc() {
 # это mc и префикс алиаса, на NFS — обычный путь на смонтированном хранилище.
 # Без этого меню после настройки NFS показывало пустой статус и выдавало команды
 # восстановления к несуществующему бакету.
+# Человекочитаемая политика хранения: на nfs может быть «дед-отец-сын», на s3 —
+# только срок жизни объекта (его применяет lifecycle бакета).
+_bk_policy_str() {
+    local w m
+    w="$(bcm_bk_retention_weeks)"; m="$(bcm_bk_retention_months)"
+    if [[ "$BK_TARGET" == "nfs" && ( "$w" -gt 0 || "$m" -gt 0 ) ]]; then
+        printf '%sд / %sнед / %sмес' "$BK_RETENTION" "$w" "$m"
+    else
+        printf '%sд' "$BK_RETENTION"
+    fi
+}
+
 _bk_store_root() {
     if [[ "$BK_TARGET" == "s3" ]]; then
         printf 'bcmbk/%s' "$BK_BUCKET"
@@ -208,7 +231,7 @@ _bk_store_du() {
 
 # ──── 1. Статус ──────────────────────────────────────────────────────────────
 _bk_show_status() {
-    bcm_section_header "Бэкапы: статус ($([[ "$BK_TARGET" == "s3" ]] && echo "бакет ${BK_BUCKET}" || echo "каталог $(_bk_store_root)"), retention ${BK_RETENTION}д)"
+    bcm_section_header "Бэкапы: статус ($([[ "$BK_TARGET" == "s3" ]] && echo "бакет ${BK_BUCKET}" || echo "каталог $(_bk_store_root)"), хранение $(_bk_policy_str))"
 
     bcm_color "WHITE" "  ── Конфиги нод (conf/<нода>/, шифрованные) ──"
     local node line

@@ -36,6 +36,11 @@ bcm_bk_target() {
 
 bcm_bk_bucket()    { local v; v="$(bcm_bk_get bucket)";         echo "${v:-bitrix-backups}"; }
 bcm_bk_retention() { local v; v="$(bcm_bk_get retention_days)"; echo "${v:-14}"; }
+# Схема «дед-отец-сын» сверх ежедневных копий — только для цели nfs: на S3 сроком
+# хранения распоряжается lifecycle бакета, а он умеет лишь «удалить старше N дней».
+# 0 = уровень выключен, и политика вырождается в прежнюю «хранить N дней».
+bcm_bk_retention_weeks()  { local v; v="$(bcm_bk_get retention_weeks)";  echo "${v:-0}"; }
+bcm_bk_retention_months() { local v; v="$(bcm_bk_get retention_months)"; echo "${v:-0}"; }
 
 # ⚠️ Креды копий: [backup] ПЕРЕКРЫВАЕТ [s3_upload]. Отдельные ключи — не
 # паранойя, а норма у провайдеров: политика скоупится на ОДИН бакет (s3:* только
@@ -229,6 +234,8 @@ bcm_bk_deploy() {
 
     local bucket ret enc ep ak sk
     bucket="$(bcm_bk_bucket)"; ret="$(bcm_bk_retention)"; enc="$(bcm_bk_get enc_key)"
+    local retw retm
+    retw="$(bcm_bk_retention_weeks)"; retm="$(bcm_bk_retention_months)"
     ep="$(bcm_bk_s3_endpoint)"; ak="$(bcm_bk_s3_access)"; sk="$(bcm_bk_s3_secret)"
     local nfs_server nfs_export nfs_mount nfs_subdir
     nfs_server="$(bcm_bk_get nfs_server)"; nfs_export="$(bcm_bk_get nfs_export)"
@@ -246,6 +253,11 @@ bcm_bk_deploy() {
     fi
 
     bcm_info "Цель: ${target}$([[ "$target" == s3 ]] && echo " ${bucket} @ ${ep}" || echo " ${nfs_server}:${nfs_export}")"
+    if [[ "$target" == "nfs" && ( "$retw" -gt 0 || "$retm" -gt 0 ) ]]; then
+        bcm_info "Хранение: ${ret} ежедневных, ${retw} еженедельных, ${retm} ежемесячных."
+    else
+        bcm_info "Хранение: ${ret} дней."
+    fi
     bcm_info "На ноды уедут: backup.env (0600), юниты и таймеры bcm-backup-*."
     bcm_confirm "Продолжить?" || { bcm_info "Отменено."; bcm_any_key; return 1; }
 
@@ -318,6 +330,8 @@ S3_SECRET='${sk_esc}'
 BUCKET='${bucket}'
 ENC_KEY='${enc_esc}'
 RETENTION_DAYS='${ret}'
+RETENTION_WEEKS='${retw}'
+RETENTION_MONTHS='${retm}'
 DB_RANK='${db_rank}'
 DB_STAGGER='180'
 SITE_PATH='/home/bitrix/www'

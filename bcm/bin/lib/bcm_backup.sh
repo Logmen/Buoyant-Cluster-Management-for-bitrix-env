@@ -60,7 +60,11 @@ S3_ACCESS="${S3_ACCESS:-}"
 S3_SECRET="${S3_SECRET:-}"
 BUCKET="${BUCKET:-bitrix-backups}"
 ENC_KEY="${ENC_KEY:-}"                    # ключ шифрования conf-архивов (hex)
-RETENTION_DAYS="${RETENTION_DAYS:-14}"    # фактически применяет lifecycle MinIO
+RETENTION_DAYS="${RETENTION_DAYS:-14}"    # на s3 фактически применяет lifecycle бакета
+# Схема «дед-отец-сын» (только nfs): сверх ежедневных держим по одной копии на
+# неделю и на месяц. 0 отключает уровень — тогда политика прежняя, «N дней».
+RETENTION_WEEKS="${RETENTION_WEEKS:-0}"
+RETENTION_MONTHS="${RETENTION_MONTHS:-0}"
 DB_RANK="${DB_RANK:-0}"                   # порядок PXC-кандидата (реплики раньше writer)
 DB_STAGGER="${DB_STAGGER:-180}"           # сек между слотами кандидатов
 SITE_PATH="${SITE_PATH:-/home/bitrix/www}"
@@ -279,20 +283,91 @@ _bk_mirror_site() {
 }
 
 # Ротация (только NFS: на S3 её делает lifecycle бакета).
+# Отбор копий по схеме «дед-отец-сын». Вход — даты YYYY-MM-DD построчно, выход —
+# те, что сохраняем: все за последние RETENTION_DAYS дней, плюс самая свежая копия
+# каждой ISO-недели в пределах RETENTION_WEEKS недель, плюс самая свежая копия
+# каждого календарного месяца в пределах RETENTION_MONTHS месяцев.
+# ⚠️ Порядок обхода — от свежих к старым: первая встреченная копия недели (месяца)
+# и есть самая свежая в нём. Копии внутри дневного окна недельный якорь НЕ занимают:
+# иначе, выйдя из окна, неделя осталась бы без представителя.
+_bk_gfs_keep() {
+    local days="${1:-14}" weeks="${2:-0}" months="${3:-0}"
+    local cut_d cut_w cut_m d wk mo
+    cut_d=$(date -d "$(( days > 0 ? days - 1 : 0 )) days ago" +%Y-%m-%d)
+    cut_w=$(date -d "${weeks} weeks ago"  +%Y-%m-%d)
+    cut_m=$(date -d "${months} months ago" +%Y-%m-%d)
+    local -A kept_week=() kept_month=()
+    local hold
+    while IFS= read -r d; do
+        [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+        # ⚠️ Регулярка пропускает синтаксически похожее, но несуществующее (2026-13-45):
+        # сверяем с календарём, иначе такой каталог сходил бы за свежую копию и жил вечно.
+        [[ "$(date -d "$d" +%Y-%m-%d 2>/dev/null)" == "$d" ]] || continue
+        hold=0
+        [[ ! "$d" < "$cut_d" ]] && hold=1
+        # ⚠️ Якорь недели (месяца) занимает и та копия, что уже удержана дневным
+        # уровнем: уровни ПЕРЕСЕКАЮТСЯ, а не дополняют друг друга. Иначе свежая
+        # неделя получала бы лишнюю копию сверх дневных, а при выходе дневных из
+        # окна её представителем оставалась бы не самая свежая копия недели.
+        if (( weeks > 0 )) && [[ ! "$d" < "$cut_w" ]]; then
+            wk=$(date -d "$d" +%G-%V 2>/dev/null || true)
+            if [[ -n "$wk" && -z "${kept_week[$wk]:-}" ]]; then kept_week["$wk"]=1; hold=1; fi
+        fi
+        if (( months > 0 )) && [[ ! "$d" < "$cut_m" ]]; then
+            mo="${d%-*}"
+            if [[ -z "${kept_month[$mo]:-}" ]]; then kept_month["$mo"]=1; hold=1; fi
+        fi
+        (( hold )) && echo "$d"
+    done < <(sort -r)
+}
+
 prune() {
     [[ "$BACKUP_TARGET" == "nfs" ]] || { log "prune: цель ${BACKUP_TARGET} чистится сама (lifecycle) — пропуск."; return 0; }
     _require_tools || return 1
     local root; root="$(_nfs_root)"
-    local n=0
-    # conf/db — датированные артефакты, www — датированные каталоги-снимки.
-    while IFS= read -r p; do
-        [[ -z "$p" ]] && continue
-        rm -rf -- "$p" && n=$((n+1))
-    done < <(
-        find "${root}/conf" "${root}/db" -mindepth 1 -maxdepth 2 -mtime "+${RETENTION_DAYS}" -print 2>/dev/null
-        find "${root}/www" -mindepth 1 -maxdepth 1 -type d -mtime "+${RETENTION_DAYS}" -print 2>/dev/null
+
+    # ⚠️ Дату копии берём из ИМЕНИ артефакта, а не из mtime: у снимка www mtime
+    # меняется при каждой раскладке жёстких ссылок, и старый снимок выглядел бы
+    # свежим. Имя каталога (файла) — это DATE_TAG копии, он не меняется никогда.
+    local -a dates=()
+    mapfile -t dates < <(
+        { ls -1 "${root}/db"    2>/dev/null
+          ls -1 "${root}/www"   2>/dev/null
+          ls -1 "${root}/files" 2>/dev/null | sed 's/\.done$//'
+          ls -1 "${root}"/conf/*/ 2>/dev/null | sed 's/\.tar\.gz\.enc$//'
+        } | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort -u
     )
-    log "prune: удалено устаревших копий: ${n} (старше ${RETENTION_DAYS} дней)"
+    if [[ ${#dates[@]} -eq 0 ]]; then
+        log "prune: копий не найдено — чистить нечего."
+        return 0
+    fi
+
+    local -A keep=()
+    local d
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && keep["$d"]=1
+    done < <(printf '%s\n' "${dates[@]}" | _bk_gfs_keep "$RETENTION_DAYS" "$RETENTION_WEEKS" "$RETENTION_MONTHS")
+
+    # ⚠️ Fail-safe: пустой набор «сохранить» при непустом списке копий означает сбой
+    # разбора дат, а не то, что устарело всё. Молча снести весь архив недопустимо.
+    if [[ ${#keep[@]} -eq 0 ]]; then
+        log "prune: ОШИБКА — политика не сохранила ни одной из ${#dates[@]} копий; чистка отменена."
+        return 1
+    fi
+
+    local n=0 p
+    for d in "${dates[@]}"; do
+        [[ -n "${keep[$d]:-}" ]] && continue
+        for p in "${root}/db/${d}" "${root}/www/${d}" "${root}/files/${d}.done" "${root}"/conf/*/"${d}.tar.gz.enc"; do
+            [[ -e "$p" ]] || continue
+            rm -rf -- "$p" && n=$((n+1))
+        done
+    done
+    if [[ "$RETENTION_WEEKS" -gt 0 || "$RETENTION_MONTHS" -gt 0 ]]; then
+        log "prune: политика ${RETENTION_DAYS}д/${RETENTION_WEEKS}нед/${RETENTION_MONTHS}мес — копий сохранено ${#keep[@]} из ${#dates[@]}, удалено объектов ${n}"
+    else
+        log "prune: удалено устаревших копий: ${n} (старше ${RETENTION_DAYS} дней)"
+    fi
 }
 
 # ──── conf: конфиги/состояние этой ноды (шифрованный tar) ────────────────────
