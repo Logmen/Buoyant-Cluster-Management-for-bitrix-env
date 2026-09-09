@@ -67,6 +67,9 @@ SITE_PATH="${SITE_PATH:-/home/bitrix/www}"
 MC_BIN="${MC_BIN:-/usr/local/bin/mc}"     # НЕ /usr/bin/mc (Midnight Commander!)
 LOG_FILE="${LOG_FILE:-/var/log/bcm/backup.log}"
 XB_TMP="${XB_TMP:-/tmp/bcm-xtrabackup}"
+XB_PARALLEL="${XB_PARALLEL:-2}"           # потоки копирования файлов xtrabackup
+XB_GZ_THREADS="${XB_GZ_THREADS:-3}"       # потоки pigz (если установлен); gzip -1 — фолбэк
+XB_LOG_DIR="${XB_LOG_DIR:-/var/log/bcm}"  # вывод xtrabackup — отдельным файлом, не в backup.log
 
 ALIAS="bcmbk"
 DATE_TAG="$(date +%Y-%m-%d)"
@@ -338,8 +341,17 @@ backup_db() {
     [[ "$st" == "Synced" ]] || { log "db: состояние '${st:-нет mysql}' != Synced — пропуск."; return 1; }
 
     local rel="db/${DATE_TAG}/${SELF_NODE}.xbstream.gz"
-    mkdir -p "$XB_TMP"
-    log "db: wsrep_desync=ON, xtrabackup → ${BACKUP_TARGET}:${rel}"
+    mkdir -p "$XB_TMP" "$XB_LOG_DIR"
+    # ⚠️ Вывод xtrabackup (сотни строк за прогон, на боевом узле — тысячи за неделю) —
+    # в СВОЙ файл: backup.log читают по строкам «db: ок» и меню 13, и зонд портала,
+    # чужой шум там мешает и раздувает ротацию.
+    local xb_log="${XB_LOG_DIR}/xtrabackup-${DATE_TAG}.log"
+    # pigz жмёт в несколько потоков тем же форматом gzip: на многоядерном узле копия
+    # снимается в 2–3 раза быстрее при том же размере. Узел на это время в desync,
+    # соседей мы не тормозим. Нет pigz — прежний однопоточный gzip.
+    local -a gz=(gzip -1)
+    command -v pigz >/dev/null 2>&1 && gz=(pigz -1 -p "$XB_GZ_THREADS")
+    log "db: wsrep_desync=ON, xtrabackup → ${BACKUP_TARGET}:${rel} ($(basename "${gz[0]}"), parallel=${XB_PARALLEL})"
     _desync ON || { log "db: не удалось включить desync — стоп."; return 1; }
     # desync ОБЯЗАН сняться при любом исходе (иначе нода навсегда вне flow control)
     trap '_desync OFF' EXIT
@@ -347,18 +359,21 @@ backup_db() {
     local t0=$SECONDS rc=0
     # --galera-info пишет wsrep-позицию (нужна при восстановлении кластера)
     if xtrabackup --backup --stream=xbstream --galera-info \
-            --target-dir="$XB_TMP" 2>>"$LOG_FILE" \
-        | gzip -1 \
+            --parallel="$XB_PARALLEL" \
+            --target-dir="$XB_TMP" 2>>"$xb_log" \
+        | "${gz[@]}" \
         | _bk_put "$rel" 2>>"$LOG_FILE"; then
         printf 'node=%s date=%s duration=%ss\n' "$SELF_NODE" "$DATE_TAG" "$((SECONDS - t0))" \
             | _bk_put "$marker" 2>>"$LOG_FILE"
         log "db: ок за $((SECONDS - t0))с ($(_bk_size "$rel"))"
     else
         rc=1
-        log "db: ОШИБКА xtrabackup/выгрузки (см. ${LOG_FILE}); маркер НЕ ставлю."
+        log "db: ОШИБКА xtrabackup/выгрузки (см. ${xb_log}); маркер НЕ ставлю."
     fi
     _desync OFF; trap - EXIT
     rm -rf "$XB_TMP"
+    # Логи xtrabackup живут не дольше самих копий.
+    find "$XB_LOG_DIR" -maxdepth 1 -name 'xtrabackup-*.log' -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null
     return $rc
 }
 
@@ -378,6 +393,19 @@ backup_files() {
     if [[ "$force" != "--force" ]] && _bk_exists "$marker"; then
         log "files: копия за ${DATE_TAG} уже есть — выход."
         return 0
+    fi
+
+    # ⚠️⚠️ upload/* исключается всегда, но «он уже в S3» верно ЛИШЬ когда файлы
+    # действительно уехали в бакет. При узких FILE_RULES или кластере без хранилища
+    # /upload остаётся на дисках — и тогда это единственное, что не попадает НИ В ОДНУ
+    # копию: зеркало lsyncd не бэкап (удаление разъезжается, шифровальщик доедет до
+    # обеих нод). Молчать об этом нельзя — пишем в лог и в --status.
+    if [[ -d "${SITE_PATH}/upload" ]] && [[ -n "$(find "${SITE_PATH}/upload" -mindepth 2 -type f -print -quit 2>/dev/null)" ]]; then
+        local up_size; up_size=$(du -sh "${SITE_PATH}/upload" 2>/dev/null | cut -f1)
+        log "files: ВНИМАНИЕ — ${SITE_PATH}/upload (${up_size:-?}) лежит на диске и в копию НЕ входит; защищён только зеркалом lsyncd."
+        printf '%s\n' "${up_size:-?}" | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
+    elif _bk_exists "meta/upload_on_disk"; then
+        printf '' | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
     fi
 
     # Исключения = списку lsyncd (кэш per-node, /upload уже в S3).
@@ -413,6 +441,8 @@ status() {
     # Размер копии кода — из кэша, записанного последним backup_files (одно GET),
     # а не пересчётом: --status зовёт зонд портала раз в минуту.
     echo "www_size|$(_bk_cat "meta/www_size" | tr -d '[:space:]')"
+    # Непустое значение = /upload лежит на дисках узлов и вне копий (см. backup_files).
+    echo "upload_on_disk|$(_bk_cat "meta/upload_on_disk" | tr -d '[:space:]')"
     return 0
 }
 
