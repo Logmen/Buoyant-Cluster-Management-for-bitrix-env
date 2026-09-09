@@ -148,7 +148,9 @@ bcm_mod_run() {
     local name="$1" hook="$2"; shift 2
     local dir; dir="$(bcm_mod_dir "$name")" || return 1
     local f="${dir}/hooks/${hook}"
-    [[ -x "$f" ]] || { [[ -f "$f" ]] && bash "$f" "$@"; return $?; }
+    # Хука нет — делать нечего, это не ошибка (модуль объявляет только нужные ему).
+    [[ -e "$f" ]] || return 0
+    [[ -x "$f" ]] || { bash "$f" "$@"; return $?; }
     BCM_MODULE_NAME="$name" BCM_MODULE_DIR="$dir" \
     BCM_MODULE_ROLE="${BCM_MODULE_ROLE:-$(bcm_get_current_role 2>/dev/null || echo unknown)}" \
     BCM_CONF_FILE="${BCM_CONF_FILE:-/etc/bitrix-cluster/cluster.conf}" \
@@ -311,9 +313,14 @@ bcm_mod_deploy() {
             bcm_error "  ${node}: нет rsync на brain-ноде."; fail=$((fail+1)); continue
         fi
         bcm_ssh_exec "$ip" "chmod +x ${BCM_MODULES_DIR}/${name}/hooks/* ${BCM_MODULES_DIR}/${name}/*.sh 2>/dev/null; true" </dev/null >/dev/null 2>&1
+        # ⚠️⚠️ Присваивания окружения ставим ПЕРЕД САМИМ хуком, а не перед `[ -x … ]`:
+        # в конструкции `VAR=x [ -x f ] && f` переменные достаются команде test, а
+        # хук запускается уже без них. Ловили вживую: install-хук получал пустой
+        # BCM_MODULE_ROLE, падал в ветку «для этой роли ничего не ставим» и НИЧЕГО
+        # не делал, а раскатка при этом рапортовала успех.
+        local hook="${BCM_MODULES_DIR}/${name}/hooks/install"
         if bcm_ssh_exec_timeout "$ip" 600 \
-            "BCM_MODULE_NAME='${name}' BCM_MODULE_DIR='${BCM_MODULES_DIR}/${name}' BCM_MODULE_ROLE='${layer}' \
-             [ -x ${BCM_MODULES_DIR}/${name}/hooks/install ] && ${BCM_MODULES_DIR}/${name}/hooks/install || true" </dev/null >/dev/null 2>&1; then
+            "[ -x '${hook}' ] || exit 0; BCM_MODULE_NAME='${name}' BCM_MODULE_DIR='${BCM_MODULES_DIR}/${name}' BCM_MODULE_ROLE='${layer}' '${hook}'" </dev/null >/dev/null 2>&1; then
             bcm_ok "  ${node} (${layer}): модуль раскатан."; ok=$((ok+1))
         else
             bcm_warn "  ${node} (${layer}): install-хук вернул ошибку (см. модуль)."; fail=$((fail+1))
