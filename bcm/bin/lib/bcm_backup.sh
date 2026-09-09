@@ -139,6 +139,19 @@ _nfs_setup() {
 # Корень хранилища для NFS: точка монтирования + необязательный подкаталог.
 _nfs_root() { printf '%s' "${NFS_MOUNT}${NFS_SUBDIR:+/$NFS_SUBDIR}"; }
 
+# ⚠️ Умеет ли экспорт менять владельца — проверяем делом, как и запись выше.
+# Сетевые хранилища обычно сквошат root (root_squash/all_squash): файлы создаются
+# под фиксированным uid, а chown запрещён. `rsync -a` владельца переносит ВСЕГДА,
+# поэтому на таком экспорте он возвращает 23 при фактически скопированном дереве —
+# и копия ночь за ночью считалась бы неуспешной (маркер не выставляется).
+_nfs_can_chown() {
+    local probe="${1}/.bcm-chown-probe.$$" rc=1
+    ( : > "$probe" ) 2>/dev/null || return 1
+    chown 0:0 "$probe" 2>/dev/null && rc=0
+    rm -f "$probe"
+    return $rc
+}
+
 _require_tools() {
     case "$BACKUP_TARGET" in
         s3)
@@ -257,7 +270,11 @@ _bk_mirror_site() {
         for e in "${ex[@]}"; do rex+=(--exclude "$e"); done
         local -a link=()
         [[ -n "$prev" ]] && link=(--link-dest="../${prev}")
-        rsync -a --delete "${rex[@]}" "${link[@]}" "${src}/" "${dst}/" 2>>"$LOG_FILE"
+        # Где владельца сменить нельзя — переносим без него: права, время и симлинки
+        # сохраняются, владельца выставляет восстановление (chown -R bitrix:bitrix).
+        local -a own=()
+        _nfs_can_chown "$root" || own=(--no-owner --no-group)
+        rsync -a "${own[@]}" --delete "${rex[@]}" "${link[@]}" "${src}/" "${dst}/" 2>>"$LOG_FILE"
     fi
 }
 

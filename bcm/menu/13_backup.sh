@@ -173,23 +173,64 @@ _bk_mc() {
     /usr/local/bin/mc --quiet "$@"
 }
 
+# ⚠️ Всё, что показывает и восстанавливает копии, обязано ветвиться по цели: на S3
+# это mc и префикс алиаса, на NFS — обычный путь на смонтированном хранилище.
+# Без этого меню после настройки NFS показывало пустой статус и выдавало команды
+# восстановления к несуществующему бакету.
+_bk_store_root() {
+    if [[ "$BK_TARGET" == "s3" ]]; then
+        printf 'bcmbk/%s' "$BK_BUCKET"
+    else
+        local m s
+        m="$(bcm_bk_get nfs_mount)"; s="$(bcm_bk_get nfs_subdir)"
+        printf '%s%s' "${m:-/mnt/bcm-backup}" "${s:+/$s}"
+    fi
+}
+
+# Содержимое каталога хранилища (путь — относительно его корня).
+_bk_store_ls() {
+    if [[ "$BK_TARGET" == "s3" ]]; then
+        _bk_mc ls "$(_bk_store_root)/$1" 2>/dev/null
+    else
+        ls -lh --time-style=long-iso "$(_bk_store_root)/$1" 2>/dev/null \
+            | tail -n +2 | awk '{printf "%s %s  %6s  %s\n", $6, $7, $5, $8}'
+    fi
+}
+
+# Объём каталога хранилища.
+_bk_store_du() {
+    if [[ "$BK_TARGET" == "s3" ]]; then
+        _bk_mc du "$(_bk_store_root)/$1" 2>/dev/null
+    else
+        du -sh "$(_bk_store_root)/$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
 # ──── 1. Статус ──────────────────────────────────────────────────────────────
 _bk_show_status() {
-    bcm_section_header "Бэкапы: статус (бакет ${BK_BUCKET}, retention ${BK_RETENTION}д)"
+    bcm_section_header "Бэкапы: статус ($([[ "$BK_TARGET" == "s3" ]] && echo "бакет ${BK_BUCKET}" || echo "каталог $(_bk_store_root)"), retention ${BK_RETENTION}д)"
 
     bcm_color "WHITE" "  ── Конфиги нод (conf/<нода>/, шифрованные) ──"
     local node line
     for node in "${!BCM_NODE_IP[@]}"; do
-        line=$(_bk_mc ls "bcmbk/${BK_BUCKET}/conf/${node}/" 2>/dev/null | tail -1 | tr -s ' ' || true)
+        line=$(_bk_store_ls "conf/${node}/" | tail -1 | tr -s ' ' || true)
         printf "    %-8s %s\n" "$node" "${line:-(нет копий)}"
     done
     echo
     bcm_color "WHITE" "  ── БД (db/<дата>/) ──"
-    _bk_mc ls "bcmbk/${BK_BUCKET}/db/" 2>/dev/null | tail -5 | sed 's/^/    /' || echo "    (нет копий)"
+    _bk_store_ls "db/" | tail -5 | sed 's/^/    /' || echo "    (нет копий)"
     echo
-    bcm_color "WHITE" "  ── Файлы портала (www/, история — versioning) ──"
-    _bk_mc du "bcmbk/${BK_BUCKET}/www" 2>/dev/null | sed 's/^/    объём: /' || echo "    (нет копий)"
-    _bk_mc ls "bcmbk/${BK_BUCKET}/files/" 2>/dev/null | tail -3 | sed 's/^/    маркер: /' || true
+    # История файлов устроена по-разному: на S3 это версии объектов в одном префиксе,
+    # на NFS — датированные снимки www/<дата> (разница между ними ужата жёсткими ссылками).
+    if [[ "$BK_TARGET" == "s3" ]]; then
+        bcm_color "WHITE" "  ── Файлы портала (www/, история — versioning) ──"
+        _bk_store_du "www" | sed 's/^/    объём: /' || echo "    (нет копий)"
+    else
+        bcm_color "WHITE" "  ── Файлы портала (www/<дата>/, история — снимки) ──"
+        _bk_store_du "www" | sed 's/^/    объём всех снимков: /' || echo "    (нет копий)"
+        _bk_store_ls "www/" | tail -5 | sed 's/^/    снимок: /' || true
+    fi
+    _bk_store_ls "files/" | tail -3 | sed 's/^/    маркер: /' || true
     echo
     bcm_color "WHITE" "  ── Таймеры по нодам ──"
     for node in "${!BCM_NODE_IP[@]}"; do
@@ -247,8 +288,17 @@ _bk_run_files() {
         [[ -z "$ip" ]] && continue
         if bcm_ssh_exec_timeout "$ip" 8 "systemctl is-active lsyncd" 2>/dev/null | grep -q active; then
             bcm_info "  Источник lsyncd: ${node} — запускаю mirror..."
-            bcm_ssh_exec_timeout "$ip" 1800 "${BK_LIB} --files --force" 2>&1 | tail -2 | sed 's/^/    /'
-            bcm_ok "  Готово."
+            # ⚠️ Результат берём у исполнителя, а не печатаем «Готово» безусловно:
+            # частичный сбой (rsync с кодом 23, недописанный маркер) выглядел бы
+            # успехом, и о нерабочей копии узнали бы только при восстановлении.
+            local out rc
+            out=$(bcm_ssh_exec_timeout "$ip" 1800 "${BK_LIB} --files --force" 2>&1); rc=$?
+            echo "$out" | tail -2 | sed 's/^/    /'
+            if [[ $rc -eq 0 ]]; then
+                bcm_ok "  Готово."
+            else
+                bcm_error "  ${node}: копия файлов не удалась (код ${rc}) — см. /var/log/bcm/backup.log."
+            fi
             bcm_any_key; return
         fi
     done
@@ -260,28 +310,54 @@ _bk_run_files() {
 _bk_restore_help() {
     bcm_section_header "Восстановление из бэкапа"
     bcm_warn "Восстановление — ручная операция по процедуре. Команды ниже — готовые к копированию."
+    local root; root="$(_bk_store_root)"
     echo
-    bcm_color "WHITE" "  ── Конфиги ноды (расшифровать архив) ──"
-    bcm_info '  enc_key — в cluster.conf [backup]; выполнять на ноде:'
-    echo "    /usr/local/bin/mc cp bcmbk/${BK_BUCKET}/conf/<нода>/<дата>.tar.gz.enc /root/"
-    echo "    openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:<enc_key> -in /root/<дата>.tar.gz.enc | tar -tzv   # просмотр"
-    echo "    ... | tar -xz -C /   # восстановить (ОСТОРОЖНО: поверх текущих)"
-    echo
-    bcm_color "WHITE" "  ── Файл портала из истории версий www/ ──"
-    echo "    /usr/local/bin/mc ls --versions bcmbk/${BK_BUCKET}/www/<путь>     # список версий"
-    echo "    /usr/local/bin/mc cp --version-id <id> bcmbk/${BK_BUCKET}/www/<путь> /root/"
-    echo
-    bcm_color "WHITE" "  ── БД (DR: развернуть кластер из копии) ──"
-    bcm_info "  На чистой PXC-ноде (или все лежат — на будущем writer'е):"
-    echo "    systemctl stop mysql; rm -rf /var/lib/mysql/*"
-    echo "    /usr/local/bin/mc cat bcmbk/${BK_BUCKET}/db/<дата>/<нода>.xbstream.gz | gunzip | xbstream -x -C /var/lib/mysql"
+
+    if [[ "$BK_TARGET" == "s3" ]]; then
+        bcm_color "WHITE" "  ── Конфиги ноды (расшифровать архив) ──"
+        bcm_info '  enc_key — в cluster.conf [backup]; выполнять на ноде:'
+        echo "    /usr/local/bin/mc cp ${root}/conf/<нода>/<дата>.tar.gz.enc /root/"
+        echo "    openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:<enc_key> -in /root/<дата>.tar.gz.enc | tar -tzv   # просмотр"
+        echo "    ... | tar -xz -C /   # восстановить (ОСТОРОЖНО: поверх текущих)"
+        echo
+        bcm_color "WHITE" "  ── Файл портала из истории версий www/ ──"
+        echo "    /usr/local/bin/mc ls --versions ${root}/www/<путь>     # список версий"
+        echo "    /usr/local/bin/mc cp --version-id <id> ${root}/www/<путь> /root/"
+        echo
+        bcm_color "WHITE" "  ── БД (DR: развернуть кластер из копии) ──"
+        bcm_info "  На чистой PXC-ноде (или все лежат — на будущем writer'е):"
+        echo "    systemctl stop mysql; rm -rf /var/lib/mysql/*"
+        echo "    /usr/local/bin/mc cat ${root}/db/<дата>/<нода>.xbstream.gz | gunzip | xbstream -x -C /var/lib/mysql"
+    else
+        bcm_info "  Хранилище смонтировано на каждой ноде: ${root} — копии читаются как обычные файлы."
+        echo
+        bcm_color "WHITE" "  ── Конфиги ноды (расшифровать архив) ──"
+        bcm_info '  enc_key — в cluster.conf [backup]; выполнять на ноде:'
+        echo "    ls ${root}/conf/<нода>/"
+        echo "    openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:<enc_key> -in ${root}/conf/<нода>/<дата>.tar.gz.enc | tar -tzv   # просмотр"
+        echo "    ... | tar -xz -C /   # восстановить (ОСТОРОЖНО: поверх текущих)"
+        echo
+        bcm_color "WHITE" "  ── Файлы портала из снимка www/<дата>/ ──"
+        bcm_info "  История здесь — датированные снимки (versioning'а нет), разница ужата жёсткими ссылками:"
+        echo "    ls ${root}/www/                                  # доступные снимки"
+        echo "    cp -a ${root}/www/<дата>/<путь> /home/bitrix/www/<путь>          # один файл"
+        echo "    rsync -a ${root}/www/<дата>/ /home/bitrix/www/                    # дерево целиком"
+        bcm_warn "  После восстановления обязательно вернуть владельца: chown -R bitrix:bitrix <путь>"
+        bcm_info "  Сетевое хранилище обычно сквошит root, поэтому владелец в копии не сохраняется."
+        echo
+        bcm_color "WHITE" "  ── БД (DR: развернуть кластер из копии) ──"
+        bcm_info "  На чистой PXC-ноде (или все лежат — на будущем writer'е):"
+        echo "    systemctl stop mysql; rm -rf /var/lib/mysql/*"
+        echo "    gunzip < ${root}/db/<дата>/<нода>.xbstream.gz | xbstream -x -C /var/lib/mysql"
+    fi
+
     echo "    xtrabackup --prepare --target-dir=/var/lib/mysql"
     echo "    chown -R mysql:mysql /var/lib/mysql"
     echo "    # выставить safe_to_bootstrap:1 в grastate.dat и: systemctl start mysql@bootstrap"
     echo "    # остальные ноды: rm -rf /var/lib/mysql/* && systemctl start mysql  (придут по SST)"
     echo
     bcm_info "  Доступные копии БД:"
-    _bk_mc ls "bcmbk/${BK_BUCKET}/db/" 2>/dev/null | tail -7 | sed 's/^/    /' || echo "    (нет)"
+    _bk_store_ls "db/" | tail -7 | sed 's/^/    /' || echo "    (нет)"
     bcm_any_key
 }
 
