@@ -2102,6 +2102,21 @@ EOF
         # задублируются. Раз в 10 минут переприменяем сохранённую VRRP-роль.
         bcm_ssh_exec_logged "$name" "$ip" "printf '*/10 * * * * root /opt/bcm/bin/lib/cron_notify.sh assert >/dev/null 2>&1\n' > /etc/cron.d/bcm-ha-cron-guard && chmod 644 /etc/cron.d/bcm-ha-cron-guard"
 
+        # Guard ролей redis: роль (master/replica) задаётся ТОЛЬКО командой в момент
+        # перехода VRRP и нигде не закреплена — в конфигах инстансов replicaof нет.
+        # Рестарт redis или пропущенный notify оставляют узел standalone-мастером с
+        # пустой базой, а keepalived без смены состояния команду не повторит: при
+        # следующем переезде VIP сессии пропадут целиком (ловили вживую — реплика
+        # три недели стояла мастером с 0 ключей). Раз в 10 минут сверяем роль с тем,
+        # кто фактически держит VIP. Строка ставится под каждый заданный инстанс.
+        local _rg=""
+        [[ -n "$SESSION_VIP" ]]     && _rg+="*/10 * * * * root /opt/bcm/bin/lib/redis_session_notify.sh ASSERT ${SESSION_VIP} ${SESSION_REDIS_PORT:-6380} noeviction >/dev/null 2>&1\n"
+        [[ -n "$PUSH_REDIS_VIP" ]]  && _rg+="*/10 * * * * root /opt/bcm/bin/lib/redis_session_notify.sh ASSERT ${PUSH_REDIS_VIP} ${PUSH_REDIS_PORT:-6381} allkeys-lru >/dev/null 2>&1\n"
+        [[ -n "$CACHE_REDIS_VIP" ]] && _rg+="*/10 * * * * root /opt/bcm/bin/lib/redis_session_notify.sh ASSERT ${CACHE_REDIS_VIP} ${CACHE_REDIS_PORT:-6382} allkeys-lru >/dev/null 2>&1\n"
+        if [[ -n "$_rg" ]]; then
+            bcm_ssh_exec_logged "$name" "$ip" "printf '%b' '${_rg}' > /etc/cron.d/bcm-redis-role-guard && chmod 644 /etc/cron.d/bcm-redis-role-guard"
+        fi
+
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable proxysql keepalived && systemctl restart proxysql keepalived"
     done
     rm -f "${local_proxysql_cfg:-}" "${local_keepalived_web:-}" 2>/dev/null
@@ -2576,8 +2591,11 @@ configure_local_logrotate() {
 
     mkdir -p "$NODE_LOGS_DIR" "/var/log/bcm"
 
+    # ⚠️ Только /bcm/logs (журналы установки). /var/log/bcm описывает bcm-node на
+    # каждой ноде, включая эту: один и тот же файл в двух наборах logrotate считает
+    # дублем и с ошибкой пропускает ВЕСЬ набор — ротация тихо переставала работать.
     cat << 'EOF' > /etc/logrotate.d/bcm-install
-/bcm/logs/*.log /var/log/bcm/*.log {
+/bcm/logs/*.log {
     daily
     rotate 5
     size 50M
@@ -2720,8 +2738,8 @@ EOF
             # HAProxy, Keepalived
             cat << 'EOF' >> "$lr_cfg"
 
-# HAProxy & Keepalived
-/var/log/haproxy.log /var/log/keepalived.log {
+# Keepalived (у haproxy есть собственный конфиг пакета — не дублируем)
+/var/log/keepalived.log {
     daily
     rotate 4
     size 50M
@@ -2733,21 +2751,12 @@ EOF
 }
 EOF
         elif [[ "$role" == "web" ]]; then
-            # Nginx, Apache (httpd), ProxySQL, lsyncd
-            cat << 'EOF' >> "$lr_cfg"
-
-# Nginx, Apache (httpd), ProxySQL, lsyncd
-/var/log/nginx/*.log /var/log/httpd/*.log /var/log/proxysql/*.log /var/lib/proxysql/proxysql.log /var/log/lsyncd/*.log {
-    daily
-    rotate 4
-    size 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
+            # ⚠️ Своего блока для nginx, httpd, proxysql и lsyncd здесь НЕТ намеренно:
+            # у каждого из них есть конфиг от своего пакета, а один и тот же файл в
+            # двух наборах logrotate считает дублем — и пропускает ОБА набора целиком
+            # (ловили вживую: haproxy.log и proxysql.log не ротировались вообще).
+            # Инвариант тот же, что для MySQL ниже: BCM описывает только те логи,
+            # которые заводит сам. Каталоги создаём — сервисы пишут в них с первого дня.
             bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd"
         elif [[ "$role" == "pxc" ]]; then
             # Блока для /var/log/mysql здесь НЕТ намеренно: error.log и slow.log
