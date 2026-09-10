@@ -64,6 +64,8 @@ RETENTION_DAYS="${RETENTION_DAYS:-14}"    # на s3 фактически при�
 # Схема «дед-отец-сын» (только nfs): сверх ежедневных держим по одной копии на
 # неделю и на месяц. 0 отключает уровень — тогда политика прежняя, «N дней».
 RETENTION_WEEKS="${RETENTION_WEEKS:-0}"
+# Включать ли /upload в копию файлов. off — прежнее поведение «он в облаке».
+INCLUDE_UPLOAD="${INCLUDE_UPLOAD:-auto}"
 RETENTION_MONTHS="${RETENTION_MONTHS:-0}"
 DB_RANK="${DB_RANK:-0}"                   # порядок PXC-кандидата (реплики раньше writer)
 DB_STAGGER="${DB_STAGGER:-180}"           # сек между слотами кандидатов
@@ -138,6 +140,20 @@ _nfs_setup() {
     fi
     rm -f "$probe"
     return 0
+}
+
+# ⚠️ /upload по умолчанию ВХОДИТ в копию. «Он уже в облаке» верно лишь для файлов,
+# попавших под FILE_RULES бакета: статика модулей, файлы, залитые до подключения
+# хранилища, и всё содержимое кластера без S3 остаются на дисках. Замеры на живых
+# кластерах: 19 МБ статики там, где облако работает, и 807 МБ (из них 595 МБ файлов
+# Диска) там, где правила бакета оказались уже, чем предполагалось. Зеркало между
+# web-нодами это не закрывает: удаление и шифровальщик доедут до обеих копий.
+# off оставляет прежнее поведение — для тех, кто бэкапит бакет отдельными средствами.
+_bk_include_upload() {
+    case "${INCLUDE_UPLOAD:-auto}" in
+        off|no|0|false) echo no ;;
+        *)              echo yes ;;
+    esac
 }
 
 # Корень хранилища для NFS: точка монтирования + необязательный подкаталог.
@@ -492,10 +508,16 @@ backup_files() {
     # /upload остаётся на дисках — и тогда это единственное, что не попадает НИ В ОДНУ
     # копию: зеркало lsyncd не бэкап (удаление разъезжается, шифровальщик доедет до
     # обеих нод). Молчать об этом нельзя — пишем в лог и в --status.
+    local up_size=""
     if [[ -d "${SITE_PATH}/upload" ]] && [[ -n "$(find "${SITE_PATH}/upload" -mindepth 2 -type f -print -quit 2>/dev/null)" ]]; then
-        local up_size; up_size=$(du -sh "${SITE_PATH}/upload" 2>/dev/null | cut -f1)
-        log "files: ВНИМАНИЕ — ${SITE_PATH}/upload (${up_size:-?}) лежит на диске и в копию НЕ входит; защищён только зеркалом lsyncd."
-        printf '%s\n' "${up_size:-?}" | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
+        up_size=$(du -sh "${SITE_PATH}/upload" 2>/dev/null | cut -f1)
+        if [[ "$(_bk_include_upload)" == "no" ]]; then
+            log "files: ВНИМАНИЕ — ${SITE_PATH}/upload (${up_size:-?}) лежит на диске и в копию НЕ входит ([backup] include_upload = off); защищён только зеркалом lsyncd."
+            printf '%s\n' "${up_size:-?}" | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
+        else
+            log "files: ${SITE_PATH}/upload (${up_size:-?}) входит в копию; кэш превью (resize_cache, tmp) исключён."
+            printf '' | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
+        fi
     elif _bk_exists "meta/upload_on_disk"; then
         printf '' | _bk_put "meta/upload_on_disk" 2>>"$LOG_FILE" || true
     fi
@@ -506,9 +528,15 @@ backup_files() {
     # Маркер — часть условия успеха: mc mirror умеет выходить с кодом 0 при
     # частичных ошибках записи (ловили вживую), а заливка маркера — честная
     # проверка, что доступ на запись в бакет действительно работает.
-    if _bk_mirror_site "$SITE_PATH" \
-        "upload/*" "bitrix/cache/*" "bitrix/managed_cache/*" "bitrix/stack_cache/*" \
-        "bitrix/html_pages/*" "bitrix/tmp/*" "bitrix/backup/*" "*.tmp" ".git/*" \
+    # Кэш (per-node, регенерируется) не копируем никогда; сам /upload — по настройке.
+    local -a ex=("bitrix/cache/*" "bitrix/managed_cache/*" "bitrix/stack_cache/*" \
+                 "bitrix/html_pages/*" "bitrix/tmp/*" "bitrix/backup/*" "*.tmp" ".git/*")
+    if [[ "$(_bk_include_upload)" == "no" ]]; then
+        ex+=("upload/*")
+    else
+        ex+=("upload/resize_cache/*" "upload/tmp/*" "upload/.bx_temp/*")
+    fi
+    if _bk_mirror_site "$SITE_PATH" "${ex[@]}" \
         && printf 'node=%s date=%s duration=%ss\n' "$SELF_NODE" "$DATE_TAG" "$((SECONDS - t0))" \
             | _bk_put "$marker" 2>>"$LOG_FILE"; then
         # Кэш объёма копии для --status (портал показывает его в разделе копий):

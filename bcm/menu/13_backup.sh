@@ -254,6 +254,13 @@ _bk_show_status() {
         _bk_store_ls "www/" | tail -5 | sed 's/^/    снимок: /' || true
     fi
     _bk_store_ls "files/" | tail -3 | sed 's/^/    маркер: /' || true
+    # ⚠️ Явно показываем судьбу /upload: раньше оператор узнавал о том, что он вне
+    # копии, только из журнала на ноде — а это самая дорогая часть портала.
+    if [[ "$(bcm_bk_include_upload)" == "off" ]]; then
+        bcm_warn "    /upload в копию НЕ входит ([backup] include_upload = off)"
+    else
+        bcm_info "    /upload входит в копию (кроме resize_cache и tmp)"
+    fi
     echo
     bcm_color "WHITE" "  ── Таймеры по нодам ──"
     for node in "${!BCM_NODE_IP[@]}"; do

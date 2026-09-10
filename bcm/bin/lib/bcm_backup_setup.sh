@@ -40,6 +40,8 @@ bcm_bk_retention() { local v; v="$(bcm_bk_get retention_days)"; echo "${v:-14}";
 # хранения распоряжается lifecycle бакета, а он умеет лишь «удалить старше N дней».
 # 0 = уровень выключен, и политика вырождается в прежнюю «хранить N дней».
 bcm_bk_retention_weeks()  { local v; v="$(bcm_bk_get retention_weeks)";  echo "${v:-0}"; }
+# /upload в копии файлов: auto (по умолчанию — входит) | off (прежнее «он в облаке»).
+bcm_bk_include_upload()   { local v; v="$(bcm_bk_get include_upload)";   echo "${v:-auto}"; }
 bcm_bk_retention_months() { local v; v="$(bcm_bk_get retention_months)"; echo "${v:-0}"; }
 
 # ⚠️ Креды копий: [backup] ПЕРЕКРЫВАЕТ [s3_upload]. Отдельные ключи — не
@@ -236,6 +238,7 @@ bcm_bk_deploy() {
     bucket="$(bcm_bk_bucket)"; ret="$(bcm_bk_retention)"; enc="$(bcm_bk_get enc_key)"
     local retw retm
     retw="$(bcm_bk_retention_weeks)"; retm="$(bcm_bk_retention_months)"
+    local incup; incup="$(bcm_bk_include_upload)"
     ep="$(bcm_bk_s3_endpoint)"; ak="$(bcm_bk_s3_access)"; sk="$(bcm_bk_s3_secret)"
     local nfs_server nfs_export nfs_mount nfs_subdir
     nfs_server="$(bcm_bk_get nfs_server)"; nfs_export="$(bcm_bk_get nfs_export)"
@@ -331,6 +334,7 @@ BUCKET='${bucket}'
 ENC_KEY='${enc_esc}'
 RETENTION_DAYS='${ret}'
 RETENTION_WEEKS='${retw}'
+INCLUDE_UPLOAD='${incup}'
 RETENTION_MONTHS='${retm}'
 DB_RANK='${db_rank}'
 DB_STAGGER='180'
