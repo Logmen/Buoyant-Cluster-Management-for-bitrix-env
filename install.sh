@@ -3899,10 +3899,15 @@ ENV
             [[ "$bk_target" == "nfs" && "$name" == "${WEB_NODES[0]}" ]] && types+=("prune:05:30")
             for t in "${types[@]}"; do
                 local typ="${t%%:*}" at="${t#*:}"
+                # X-BCM-Owner — метка «юнит наш»: systemd игнорирует ключи с
+                # префиксом X-, а уборка лишних таймеров (bcm_backup_setup.sh) по
+                # ней отличает свои юниты от чужих с тем же префиксом имени —
+                # под bcm-backup-* попадают и таймеры модулей.
                 cat > "$local_svc" <<UNIT
 [Unit]
 Description=BCM backup: ${typ}
 After=network-online.target
+X-BCM-Owner=core
 
 [Service]
 Type=oneshot
@@ -3911,6 +3916,7 @@ UNIT
                 cat > "$local_tmr" <<UNIT
 [Unit]
 Description=BCM backup timer: ${typ}
+X-BCM-Owner=core
 
 [Timer]
 OnCalendar=*-*-* ${at}:00
@@ -3923,7 +3929,11 @@ UNIT
                 bcm_ssh_copy_file "$local_svc" "$ip" "/etc/systemd/system/bcm-backup-${typ}.service"
                 bcm_ssh_copy_file "$local_tmr" "$ip" "/etc/systemd/system/bcm-backup-${typ}.timer"
             done
-            bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && for u in /etc/systemd/system/bcm-backup-*.timer; do systemctl enable --now \"\$(basename \"\$u\")\"; done"
+            # ⚠️ Поимённо, а не по маске bcm-backup-*: под неё попадают таймеры
+            # модулей (портал ставит bcm-backup-verify), а чужими юнитами
+            # распоряжается их владелец — не установщик ядра.
+            local enable_units=""; for t in "${types[@]}"; do enable_units+="bcm-backup-${t%%:*}.timer "; done
+            bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload; for u in ${enable_units}; do systemctl enable --now \"\$u\"; done"
             log_ok "  $name (${layer}): бэкап настроен (rank=${db_rank})."
         done
     done

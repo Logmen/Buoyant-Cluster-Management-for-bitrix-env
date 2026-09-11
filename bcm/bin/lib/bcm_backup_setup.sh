@@ -24,6 +24,19 @@
 _BK_MC="/usr/local/bin/mc"          # НЕ /usr/bin/mc — там Midnight Commander
 _BK_SETUP_ALIAS="bcmbkchk"          # временный алиас проверки (снимаем за собой)
 
+# ⚠️⚠️ Имя bcm-backup-* — НЕ наша собственность. Под эту маску попадают юниты
+# модулей: портал ставит на узлы базы bcm-backup-verify (ночная проверка копии).
+# Пока уборка лишних таймеров шла по маске, каждое применение настроек копий
+# сносило чужой таймер вместе с его .service, а следующая раскатка модуля ставила
+# его обратно — и так по кругу, до первого «почему проверка копии не отработала».
+#
+# Поэтому трогаем только СВОИ юниты, а «свой» определяем двумя способами:
+#   • маркер X-BCM-Owner=core в юните — его пишет и эта библиотека, и install.sh;
+#   • типы ниже — для юнитов, записанных ДО появления маркера (у них его нет).
+# Список обязан покрывать все типы, которые ядро когда-либо создавало: тип,
+# выпавший отсюда, останется на ноде навсегда. Генератор типов — в bcm_bk_deploy.
+BCM_BK_CORE_TYPES="conf db files prune"
+
 # ──── Параметры цели из cluster.conf ─────────────────────────────────────────
 bcm_bk_get() { bcm_conf_get backup "$1" 2>/dev/null || echo ''; }
 
@@ -366,14 +379,19 @@ ENVEOF
 [Unit]
 Description=BCM backup: ${typ}
 After=network-online.target
+X-BCM-Owner=core
 
 [Service]
 Type=oneshot
 ExecStart=/opt/bcm/bin/lib/bcm_backup.sh --${typ}
 UNITEOF
+            # X-BCM-Owner — метка «юнит наш». systemd игнорирует ключи с префиксом
+            # X- (см. systemd.unit(5)), а уборка лишних таймеров по ней отличает
+            # свои юниты от чужих с таким же префиксом имени.
             cat > "$tmp_tmr" <<UNITEOF
 [Unit]
 Description=BCM backup timer: ${typ}
+X-BCM-Owner=core
 
 [Timer]
 OnCalendar=*-*-* ${at}:00
@@ -388,15 +406,24 @@ UNITEOF
         done
         # Лишние таймеры (сменилась роль ноды или цель) — снять, иначе они
         # ежедневно падали бы на неподходящей ноде и мусорили в логе.
+        # ⚠️⚠️ Только свои: маска bcm-backup-* ловит и юниты модулей (см. шапку,
+        # BCM_BK_CORE_TYPES). Чужой юнит пропускаем, даже не думая об удалении.
         local want_list=" "; for t in "${types[@]}"; do want_list+="${t%%:*} "; done
         bcm_ssh_exec_timeout "$ip" 60 \
             "for u in /etc/systemd/system/bcm-backup-*.timer; do
                  [ -e \"\$u\" ] || continue
                  b=\$(basename \"\$u\" .timer); typ=\${b#bcm-backup-}
+                 case ' ${BCM_BK_CORE_TYPES} ' in
+                     *\" \$typ \"*) : ;;
+                     *) grep -qx 'X-BCM-Owner=core' \"\$u\" 2>/dev/null || continue ;;
+                 esac
                  case '${want_list}' in *\" \$typ \"*) : ;; *) systemctl disable --now \"\$b.timer\" >/dev/null 2>&1; rm -f \"\$u\" \"/etc/systemd/system/\$b.service\";; esac
              done; true" </dev/null >/dev/null 2>&1
+        # Включаем ПОИМЕННО свои таймеры, а не всё, что подошло под маску: чужой
+        # таймер включает (или намеренно не включает) его владелец.
+        local enable_units=""; for t in "${types[@]}"; do enable_units+="bcm-backup-${t%%:*}.timer "; done
         if bcm_ssh_exec_timeout "$ip" 120 \
-            "systemctl daemon-reload && for u in /etc/systemd/system/bcm-backup-*.timer; do systemctl enable --now \"\$(basename \"\$u\")\" >/dev/null 2>&1; done" </dev/null >/dev/null 2>&1; then
+            "systemctl daemon-reload; rc=0; for u in ${enable_units}; do systemctl enable --now \"\$u\" >/dev/null 2>&1 || rc=1; done; exit \$rc" </dev/null >/dev/null 2>&1; then
             bcm_ok "    готово (rank=${db_rank}, таймеры:${want_list% })"
             ok=$((ok+1))
         else
