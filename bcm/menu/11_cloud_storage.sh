@@ -215,6 +215,8 @@ _cs_menu() {
             "2.  Проверить связь web→хранилище"
             "3.  Авто-регистрация бакета (best-effort, нужен портал)"
             "4.  Полная проверка доступа к бакету (запись/чтение/адресация)"
+            "5.  nginx: отдавать /upload из бакета, если файла нет на диске (поставить/обновить)"
+            "6.  nginx: снять отдачу /upload из бакета"
             "0.  Назад"
         )
         bcm_print_menu items
@@ -225,6 +227,8 @@ _cs_menu() {
             2) _cs_test_conn ;;
             3) _cs_register ;;
             4) bcm_s3ext_check ;;
+            5) bcm_s3ext_nginx_deploy || true ;;
+            6) bcm_s3ext_nginx_remove || true ;;
             0) return 0 ;;
             "") : ;;
             *) bcm_warn "Неверный выбор." ;;

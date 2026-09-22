@@ -301,6 +301,9 @@ bcm_s3ext_setup() {
     bcm_warn "     Если в бакет уходит НЕ ВСЁ — узкие FILE_RULES, файлы, залитые до"
     bcm_warn "     подключения хранилища, статика модулей — зеркало нужно ОСТАВИТЬ"
     bcm_warn "     (меню 6 → 10, режим on), иначе такие файлы видны лишь одной ноде."
+    bcm_info "  3. Поставить nginx-отдачу /upload из бакета (этот раздел, пункт 5):"
+    bcm_info "     после переноса файлов в облако ссылки на физический путь /upload/…"
+    bcm_info "     (виджеты на чужих сайтах, старые письма) иначе дают 404 на ноде без копии."
     bcm_any_key
 }
 
@@ -326,5 +329,188 @@ bcm_s3ext_check() {
     else
         echo; bcm_error "Есть проблемы — облачное /upload будет работать неверно."
     fi
+    bcm_any_key
+}
+
+# ──── nginx: /upload, которого нет на диске, отдавать из бакета ─────────────
+# ⚠️⚠️ Зачем. После переноса файлов в облако Битрикс удаляет локальные копии на
+# той ноде, где шёл перенос, и дальше отдаёт на них облачные ссылки. Но в мире
+# остаются ссылки на ФИЗИЧЕСКИЙ путь /upload/…: код виджета «Кнопка на сайт» на
+# сайтах клиентов, трекер звонков, старые письма с вложениями, документы. Такой
+# запрос приходит на web-ноду, и если файла на диске нет — Битрикс отвечает
+# HTML-страницей 404; для <script> браузер её блокирует (ERR_BLOCKED_BY_ORB).
+# Ловили вживую: web01 после переноса пустой, web02 с зеркалом полный — виджет
+# видел каждый второй посетитель. Зеркало /upload тут не спасает: удаления оно
+# не переносит по замыслу, а перенос как раз и есть удаление.
+#
+# Что ставим на КАЖДУЮ web-ноду:
+#   bx/settings/bcm_s3_upload_upstream.conf        (http)   upstream до хранилища
+#   bx/site_settings/default/bcm_s3_upload.conf    (server) location с try_files
+# Локальный файл есть → отдаём его как раньше (expires 30d). Нет → проксируем в
+# бакет тем стилем адресации, что записан в [s3_upload] addressing.
+#
+# ⚠️ site_settings включается РАНЬШЕ bitrix.conf, а среди regex-location у nginx
+# побеждает первый совпавший — наш location перехватил бы и защитные правила
+# Битрикса (svg без XSS, «скачать, а не выполнить» для php в upload, 1c_, scale
+# в resize_cache/x). Поэтому всё это исключено negative lookahead'ами и падает
+# в родные location'ы как прежде. Менять bitrix_general.conf нельзя — его
+# перезаписывает bitrix-env.
+_S3EXT_NGX_UP="/etc/nginx/bx/settings/bcm_s3_upload_upstream.conf"
+_S3EXT_NGX_LOC="/etc/nginx/bx/site_settings/default/bcm_s3_upload.conf"
+
+# Печатает оба файла, разделённые строкой "=====". Параметры — из cluster.conf.
+_s3ext_nginx_render() {
+    local bucket apihost use_https addressing scheme host hostname
+    bucket="$(bcm_conf_get s3_upload bucket)"
+    apihost="$(bcm_conf_get s3_upload api_host 2>/dev/null || echo '')"
+    [[ -z "$apihost" ]] && apihost="$(bcm_conf_get s3_upload endpoint | sed -E 's#^https?://##; s#/.*$##')"
+    use_https="$(bcm_conf_get s3_upload use_https 2>/dev/null || echo Y)"
+    addressing="$(bcm_conf_get s3_upload addressing 2>/dev/null || echo path)"
+    scheme="https"; [[ "${use_https^^}" == "N" ]] && scheme="http"
+    host="$apihost"; hostname="${apihost%%:*}"
+    # Без порта в upstream nginx возьмёт 80 даже для https — порт обязателен.
+    [[ "$host" == *:* ]] || { [[ "$scheme" == "https" ]] && host="${host}:443" || host="${host}:80"; }
+
+    # ⚠️ Ключ объекта подставляем через rewrite, а НЕ переменной в proxy_pass:
+    # с переменной nginx шлёт \$uri как есть — пробелы и кириллица в именах
+    # файлов Битрикса ломали бы запрос. После rewrite он кодирует путь сам.
+    local rew hosthdr sslname
+    if [[ "$addressing" == "vhost" ]]; then
+        rew="rewrite ^/upload/(.*)\$ /\$1 break;"
+        hosthdr="${bucket}.${apihost}"; sslname="${bucket}.${hostname}"
+    else
+        rew="rewrite ^/upload/(.*)\$ /${bucket}/\$1 break;"
+        hosthdr="${apihost}"; sslname="${hostname}"
+    fi
+
+    cat <<UPEOF
+# BCM: апстрим S3-хранилища для /upload (bcm_s3_external.sh, меню 11).
+# Файл генерируется — правки перезапишет следующая раскатка.
+upstream bcm_s3_upload {
+    server ${host};
+    keepalive 16;
+}
+UPEOF
+    echo "====="
+    cat <<LOCEOF
+# BCM: /upload, которого нет на диске, отдаём из S3-бакета ${bucket} (${addressing}).
+# Файл генерируется bcm_s3_external.sh (меню 11) — правки перезапишет раскатка.
+#
+# Исключения в regex — то, что обязано попасть в родные location'ы Битрикса:
+# resize_cache/ (масштабирование), bx_cloud_upload/ (его собственный прокси),
+# support/, 1c_ (закрыт), tmp/ и .bx_temp/, скрытые файлы, svg и исполняемые
+# расширения (у Битрикса на них защитные правила).
+location ~* "^/upload/(?!resize_cache/|bx_cloud_upload/|support/|1c_|tmp/|\.bx_temp/)(?!.*/\.)(?!.*\.(svg|html?|php\d?|phtml|pl|aspx?|cgi|dll|exe|shtml?|fcgi?|fpl|asmx|pht)\$).+\$" {
+    try_files \$uri @bcm_s3_upload;
+    expires 30d;
+}
+
+location @bcm_s3_upload {
+    if (\$request_method !~ ^(GET|HEAD)\$) { return 405; }
+    ${rew}
+    proxy_pass ${scheme}://bcm_s3_upload;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host ${hosthdr};
+LOCEOF
+    if [[ "$scheme" == "https" ]]; then
+        cat <<LOCEOF
+    proxy_ssl_server_name on;
+    proxy_ssl_name ${sslname};
+    proxy_ssl_protocols TLSv1.2 TLSv1.3;
+LOCEOF
+    fi
+    cat <<'LOCEOF'
+    # Ошибку хранилища (нет объекта, нет прав) отдаём как обычный 404 сайта,
+    # а не XML от S3: для <script> и <img> это то же самое, а людям понятнее.
+    proxy_intercept_errors on;
+    error_page 403 404 =404 /404.html;
+    proxy_hide_header x-amz-request-id;
+    proxy_hide_header x-amz-id-2;
+    proxy_hide_header x-amz-version-id;
+    proxy_hide_header x-minio-deployment-id;
+    proxy_hide_header Set-Cookie;
+    # Свои security-заголовки сайт добавляет сам (http-add_header.conf) —
+    # копию от хранилища прячем, иначе заголовок уходит дважды.
+    proxy_hide_header X-Content-Type-Options;
+    # more_set_headers, а не add_header: add_header в location отменил бы все
+    # унаследованные заголовки (в т.ч. из bx/conf/http-add_header.conf).
+    more_set_headers 'X-BCM-Source: s3';
+    expires 30d;
+}
+LOCEOF
+}
+
+# Раскатать фрагмент на все web-ноды: записать, nginx -t, reload; при провале
+# проверки вернуть прежние файлы (или убрать новые) — nginx остаётся рабочим.
+bcm_s3ext_nginx_deploy() {
+    bcm_section_header "nginx: отдача /upload из S3, когда файла нет на диске"
+    bcm_s3_storage_enabled || { bcm_error "Хранилище не подключено (пункт «Подключить»)."; bcm_any_key; return 1; }
+    bcm_load_topology || true
+
+    local rendered up loc
+    rendered="$(_s3ext_nginx_render)"
+    up="${rendered%%=====*}"; loc="${rendered#*=====}"; loc="${loc#$'\n'}"
+    bcm_info "Бакет: $(bcm_conf_get s3_upload bucket) @ $(bcm_conf_get s3_upload api_host) · адресация: $(bcm_conf_get s3_upload addressing 2>/dev/null || echo path)"
+    bcm_info "Файлы: ${_S3EXT_NGX_UP}"
+    bcm_info "       ${_S3EXT_NGX_LOC}"
+    bcm_info "На web-нодах: ${BCM_NODES_WEB[*]}"
+    echo
+    bcm_confirm "Записать и перечитать nginx на всех web-нодах?" || { bcm_info "Отменено."; bcm_any_key; return 1; }
+
+    local tmp_up tmp_loc; tmp_up="$(mktemp)"; tmp_loc="$(mktemp)"
+    printf '%s\n' "$up" > "$tmp_up"; printf '%s\n' "$loc" > "$tmp_loc"
+    local node ip ok=0 fail=0
+    for node in "${BCM_NODES_WEB[@]}"; do
+        [[ -n "$node" ]] || continue
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -n "$ip" ]] || continue
+        if ! bcm_node_reachable "$ip" 5 2>/dev/null; then bcm_warn "  ${node}: недоступна — пропуск."; fail=$((fail+1)); continue; fi
+        local ts; ts="$(date +%Y%m%d-%H%M%S)"
+        # ⚠️ Бэкапы — вне каталогов *.conf-масок, иначе nginx подхватит и их.
+        bcm_ssh_exec "$ip" "mkdir -p /etc/nginx/bx/settings /etc/nginx/bx/site_settings/default /var/backups/bcm-nginx
+            for f in ${_S3EXT_NGX_UP} ${_S3EXT_NGX_LOC}; do [ -f \"\$f\" ] && cp -a \"\$f\" \"/var/backups/bcm-nginx/\$(basename \"\$f\").${ts}\"; done; true" </dev/null >/dev/null 2>&1
+        bcm_ssh_copy_file "$tmp_up"  "$ip" "${_S3EXT_NGX_UP}"  >/dev/null 2>&1
+        bcm_ssh_copy_file "$tmp_loc" "$ip" "${_S3EXT_NGX_LOC}" >/dev/null 2>&1
+        local out
+        if out="$(bcm_ssh_exec_timeout "$ip" 60 "chmod 644 ${_S3EXT_NGX_UP} ${_S3EXT_NGX_LOC}; nginx -t 2>&1" </dev/null)"; then
+            if bcm_ssh_exec_timeout "$ip" 60 "systemctl reload nginx" </dev/null >/dev/null 2>&1; then
+                bcm_ok "  ${node}: фрагмент поставлен, nginx перечитан."; ok=$((ok+1))
+            else
+                bcm_error "  ${node}: nginx -t прошёл, но reload не удался — проверьте systemctl status nginx."; fail=$((fail+1))
+            fi
+        else
+            # Откат: вернуть прежние файлы, если были, иначе убрать новые.
+            bcm_ssh_exec "$ip" "for f in ${_S3EXT_NGX_UP} ${_S3EXT_NGX_LOC}; do b=\"/var/backups/bcm-nginx/\$(basename \"\$f\").${ts}\"; if [ -f \"\$b\" ]; then cp -a \"\$b\" \"\$f\"; else rm -f \"\$f\"; fi; done; nginx -t >/dev/null 2>&1" </dev/null >/dev/null 2>&1
+            bcm_error "  ${node}: nginx -t не прошёл — откатил, конфиг не менялся:"
+            printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
+            fail=$((fail+1))
+        fi
+    done
+    rm -f "$tmp_up" "$tmp_loc"
+    echo
+    if [[ $fail -eq 0 ]]; then
+        bcm_ok "Готово на ${ok} web-нодах. Проверка: curl -sI https://<сайт>/upload/<путь-файла-из-облака> → 200, X-BCM-Source: s3."
+    else
+        bcm_warn "Не везде: ok=${ok}, ошибок=${fail}."
+    fi
+    bcm_any_key
+    [[ $fail -eq 0 ]]
+}
+
+# Снять фрагмент с web-нод (nginx вернётся к поведению bitrix-env).
+bcm_s3ext_nginx_remove() {
+    bcm_section_header "nginx: убрать отдачу /upload из S3"
+    bcm_load_topology || true
+    bcm_confirm "Убрать фрагмент с web-нод (${BCM_NODES_WEB[*]}) и перечитать nginx?" || { bcm_info "Отменено."; bcm_any_key; return 1; }
+    local node ip
+    for node in "${BCM_NODES_WEB[@]}"; do
+        [[ -n "$node" ]] || continue
+        ip="${BCM_NODE_IP[$node]:-}"; [[ -n "$ip" ]] || continue
+        if bcm_ssh_exec_timeout "$ip" 60 "rm -f ${_S3EXT_NGX_UP} ${_S3EXT_NGX_LOC} && nginx -t >/dev/null 2>&1 && systemctl reload nginx" </dev/null >/dev/null 2>&1; then
+            bcm_ok "  ${node}: снято."
+        else
+            bcm_error "  ${node}: не удалось — проверьте nginx -t на ноде."
+        fi
+    done
     bcm_any_key
 }
