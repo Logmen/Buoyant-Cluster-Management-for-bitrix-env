@@ -115,7 +115,14 @@ _sg_make_reference() {
         // extra прямо в data[секция], а читает его как data[секция]["value"].
         echo "return ", var_export($out, true), ";\n";
     ' "$SETTINGS" "$GUARDED_SECTIONS") || _sg_die "не удалось собрать эталон"
+    _sg_write_reference "$body"
+    _sg_log "эталон снят с $SETTINGS (секции: $GUARDED_SECTIONS)"
+}
 
+# Записать эталон целиком: шапка (автозагрузчик маршрутизатора чтений) и
+# массив секций ($1 — строка «return …;»). Атомарно и только после php -l.
+_sg_write_reference() {
+    local body="$1"
     {
         cat <<'HDR'
 <?php
@@ -155,7 +162,45 @@ HDR
     mkdir -p "$(dirname "$REFERENCE")"
     mv -f "${REFERENCE}.tmp" "$REFERENCE"
     chmod 600 "$REFERENCE"
-    _sg_log "эталон снят с $SETTINGS (секции: $GUARDED_SECTIONS)"
+}
+
+# ──── Дописать в эталон секции, которые начали охраняться в новой версии ─────
+# ⚠️⚠️ Эталон — снимок ЗАВЕДОМО рабочего .settings.php, и переснимать его целиком
+# при обновлении ядра нельзя: если ansible только что вернул .settings.php к
+# скелету, --install снял бы в эталон скелет, и страж начал бы охранять поломку.
+# Поэтому здесь только ДОПИСЫВАЕМ: секцию, которой в эталоне нет, но которая есть
+# в текущем .settings.php и числится в GUARDED_SECTIONS. Уже снятые секции не
+# трогаем никогда. Нечего дописывать — файлы не трогаем вовсе (иначе inotify
+# стража сработал бы вхолостую).
+# Зачем: новая версия стража начинает охранять новую секцию (1.0.30 — crypto) только
+# после пересъёмки эталона; до неё секция не защищена, и на eda.khc.kz crypto_key
+# так и пролежал без охраны до ручного --install.
+_sg_merge_new() {
+    [[ -f "$REFERENCE" ]] || { echo "эталона нет — сторож не установлен, дописывать некуда"; return 0; }
+    [[ -f "$SETTINGS" ]] || { echo "нет $SETTINGS — дописывать не из чего"; return 0; }
+    local body added rc errf
+    errf="$(mktemp)"
+    body=$(php -r '
+        $ref = include $argv[1]; $cur = include $argv[2];
+        if (!is_array($ref) || !is_array($cur)) { fwrite(STDERR, "нечитаемый эталон или .settings.php"); exit(2); }
+        $added = [];
+        foreach (explode(" ", $argv[3]) as $k) {
+            if (!array_key_exists($k, $ref) && isset($cur[$k])) { $ref[$k] = $cur[$k]; $added[] = $k; }
+        }
+        if (!$added) { exit(10); }
+        fwrite(STDERR, implode(" ", $added));
+        echo "return ", var_export($ref, true), ";\n";
+    ' "$REFERENCE" "$SETTINGS" "$GUARDED_SECTIONS" 2>"$errf"); rc=$?
+    added="$(cat "$errf")"; rm -f "$errf"
+    case $rc in
+        10) echo "эталон уже охраняет всё, что есть в .settings.php"; return 0 ;;
+        0)  ;;
+        *)  _sg_log "ОШИБКА дописывания эталона: ${added}"; echo "ОШИБКА: ${added}" >&2; return 1 ;;
+    esac
+    _sg_write_reference "$body"
+    _sg_log "в эталон дописаны секции: ${added}"
+    _sg_assert
+    echo "в эталон дописаны секции: ${added}"
 }
 
 # Эталоны файлов nginx снимаем с текущих (рабочих) — они уже приведены
@@ -306,6 +351,10 @@ case "${1:---status}" in
         echo "Сторож настроек портала установлен."
         ;;
     --assert)  _sg_assert ;;
+    --merge-new)
+        [[ $EUID -eq 0 ]] || _sg_die "нужны права root"
+        _sg_merge_new
+        ;;
     --status)  _sg_status ;;
     --disable)
         [[ $EUID -eq 0 ]] || _sg_die "нужны права root"
@@ -316,7 +365,7 @@ case "${1:---status}" in
         echo "Сторож отключён (файл наложений и эталон оставлены на месте)."
         ;;
     *)
-        echo "Использование: $(basename "$0") --install | --assert | --status | --disable"
+        echo "Использование: $(basename "$0") --install | --merge-new | --assert | --status | --disable"
         exit 1
         ;;
 esac

@@ -90,6 +90,9 @@ if [[ -f "${BCM_LIB_DIR}/bcm_utils.sh" ]]; then
     # Подключаемые модули (портал и прочие расширения) — раскатка после deploy_bcm.
     # shellcheck disable=SC1091
     [[ -f "${BCM_LIB_DIR}/bcm_modules.sh" ]] && source "${BCM_LIB_DIR}/bcm_modules.sh"
+    # Наборы logrotate BCM — общие с bcm --update (bcm_post_update.sh).
+    # shellcheck disable=SC1091
+    source "${BCM_LIB_DIR}/bcm_logrotate.sh"
 fi
 
 # ──── Аргументы командной строки ─────────────────────────────────────────────
@@ -2610,21 +2613,10 @@ configure_local_logrotate() {
 
     mkdir -p "$NODE_LOGS_DIR" "/var/log/bcm"
 
-    # ⚠️ Только /bcm/logs (журналы установки). /var/log/bcm описывает bcm-node на
-    # каждой ноде, включая эту: один и тот же файл в двух наборах logrotate считает
-    # дублем и с ошибкой пропускает ВЕСЬ набор — ротация тихо переставала работать.
-    cat << 'EOF' > /etc/logrotate.d/bcm-install
-/bcm/logs/*.log {
-    daily
-    rotate 5
-    size 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
+    # ⚠️ Только /bcm/logs (журналы установки): /var/log/bcm описывает bcm-node на
+    # каждой ноде, включая эту, — дубль выключил бы оба набора. Содержимое — из
+    # bcm_logrotate.sh, тем же кодом его приводит к текущему bcm --update.
+    bcm_lr_render_install > /etc/logrotate.d/bcm-install
     log_ok "Локальная ротация логов установки настроена."
 }
 
@@ -2733,78 +2725,24 @@ configure_remote_logging() {
             continue
         fi
 
-        # Создаем директории для логов BCM на удаленном узле
+        # Каталоги журналов: сервисы пишут в них с первого дня.
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/bcm"
+        case "$role" in
+            web) bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd" ;;
+            pxc) bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/mysql && chown -R mysql:mysql /var/log/mysql || true" ;;
+            s3)  bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/minio" ;;
+        esac
 
-        # Базовый блок для BCM логов (есть на всех нодах)
-        local lr_cfg="/tmp/bcm-node-lr-${name}"
-        cat << 'EOF' > "$lr_cfg"
-# Настройки ротации логов BCM (на всех узлах)
-/var/log/bcm/*.log {
-    daily
-    rotate 4
-    size 10M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-
-        # Ролевые блоки
-        if [[ "$role" == "lb" ]]; then
-            # HAProxy, Keepalived
-            cat << 'EOF' >> "$lr_cfg"
-
-# Keepalived (у haproxy есть собственный конфиг пакета — не дублируем)
-/var/log/keepalived.log {
-    daily
-    rotate 4
-    size 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-        elif [[ "$role" == "web" ]]; then
-            # ⚠️ Своего блока для nginx, httpd, proxysql и lsyncd здесь НЕТ намеренно:
-            # у каждого из них есть конфиг от своего пакета, а один и тот же файл в
-            # двух наборах logrotate считает дублем — и пропускает ОБА набора целиком
-            # (ловили вживую: haproxy.log и proxysql.log не ротировались вообще).
-            # Инвариант тот же, что для MySQL ниже: BCM описывает только те логи,
-            # которые заводит сам. Каталоги создаём — сервисы пишут в них с первого дня.
-            bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd"
-        elif [[ "$role" == "pxc" ]]; then
-            # Блока для /var/log/mysql здесь НЕТ намеренно: error.log и slow.log
-            # ротируются почасовым набором (configure_pxc_log_rotation), а один и
-            # тот же файл в двух наборах logrotate отвергает как дубль записи.
-            bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/mysql && chown -R mysql:mysql /var/log/mysql || true"
-        elif [[ "$role" == "s3" ]]; then
-            # MinIO
-            cat << 'EOF' >> "$lr_cfg"
-
-# MinIO S3
-/var/log/minio/*.log {
-    daily
-    rotate 4
-    size 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-            bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/minio"
-        fi
-
-        # Копируем конфигурационный файл на удаленный узел
-        bcm_ssh_copy_file "$lr_cfg" "$ip" "/etc/logrotate.d/bcm-node"
-        bcm_ssh_exec_logged "$name" "$ip" "chmod 644 /etc/logrotate.d/bcm-node"
-        rm -f "$lr_cfg"
+        # Набор bcm-node — из bcm_logrotate.sh: тем же кодом его приводит к текущей
+        # версии bcm --update (bcm_post_update.sh). Раньше набор писал только
+        # установщик, и исправление 1.0.26 до живых кластеров не доехало: старый
+        # bcm-node дублировал журналы nginx/haproxy/proxysql/lsyncd, и logrotate
+        # пропускал оба набора целиком. ⚠️ BCM описывает ТОЛЬКО журналы, которые
+        # заводит сам (подробно — в шапке bcm_logrotate.sh; mysql ротирует свой
+        # почасовой набор configure_pxc_log_rotation).
+        local lr_out
+        lr_out="$(bcm_lr_apply_node "$ip" "$role")" || log_warn "  ${name}: наборы logrotate не применены"
+        log_info "  ${name}: logrotate — $(printf '%s' "$lr_out" | tr '\n' ';')"
     done
     log_ok "Локальная ротация логов на всех узлах успешно настроена."
 }
