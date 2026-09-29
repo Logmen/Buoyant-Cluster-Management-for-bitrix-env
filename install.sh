@@ -2358,9 +2358,20 @@ $file = $docroot . '/bitrix/.settings.php';
 if (!is_file($file)) { fwrite(STDERR, "NO_SETTINGS:$file\n"); exit(2); }
 $cfg = include $file;
 if (!is_array($cfg)) { fwrite(STDERR, "BAD_SETTINGS\n"); exit(2); }
+// ⚠️ Режим сессий и kernel-обработчик СОХРАНЯЕМ, если они уже заданы. Кластер мог
+// быть переведён в `separated` (авторизация в зашифрованной cookie, основная
+// сессия лениво и с блокировкой в redis) — лекарство от очереди на блокировке
+// сессии, когда клиент шлёт десятки параллельных запросов (картинки чата в
+// десктоп-приложении ждали по 60 с и падали с 500). Повторный install.sh
+// молча вернул бы `default`, и очередь вернулась бы вместе с ним. Установщик
+// отвечает только за то, КУДА ходит основная сессия (VIP redis), а не за режим.
+$prevSession = (isset($cfg['session']['value']) && is_array($cfg['session']['value'])) ? $cfg['session']['value'] : array();
+$sessMode = (isset($prevSession['mode']) && $prevSession['mode'] === 'separated'
+    && isset($prevSession['handlers']['kernel']) && isset($cfg['crypto']['value']['crypto_key']))
+    ? 'separated' : 'default';
 $cfg['session'] = array(
     'value' => array(
-        'mode' => 'default',
+        'mode' => $sessMode,
         'handlers' => array(
             'general' => array(
                 'type' => 'redis',
@@ -2383,6 +2394,14 @@ $cfg['session'] = array(
     // внешняя перезапись файла целиком; её лечит повторный прогон install.sh.
     'readonly' => true,
 );
+// Что было задано оператором поверх нашего минимума — возвращаем: kernel-обработчик
+// (без него `separated` не стартует), срок жизни и отладку режима.
+if ($sessMode === 'separated') {
+    $cfg['session']['value']['handlers']['kernel'] = $prevSession['handlers']['kernel'];
+}
+foreach (array('lifetime', 'debug') as $k) {
+    if (isset($prevSession[$k])) { $cfg['session']['value'][$k] = $prevSession[$k]; }
+}
 // Бэкап наследует владельца и режим оригинала: сниппет исполняется от root с umask 022,
 // а .settings.php — bitrix:bitrix 0640. Без наследования рядом остаётся root:root 0644:
 // копия реквизитов БД, читаемая любым пользователем ноды, и «Проверка системы» Bitrix

@@ -53,7 +53,15 @@ UNIT_SERVICE="/etc/systemd/system/bcm-settings-guard.service"
 # push-сервера и должен оставаться под управлением bitrix-env.
 # messenger — режим фоновой шины ядра (run_mode=cli, очереди разбирает master-cron,
 # см. bcm_messenger.sh): без защиты клоббер вернул бы опрос очередей на хиты.
-GUARDED_SECTIONS="connections cache session messenger"
+# crypto — ключ, без которого не живёт режим сессий `separated`: авторизация там
+# хранится в зашифрованной cookie (kernel => encrypted_cookies), и при пропаже
+# crypto_key ядро бросает «There is no crypto[crypto_key] in .settings.php» на
+# КАЖДОМ хите — сайт ложится целиком. Скелет bitrix-env этой секции не несёт,
+# поэтому без защиты первый же прогон ansible уронил бы портал. Кроме того,
+# crypto_key подмешивается в ключ подписи (Security\Sign\Signer): его смена
+# инвалидирует подписанные параметры во всех открытых вкладках. Если секции в
+# .settings.php нет, эталон её просто не содержит (режим default без неё живёт).
+GUARDED_SECTIONS="connections cache session messenger crypto"
 
 # ──── Файлы nginx, которые тоже сносит ansible ──────────────────────────────
 # ⚠️ Роль web (`sites_synchronize.yml`) синхронизирует /etc/nginx/bx/settings
