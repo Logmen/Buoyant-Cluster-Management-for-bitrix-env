@@ -2910,6 +2910,10 @@ ENV
         # 2. Старт mysql теперь у агента: отключаем автозапуск mysql.service,
         #    включаем pxc-autorecover. Сам mysql НЕ останавливаем (он уже Synced).
         bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl disable mysql 2>/dev/null; systemctl enable pxc-autorecover"
+        # Возврат узла, у которого mysqld упал на ходу (ABRT после оборванного IST
+        # и т.п.): pxc-rejoin.service через OnFailure= у mysql.service. Загрузочный
+        # агент этот случай не покрывает — см. шапку pxc_autorecover.sh.
+        bcm_ssh_exec_logged "$name" "$ip" "/opt/bcm/bin/lib/pxc_autorecover.sh --install-rejoin"
         rm -f "$local_env"
     done
     rm -f "${local_unit:-}"

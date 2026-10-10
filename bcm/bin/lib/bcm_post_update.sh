@@ -19,7 +19,8 @@
 #   1. эталоны стража настроек — дописать секции, которые начали охраняться в
 #      новой версии (bcm_settings_guard.sh --merge-new); уже снятые не трогаются;
 #   2. наборы logrotate BCM на всех узлах — к текущей версии (bcm_logrotate.sh);
-#   3. каталог ключей поставщиков модулей на всех узлах.
+#   3. каталог ключей поставщиков модулей на всех узлах;
+#   4. возврат упавшего на ходу узла PXC (pxc-rejoin.service + OnFailure у mysql).
 # =============================================================================
 set -uo pipefail
 
@@ -73,6 +74,14 @@ for n in "${!BCM_NODE_IP[@]}"; do
 done
 printf '  есть на %d из %d узлов\n' "$ok" "$total"
 [[ $ok -eq $total ]] || fail=1
+
+# ──── 4. Возврат упавшего на ходу узла PXC ───────────────────────────────────
+bcm_info "4. Возврат упавшего на ходу узла PXC (pxc-rejoin):"
+for n in "${BCM_NODES_PXC[@]}"; do
+    ip="${BCM_NODE_IP[$n]:-}"; [[ -n "$ip" ]] || continue
+    out="$(bcm_ssh_exec_timeout "$ip" 30 "/opt/bcm/bin/lib/pxc_autorecover.sh --install-rejoin 2>&1" </dev/null)" || fail=1
+    printf '  %-6s %s\n' "$n" "${out:-нет ответа}"
+done
 
 echo
 if [[ $fail -eq 0 ]]; then

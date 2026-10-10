@@ -21,6 +21,22 @@
 #                        "PRIMARY"           если локальный mysql уже Primary,
 #                        "<uuid> <seqno>"    иначе (seqno из grastate либо
 #                                            из `mysqld --wsrep-recover`).
+#   --rejoin         — вернуть в кластер узел, у которого mysqld упал НА ХОДУ
+#                      (запускает systemd: OnFailure= у mysql.service/mysql@.service).
+#   --install-rejoin — поставить юнит pxc-rejoin.service и OnFailure-вставки
+#                      (зовут install.sh и bcm_post_update.sh).
+#
+# ⚠️⚠️ Зачем --rejoin. Загрузочный агент (--recover) работает только при старте
+# узла. Если mysqld падает на ходу, его не поднимает никто: у mysql.service от
+# Percona `RestartPreventExitStatus=SIGABRT`, а Galera завершает узел именно ABRT —
+# например, когда оборвался догон (IST) из-за сетевого сбоя. Ловили вживую на
+# crm.onelab.kz 10.10.2026: сеть вокруг db02 дёрнулась на минуту, IST в 20
+# транзакций оборвался, «node restart required» → ABRT, и узел лежал, пока его
+# не запустили руками; хватило бы одного `systemctl start mysql`.
+# --rejoin делает ровно это, но осторожно: ждёт, пока сеть успокоится, и
+# присоединяется ТОЛЬКО к стабильному живому Primary. Нет такого — это уже не
+# одиночное падение, а сбой кластера: ничего не трогает (бутстрап на ходу —
+# решение оператора или загрузочного агента, не сторожа).
 #
 # Все данные о топологии — только из env-файла; хардкода IP/имён нет.
 # =============================================================================
@@ -51,6 +67,16 @@ WAIT_MAJORITY="${WAIT_MAJORITY:-300}" # суммарный дедлайн; < б�
 RETRY="${RETRY:-5}"                  # пауза между опросами рандеву
 BOOTSTRAP_WAIT="${BOOTSTRAP_WAIT:-300}" # ждать Synced после старта mysql/mysql@bootstrap
 PEER_PROBE_TIMEOUT="${PEER_PROBE_TIMEOUT:-10}" # таймаут одного SSH-опроса пира
+
+# --rejoin
+REJOIN_DELAY="${REJOIN_DELAY:-30}"        # пауза перед попыткой: дать сети успокоиться
+REJOIN_STABLE_GAP="${REJOIN_STABLE_GAP:-10}" # донор должен быть Primary/Synced в двух проверках подряд с таким шагом
+REJOIN_MAX="${REJOIN_MAX:-3}"             # попыток за окно — дальше узел не трогаем
+REJOIN_WINDOW="${REJOIN_WINDOW:-3600}"    # окно для REJOIN_MAX, секунды
+REJOIN_STATE="${REJOIN_STATE:-/run/pxc-rejoin.attempts}"
+REJOIN_LOCK="${REJOIN_LOCK:-/run/pxc-rejoin.lock}"
+REJOIN_DISABLE="${REJOIN_DISABLE:-/etc/bitrix-cluster/pxc-rejoin.disabled}"
+CLUSTER_CONF="${CLUSTER_CONF:-/etc/bitrix-cluster/cluster.conf}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o LogLevel=ERROR)
@@ -370,6 +396,112 @@ recover() {
     do_join; return $?
 }
 
+# ──── Возврат упавшего на ходу узла (--rejoin) ───────────────────────────────
+# Узел в режиме обслуживания BCM ([layer.pxc] <имя>.maintenance = 1)?
+self_in_maintenance() {
+    [[ -f "$CLUSTER_CONF" ]] || return 1
+    awk -F' *= *' -v ip="$SELF_IP" '
+        /^\[/ { sec=$0; next }
+        sec=="[layer.pxc]" && $1 ~ /\.ip$/ && $2==ip { n=$1; sub(/\.ip$/,"",n) }
+        sec=="[layer.pxc]" { kv[$1]=$2 }
+        END { exit !(n!="" && (kv[n".maintenance"]=="1" || tolower(kv[n".maintenance"])=="y")) }
+    ' "$CLUSTER_CONF"
+}
+
+# Пир — стабильный донор: Primary, ready, Synced. Только чтение статуса (а не
+# --report: тот на не-Primary пире запускает mysqld --wsrep-recover).
+peer_is_donor() {
+    local ip="$1"
+    [[ "$(peer_wsrep "$ip" wsrep_cluster_status)" == "Primary" \
+       && "$(peer_wsrep "$ip" wsrep_ready)" == "ON" \
+       && "$(peer_wsrep "$ip" wsrep_local_state_comment)" == "Synced" ]]
+}
+
+# Попытки за окно: печатает их число, старые отбрасывает.
+rejoin_attempts() {
+    local now cutoff; now=$(date +%s); cutoff=$(( now - REJOIN_WINDOW ))
+    [[ -f "$REJOIN_STATE" ]] || { echo 0; return; }
+    awk -v c="$cutoff" '$1 >= c' "$REJOIN_STATE" > "${REJOIN_STATE}.tmp" 2>/dev/null && mv -f "${REJOIN_STATE}.tmp" "$REJOIN_STATE"
+    wc -l < "$REJOIN_STATE" | tr -d ' '
+}
+
+rejoin() {
+    [[ -n "$PXC_PEERS" && -n "$SELF_IP" ]] || { log "rejoin: PXC_PEERS/SELF_IP не заданы в ${ENV_FILE}."; return 1; }
+    exec 9>"$REJOIN_LOCK"
+    flock -n 9 || { log "rejoin: уже выполняется — выход."; return 0; }
+
+    if [[ -f "$REJOIN_DISABLE" ]]; then
+        log "rejoin: отключён (${REJOIN_DISABLE}) — mysql не трогаю."; return 0
+    fi
+    if self_in_maintenance; then
+        log "rejoin: узел в режиме обслуживания BCM — mysql не трогаю."; return 0
+    fi
+    # Загрузочный агент ещё работает — стартом владеет он (его неудачный join тоже
+    # роняет mysql.service и будит нас; мешать ему нельзя).
+    if [[ "$(systemctl is-active pxc-autorecover 2>/dev/null)" == "activating" ]]; then
+        log "rejoin: идёт загрузочное автовосстановление — выход."; return 0
+    fi
+    local n; n=$(rejoin_attempts)
+    if (( n >= REJOIN_MAX )); then
+        log "rejoin: уже ${n} попыток за $(( REJOIN_WINDOW / 60 )) мин — узел падает повторно, нужен человек. Не трогаю."
+        return 1
+    fi
+
+    log "rejoin: mysql упал на ходу. Жду ${REJOIN_DELAY}с, пока успокоится сеть."
+    sleep "$REJOIN_DELAY"
+    if local_is_synced || systemctl is-active --quiet mysql mysql@bootstrap; then
+        log "rejoin: mysql уже поднят (оператором или порталом) — выход."; return 0
+    fi
+
+    local -a peers=(); read -r -a peers <<< "$PXC_PEERS"
+    local p donor=""
+    for p in "${peers[@]}"; do
+        [[ "$p" == "$SELF_IP" ]] && continue
+        peer_is_donor "$p" || continue
+        sleep "$REJOIN_STABLE_GAP"
+        peer_is_donor "$p" && { donor="$p"; break; }
+    done
+    if [[ -z "$donor" ]]; then
+        log "rejoin: стабильного Primary среди пиров нет — это сбой кластера, а не одного узла. Ничего не делаю (бутстрап — решение оператора)."
+        return 1
+    fi
+
+    date +%s >> "$REJOIN_STATE"
+    log "rejoin: донор ${donor} стабилен (Primary/Synced). Попытка $(( n + 1 )) из ${REJOIN_MAX}."
+    do_join
+}
+
+# Поставить pxc-rejoin.service и OnFailure-вставки. Идемпотентно.
+install_rejoin() {
+    local changed=0 f tmp
+    write_if_diff() {   # $1 путь, содержимое — stdin
+        tmp=$(mktemp); cat > "$tmp"
+        if ! cmp -s "$tmp" "$1"; then mkdir -p "$(dirname "$1")"; install -m 644 "$tmp" "$1"; changed=1; fi
+        rm -f "$tmp"
+    }
+    write_if_diff /etc/systemd/system/pxc-rejoin.service <<'UNIT'
+# BCM: вернуть в кластер узел PXC, у которого mysqld упал на ходу.
+# Запускается через OnFailure= у mysql.service / mysql@.service (см. pxc_autorecover.sh).
+[Unit]
+Description=PXC (Galera) rejoin after runtime crash (BCM)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/bcm/bin/lib/pxc_autorecover.sh --rejoin
+TimeoutStartSec=1800
+UNIT
+    for f in mysql.service mysql@.service; do
+        write_if_diff "/etc/systemd/system/${f}.d/bcm-rejoin.conf" <<'DROPIN'
+# BCM: упал mysqld (в т.ч. ABRT, на котором Percona намеренно не перезапускает) —
+# вернуть узел в кластер осторожно, через pxc-rejoin.service. Ручной stop не триггерит.
+[Unit]
+OnFailure=pxc-rejoin.service
+DROPIN
+    done
+    if (( changed )); then systemctl daemon-reload; echo "rejoin: юниты поставлены"; else echo "rejoin: юниты уже актуальны"; fi
+}
+
 # ──── Точка входа ────────────────────────────────────────────────────────────
 main() {
     case "${1:-}" in
@@ -379,8 +511,14 @@ main() {
         ""|--recover)
             recover
             ;;
+        --rejoin)
+            rejoin
+            ;;
+        --install-rejoin)
+            install_rejoin
+            ;;
         *)
-            echo "usage: $0 [--report|--recover]" >&2
+            echo "usage: $0 [--report|--recover|--rejoin|--install-rejoin]" >&2
             exit 2
             ;;
     esac
