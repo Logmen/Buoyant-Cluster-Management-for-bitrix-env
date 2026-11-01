@@ -34,6 +34,10 @@ PORTAL_CRON_OFF="/etc/bitrix-cluster/bcm-portal-master.disabled"
 # Роль источника lsyncd следует за master web-VRRP (этот же HA-Cron-инстанс):
 # MASTER → стать источником (promote), BACKUP → приёмником (demote).
 LSYNCD_ROLE="/opt/bcm/bin/lib/lsyncd_role.sh"
+# Главный узел кластера поиска (Manticore) — тоже master HA Cron: там работает
+# обработчик очередей, единственный писатель в индекс. Такт контролёра — сразу, не
+# дожидаясь его таймера; в фоне: keepalived ждёт возврата notify.
+SEARCH_ROLE="/opt/bcm/bin/lib/search_role.sh"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [${STATE}] $*" >> "$LOG_FILE"; }
@@ -79,6 +83,8 @@ case "$STATE" in
         systemctl start crond 2>/dev/null || systemctl start cron 2>/dev/null || true
         # Стать источником lsyncd (с catch-up — без потери наработок пиров)
         [[ -x "$LSYNCD_ROLE" ]] && bash "$LSYNCD_ROLE" promote >> "$LOG_FILE" 2>&1 || true
+        [[ -x "$SEARCH_ROLE" && -f /etc/bitrix-cluster/search.env ]] \
+            && { setsid bash "$SEARCH_ROLE" tick --reason vrrp-master >/dev/null 2>&1 < /dev/null & } || true
         ;;
     BACKUP)
         log "HA Cron VRRP event: становлюсь BACKUP — выключаю агенты Битрикс"
@@ -87,6 +93,8 @@ case "$STATE" in
         _portal_disable
         # Стать приёмником lsyncd (источник — новый master)
         [[ -x "$LSYNCD_ROLE" ]] && bash "$LSYNCD_ROLE" demote >> "$LOG_FILE" 2>&1 || true
+        [[ -x "$SEARCH_ROLE" && -f /etc/bitrix-cluster/search.env ]] \
+            && { setsid bash "$SEARCH_ROLE" tick --reason vrrp-backup >/dev/null 2>&1 < /dev/null & } || true
         ;;
     FAULT)
         log "HA Cron VRRP event: FAULT — состояние агентов не меняю"

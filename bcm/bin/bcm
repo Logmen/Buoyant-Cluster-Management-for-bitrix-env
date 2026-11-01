@@ -242,6 +242,7 @@ _show_full_menu() {
         "14. Генератор документов (Transformer) — нужен портал+Enterprise"
         "15. Почта (HA Postfix smarthost-релей)"
         "16. Модули (расширения BCM)${mod_note}"
+        "17. Поиск портала (Manticore)"
     )
     # Пункты включённых модулей — после встроенных, нумерация с 20 (запас оставлен,
     # чтобы новый раздел ядра не сдвигал номера, к которым привыкли операторы).
@@ -311,6 +312,7 @@ _handle_full_menu_choice() {
         14) bash "${BCM_MENU_DIR}/14_transformer.sh" ;;
         15) bash "${BCM_MENU_DIR}/15_mail.sh" ;;
         16) bash "${BCM_MENU_DIR}/16_modules.sh" ;;
+        17) bash "${BCM_MENU_DIR}/17_search.sh" ;;
         0) bcm_color "CYAN" "  До свидания!"; echo; exit 0 ;;
         "") : ;;  # пустой ввод — просто обновить экран
         # Номера от 20 принадлежат модулям: их выдаёт bcm_mod_menu_entries, он же

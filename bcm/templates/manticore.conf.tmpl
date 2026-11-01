@@ -1,0 +1,20 @@
+# Manticore Search — поиск портала на кластере web-узлов (BCM, bin/lib/bcm_search.sh).
+# Файл генерирует BCM: правки будут перезаписаны при следующей установке поиска.
+#
+# ⚠️ API и репликация слушают IP узла, а не 0.0.0.0 / 127.0.0.1: по этому адресу узел
+# знают соседи (cluster_*_nodes_view). Локальный 127.0.0.1 — для Битрикса на этом же
+# узле; IP узла на порту mysql — запасной путь соседа, когда его Manticore лежит.
+# Порты открыты только между web-узлами (firewall, bcm_search.sh).
+searchd {
+    listen = 127.0.0.1:__PORT__:mysql
+    listen = __NODE_IP__:__PORT__:mysql
+    listen = __NODE_IP__:__API_PORT__
+    listen = __NODE_IP__:__REPL_PORTS__:replication
+    data_dir = /var/lib/manticore
+    log = /var/log/manticore/searchd.log
+    query_log = /var/log/manticore/query.log
+    query_log_min_msec = 1000
+    pid_file = /run/manticore/searchd.pid
+    # Buddy (PHP-исполнитель расширений Manticore) поиску портала не нужен.
+    buddy_path =
+}

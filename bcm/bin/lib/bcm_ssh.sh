@@ -206,6 +206,7 @@ bcm_deploy_to_node() {
               bin/lib/bcm_mail.sh bin/lib/bcm_portal_hosts.sh \
               bin/lib/bcm_settings_guard.sh bin/lib/bcm_session_mode.sh bin/lib/bcm_php_update.sh \
               bin/lib/bcm_logrotate.sh bin/lib/bcm_post_update.sh bin/lib/bcm_proxysql_tune.sh \
+              bin/lib/bcm_search.sh bin/lib/search_role.sh \
               bin/lib/bcm_dbrouter.sh bin/lib/bcm_messenger.sh bin/lib/bcm_pxc_harden.sh \
               bin/lib/bcm_modules.sh VERSION; do
         bcm_ssh_copy_file "${bcm_src}/${f}" "$ip" "/opt/bcm/${f}"

@@ -22,7 +22,9 @@
 #   3. каталог ключей поставщиков модулей на всех узлах;
 #   4. возврат упавшего на ходу узла PXC (pxc-rejoin.service + OnFailure у mysql);
 #   5. ProxySQL на web-узлах: устойчивость проверки здоровья Galera к долгому DDL
-#      и рабочий лог (bcm_proxysql_tune.sh; proxysql.cnf на живом кластере не читается).
+#      и рабочий лог (bcm_proxysql_tune.sh; proxysql.cnf на живом кластере не читается);
+#   6. поиск портала (Manticore), если установлен: конфиг и контролёр на узлах, файлы
+#      модуля bcm.search, новые поля модуля поиска в таблице (bcm_search.sh).
 # =============================================================================
 set -uo pipefail
 
@@ -92,6 +94,30 @@ done
 read -r _hc_t _hc_m <<< "$(bcm_psql_galera_hc_values)"
 bcm_info "5. ProxySQL на web-узлах (проверка Galera ${_hc_t} мс × ${_hc_m}, лог):"
 bcm_psql_tune_all apply || fail=1
+
+# ──── 6. Поиск портала (Manticore) ───────────────────────────────────────────
+# Только там, где кластер поиска установлен: узлам — актуальные конфиг, контролёр и
+# таймер (работающую службу не перезапускаем — об изменённом конфиге будет сказано),
+# порталу — файлы модуля bcm.search, таблице — поля новой версии модуля поиска.
+if [[ "$(bcm_conf_get search installed 2>/dev/null)" == "yes" ]]; then
+    SEARCH_TOOL="${BCM_LIB_DIR}/bcm_search.sh"
+    bcm_info "6. Поиск портала (Manticore):"
+    declare -a s_ips=()
+    for n in "${BCM_NODES_WEB[@]}"; do [[ -n "${BCM_NODE_IP[$n]:-}" ]] && s_ips+=("${BCM_NODE_IP[$n]}"); done
+    for ip in "${s_ips[@]}"; do
+        peers=""; for p in "${s_ips[@]}"; do [[ "$p" != "$ip" ]] && peers+="${p} "; done
+        out="$(bcm_ssh_exec_timeout "$ip" 900 "${SEARCH_TOOL} --local-setup '${ip}' '${peers% }'" </dev/null 2>&1)" || fail=1
+        printf '  %-15s %s\n' "$ip" "$(printf '%s' "$out" | tr '\n' ' ')"
+    done
+    if [[ "$(bcm_conf_get search portal 2>/dev/null)" == "yes" ]]; then
+        for ip in "${s_ips[@]}"; do
+            [[ "$(bcm_ssh_exec_timeout "$ip" 10 "systemctl is-active lsyncd" </dev/null)" == "active" ]] || continue
+            out="$(bcm_ssh_exec_timeout "$ip" 60 "${SEARCH_TOOL} --local-files && ${SEARCH_TOOL} --local-hook add" </dev/null 2>&1)" || fail=1
+            printf '  портал: %s\n' "$(printf '%s' "$out" | tr '\n' ' ')"
+        done
+        "${SEARCH_TOOL}" --schema-sync --auto || fail=1
+    fi
+fi
 
 echo
 if [[ $fail -eq 0 ]]; then
