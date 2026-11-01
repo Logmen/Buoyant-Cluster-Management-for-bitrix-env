@@ -93,6 +93,9 @@ if [[ -f "${BCM_LIB_DIR}/bcm_utils.sh" ]]; then
     # Наборы logrotate BCM — общие с bcm --update (bcm_post_update.sh).
     # shellcheck disable=SC1091
     source "${BCM_LIB_DIR}/bcm_logrotate.sh"
+    # Настройки ProxySQL, которые доводятся и на живых кластерах (bcm_post_update.sh).
+    # shellcheck disable=SC1091
+    source "${BCM_LIB_DIR}/bcm_proxysql_tune.sh"
 fi
 
 # ──── Аргументы командной строки ─────────────────────────────────────────────
@@ -2036,6 +2039,11 @@ EOF
     # Bitrix ходит через ProxySQL → sql_mode/time_zone сессии задаёт ProxySQL.
     # Время БД = время web (требование Bitrix), sql_mode пустой (требование Bitrix).
     render_value "$local_proxysql_cfg" "__DB_TIMEZONE__" "$(_bcm_web_timezone)"
+    # Устойчивость проверки здоровья Galera к долгому DDL — те же значения, что
+    # bcm_proxysql_tune.sh доводит на живых кластерах (подробности — там).
+    local _hc_t _hc_m
+    read -r _hc_t _hc_m <<< "$(bcm_psql_galera_hc_values)"
+    sed -i "s/__GALERA_HC_TIMEOUT__/${_hc_t}/g; s/__GALERA_HC_MAX_TIMEOUTS__/${_hc_m}/g" "$local_proxysql_cfg"
 
     for name in "${WEB_NODES[@]}"; do
         local ip="${WEB_IPS[$name]}"
@@ -2120,7 +2128,18 @@ EOF
             bcm_ssh_exec_logged "$name" "$ip" "printf '%b' '${_rg}' > /etc/cron.d/bcm-redis-role-guard && chmod 644 /etc/cron.d/bcm-redis-role-guard"
         fi
 
-        bcm_ssh_exec_logged "$name" "$ip" "systemctl daemon-reload && systemctl enable proxysql keepalived && systemctl restart proxysql keepalived"
+        # ⚠️ Каталог лога — пользователю proxysql ДО старта: ProxySQL работает не от
+        # root, и в каталоге root файл errorlog ему не создать — лога не будет вовсе.
+        bcm_ssh_exec_logged "$name" "$ip" "mkdir -p ${BCM_PSQL_LOG_DIR} && chown proxysql:proxysql ${BCM_PSQL_LOG_DIR} && systemctl daemon-reload && systemctl enable proxysql keepalived && systemctl restart proxysql keepalived"
+        # proxysql.cnf читается только при первом старте: на повторной установке у
+        # ProxySQL уже своя база, и значения шаблона до неё не доходят — ставим их
+        # через admin (тем же кодом, что bcm --update на живых кластерах).
+        local _tune
+        if _tune="$(bcm_psql_tune_node "$ip" apply "$PROXYSQL_ADMIN_PORT" "$PROXYSQL_ADMIN_USER" "$PROXYSQL_ADMIN_PASS")"; then
+            log_info "ProxySQL на $name: ${_tune}"
+        else
+            log_warn "ProxySQL на $name: ${_tune:-admin не ответил} — повторить: /opt/bcm/bin/lib/bcm_proxysql_tune.sh --apply"
+        fi
     done
     rm -f "${local_proxysql_cfg:-}" "${local_keepalived_web:-}" 2>/dev/null
 }
@@ -2728,7 +2747,8 @@ configure_remote_logging() {
         # Каталоги журналов: сервисы пишут в них с первого дня.
         bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/bcm"
         case "$role" in
-            web) bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd" ;;
+            # /var/log/proxysql — пользователю proxysql (ProxySQL работает не от root).
+            web) bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/nginx /var/log/httpd /var/log/proxysql /var/log/lsyncd && { ! id proxysql >/dev/null 2>&1 || chown proxysql:proxysql /var/log/proxysql; }" ;;
             pxc) bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/mysql && chown -R mysql:mysql /var/log/mysql || true" ;;
             s3)  bcm_ssh_exec_logged "$name" "$ip" "mkdir -p /var/log/minio" ;;
         esac

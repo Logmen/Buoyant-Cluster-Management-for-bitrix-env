@@ -54,6 +54,14 @@ mysql_variables=
     monitor_read_only_timeout=500
     ping_interval_server_msec=120000
     ping_timeout_server=500
+    # ⚠️ Проверка здоровья Galera (mysql_galera_hostgroups). DDL в PXC идёт через TOI,
+    # и пока он выполняется, узлы не отвечают на запрос статуса. С умолчаниями ProxySQL
+    # (800 мс, три таймаута подряд) ALTER дольше ~10 с выводил из групп ВСЕ узлы —
+    # портал оставался без базы. Значения и их доводку на живых кластерах (этот файл
+    # читается только при первом старте) см. в bin/lib/bcm_proxysql_tune.sh.
+    monitor_galera_healthcheck_interval=5000
+    monitor_galera_healthcheck_timeout=__GALERA_HC_TIMEOUT__
+    monitor_galera_healthcheck_max_timeout_count=__GALERA_HC_MAX_TIMEOUTS__
     commands_stats=true
     sessions_sort=true
     connect_retries_on_failure=10

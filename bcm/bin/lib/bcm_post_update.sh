@@ -20,7 +20,9 @@
 #      новой версии (bcm_settings_guard.sh --merge-new); уже снятые не трогаются;
 #   2. наборы logrotate BCM на всех узлах — к текущей версии (bcm_logrotate.sh);
 #   3. каталог ключей поставщиков модулей на всех узлах;
-#   4. возврат упавшего на ходу узла PXC (pxc-rejoin.service + OnFailure у mysql).
+#   4. возврат упавшего на ходу узла PXC (pxc-rejoin.service + OnFailure у mysql);
+#   5. ProxySQL на web-узлах: устойчивость проверки здоровья Galera к долгому DDL
+#      и рабочий лог (bcm_proxysql_tune.sh; proxysql.cnf на живом кластере не читается).
 # =============================================================================
 set -uo pipefail
 
@@ -30,6 +32,7 @@ source "${BCM_LIB_DIR}/bcm_utils.sh"
 source "${BCM_LIB_DIR}/bcm_config.sh"
 source "${BCM_LIB_DIR}/bcm_ssh.sh"
 source "${BCM_LIB_DIR}/bcm_logrotate.sh"
+source "${BCM_LIB_DIR}/bcm_proxysql_tune.sh"
 
 [[ $EUID -eq 0 ]] || { bcm_error "нужны права root"; exit 1; }
 bcm_load_topology || { bcm_error "не удалось прочитать топологию"; exit 1; }
@@ -82,6 +85,13 @@ for n in "${BCM_NODES_PXC[@]}"; do
     out="$(bcm_ssh_exec_timeout "$ip" 30 "/opt/bcm/bin/lib/pxc_autorecover.sh --install-rejoin 2>&1" </dev/null)" || fail=1
     printf '  %-6s %s\n' "$n" "${out:-нет ответа}"
 done
+
+# ──── 5. ProxySQL: проверка здоровья Galera и лог ────────────────────────────
+# С умолчаниями ProxySQL ALTER дольше ~10 с из обновления Битрикса выводил из
+# групп все узлы PXC сразу (crm.onelab.kz, 01.11.2026) — подробно в библиотеке.
+read -r _hc_t _hc_m <<< "$(bcm_psql_galera_hc_values)"
+bcm_info "5. ProxySQL на web-узлах (проверка Galera ${_hc_t} мс × ${_hc_m}, лог):"
+bcm_psql_tune_all apply || fail=1
 
 echo
 if [[ $fail -eq 0 ]]; then

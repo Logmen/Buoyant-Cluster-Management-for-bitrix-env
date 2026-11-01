@@ -24,6 +24,9 @@
 # httpd, proxysql, lsyncd, haproxy, mysql есть наборы от их пакетов (для mysql —
 # почасовой набор BCM вне /etc/logrotate.d, см. install.sh). Второе описание того
 # же файла ломает ротацию обоих наборов.
+# Лог ProxySQL — как раз журнал BCM: пакетный набор proxysql описывает
+# /var/lib/proxysql/proxysql.log, а шаблон BCM переносит errorlog в
+# /var/log/proxysql/proxysql.log. Этот файл никто, кроме bcm-node, не ротирует.
 #
 # ⚠️ Каталог /etc/logrotate.d читается ЦЕЛИКОМ: logrotate пропускает лишь пару
 # расширений (.rpmnew, .rpmsave, ~ и т.п.), а копия «bcm-node.bcm-bak-…» для него —
@@ -41,7 +44,8 @@ bcm_lr_render_node() {
 # Файл генерирует BCM (bin/lib/bcm_logrotate.sh) и приводит к текущей версии при
 # каждом обновлении ядра — правки здесь будут перезаписаны.
 # ⚠️ Только журналы, которые заводит сам BCM: второе описание чужого журнала
-# (nginx, haproxy, proxysql, lsyncd, mysql) ломает ротацию обоих наборов.
+# (nginx, haproxy, lsyncd, mysql, пакетный /var/lib/proxysql/proxysql.log)
+# ломает ротацию обоих наборов.
 /var/log/bcm/*.log {
     daily
     rotate 4
@@ -54,6 +58,25 @@ bcm_lr_render_node() {
 }
 EOF
     case "$role" in
+        web)
+            cat <<'EOF'
+
+# ProxySQL: errorlog по шаблону BCM. Пакетный набор proxysql описывает другой
+# файл (/var/lib/proxysql/proxysql.log) — дубля нет. Каталог принадлежит
+# proxysql, отсюда su; ProxySQL держит файл открытым — copytruncate.
+/var/log/proxysql/proxysql.log {
+    su proxysql proxysql
+    daily
+    rotate 7
+    size 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+            ;;
         lb)
             cat <<'EOF'
 
