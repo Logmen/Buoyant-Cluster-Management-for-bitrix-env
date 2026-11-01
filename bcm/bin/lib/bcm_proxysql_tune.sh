@@ -26,10 +26,14 @@
 #    Мёртвый или недоступный узел длинным порогом не маскируется: его выводят
 #    ping-монитор (monitor_ping_*) и ошибки соединения (shun_on_failures), а ping во
 #    время TOI отвечает. Узел вне Primary или в Donor проверка видит сразу — это
-#    ответ, а не таймаут. Поэтому таймаут проверки 3 с и 24 таймаута подряд
-#    (≈2 мин при интервале 5 с): DDL такой длины кластер переживает без выпадения
+#    ответ, а не таймаут. Поэтому таймаут проверки 3 с и 10 таймаутов подряд
+#    (≈50 с при интервале 5 с): DDL такой длины кластер переживает без выпадения
 #    узлов, запросы на это время ждут, а не падают. Переопределяются в cluster.conf:
 #    [proxysql] galera_hc_timeout_ms, galera_hc_max_timeouts.
+#    ⚠️ 10 — предел ProxySQL (2.6.6: max_timeout_count 1…10). Большее значение
+#    LOAD … TO RUNTIME молча отвергает («Impossible to set variable … Resetting to
+#    current») и возвращает прежнее — так 1.0.33 оставил на crm 3000 мс × 3 вместо
+#    × 24. Поэтому значение из cluster.conf зажимается в 1…10.
 # 2. Лог ProxySQL. errorlog в шаблоне — /var/log/proxysql/proxysql.log, а каталог
 #    установщик создавал от root. ProxySQL работает от пользователя proxysql, файл
 #    создать не мог — лога не было вовсе (01.11.2026 выпадение узлов пришлось
@@ -40,7 +44,8 @@
 # =============================================================================
 
 BCM_PSQL_GALERA_HC_TIMEOUT_MS_DEFAULT=3000
-BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_DEFAULT=24
+BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_DEFAULT=10
+BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_LIMIT=10
 BCM_PSQL_LOG_DIR="/var/log/proxysql"
 
 # «таймаут_мс макс_таймаутов» — из cluster.conf, иначе значения по умолчанию.
@@ -53,6 +58,8 @@ bcm_psql_galera_hc_values() {
     fi
     [[ "$t" =~ ^[0-9]+$ ]] || t="$BCM_PSQL_GALERA_HC_TIMEOUT_MS_DEFAULT"
     [[ "$m" =~ ^[0-9]+$ ]] || m="$BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_DEFAULT"
+    (( m < 1 )) && m=1
+    (( m > BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_LIMIT )) && m="$BCM_PSQL_GALERA_HC_MAX_TIMEOUTS_LIMIT"
     echo "$t $m"
 }
 
