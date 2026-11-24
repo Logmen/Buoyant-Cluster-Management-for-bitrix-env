@@ -22,6 +22,7 @@
 #   13. ⚠ нет циклов `while … read` с ssh в ТЕЛЕ (обрываются после первой итерации)
 #   14. манифесты модулей в составе релиза
 #   15. таблица решений контролёра поиска (tests/search_role_test.sh)
+#   16. сторож зеркала /upload узнаёт подменённый каталог (tests/upload_guard_test.sh)
 #
 # Возвращает 0, если все проверки прошли; иначе число проваленных (>=1).
 # НЕ требует доступа к кластеру — чистая статика по дереву репозитория.
@@ -330,6 +331,16 @@ if sr_out="$(bash tests/search_role_test.sh 2>&1)"; then
 else
     printf '%s\n' "$sr_out" | grep '✗' >&2
     fail "контролёр search_role.sh: решения расходятся с таблицей (tests/search_role_test.sh)"
+fi
+
+section "16. Сторож зеркала /upload (подменённый каталог)"
+# inotify следит за inode: пересозданный каталог upload зеркало не видит, а процесс
+# остаётся active. Сторож сверяет inode с наблюдениями процесса — на настоящем ядре.
+if ug_out="$(bash tests/upload_guard_test.sh 2>&1)"; then
+    pass "сторож lsyncd_upload.sh: $(printf '%s\n' "$ug_out" | tail -1)"
+else
+    printf '%s\n' "$ug_out" | grep '✗' >&2
+    fail "сторож lsyncd_upload.sh: проверки не совпали (tests/upload_guard_test.sh)"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────

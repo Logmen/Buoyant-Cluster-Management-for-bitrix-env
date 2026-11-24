@@ -29,6 +29,16 @@
 # зеркала.
 # ⚠️ insist=true: пир недоступен на старте — lsyncd продолжает работу и догонит
 # позже (без insist он завершился бы, и зеркала не было бы вовсе).
+# ⚠️⚠️ Подменённый каталог upload — зеркало глохнет МОЛЧА. inotify следит за
+# inode, а не за путём: если /upload удалить или переименовать и создать заново
+# (развёртывание портала, восстановление из копии), lsyncd продолжает работать,
+# но событий больше не получает — процесс active, журнал пуст. eda.khc.kz:
+# зеркало поднято 19.08.2026 на каталоге, который configure() создаёт заранее,
+# 20.08 портал развернули с новым upload — три месяца web01 ничего не отдавал
+# web02 (смайлы, справка, PDF), заметили по 404 у пользователя 24.11. Поэтому
+# сторож (--assert из cron раз в 5 мин): inode текущего каталога должен быть
+# среди inotify-наблюдений самого процесса (/proc/<pid>/fdinfo); нет —
+# --configure (догон с пиров и перезапуск), не чаще раза в 30 мин.
 #
 # Управляется install.sh (configure_lsyncd_upload_mirror) и меню 6 → 10; нужно ли
 # зеркало, решает [lsyncd] upload_mirror в cluster.conf (auto|on|off, единый
@@ -57,6 +67,10 @@ UPLOAD_UNIT="/etc/systemd/system/lsyncd-upload.service"
 UPLOAD_SVC="lsyncd-upload"
 UPLOAD_LOG="/var/log/lsyncd/lsyncd-upload.log"
 UPLOAD_STATUS="/run/lsyncd-upload.status"
+UPLOAD_GUARD="/etc/cron.d/bcm-upload-mirror-guard"
+UPLOAD_HEAL_MARK="/run/lsyncd-upload.heal"
+GUARD_GRACE=120        # с: зеркало, запущенное позже, ещё расставляет наблюдения
+GUARD_COOLDOWN=1800    # с: не чаще одного перезапуска сторожем за 30 мин
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o LogLevel=ERROR)
@@ -222,15 +236,76 @@ configure() {
         log "ОШИБКА: не удалось запустить ${UPLOAD_SVC}."
         return 1
     fi
+    _install_guard
     return 0
 }
 
 disable_mirror() {
     systemctl disable --now "$UPLOAD_SVC" >/dev/null 2>&1
     systemctl reset-failed "$UPLOAD_SVC" 2>/dev/null || true
-    rm -f "$UPLOAD_UNIT" "$UPLOAD_CONF"
+    rm -f "$UPLOAD_UNIT" "$UPLOAD_CONF" "$UPLOAD_GUARD" "$UPLOAD_HEAL_MARK"
     systemctl daemon-reload 2>/dev/null || true
     log "Зеркало /upload выключено ([lsyncd] upload_mirror: off либо auto при наличии S3)."
+}
+
+# ──── Сторож: зеркало следит за ТЕКУЩИМ каталогом upload ─────────────────────
+_mirror_pid() {
+    local pid
+    pid="$(systemctl show -p MainPID --value "$UPLOAD_SVC" 2>/dev/null)"
+    [[ "$pid" =~ ^[0-9]+$ ]] && echo "$pid" || echo 0
+}
+
+# Секунд с запуска зеркала (0 — не запущено).
+_mirror_uptime() {
+    local since now
+    since="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$UPLOAD_SVC" 2>/dev/null)"
+    [[ "$since" =~ ^[1-9][0-9]*$ ]] || { echo 0; return; }
+    now="$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)"
+    echo $(( (now - since) / 1000000 ))
+}
+
+# ok — inode каталога upload среди inotify-наблюдений процесса lsyncd;
+# stale — процесс жив, а каталог подменили (наблюдение на старом inode или снято
+# ядром вместе с удалённым каталогом); starting — запущено меньше GUARD_GRACE с
+# назад, наблюдения ещё расставляются; down — зеркало не запущено; nodir — нет upload.
+_watch_state() {
+    local pid ino
+    [[ -d "${SITE_PATH}/upload" ]] || { echo nodir; return; }
+    pid="$(_mirror_pid)"
+    [[ "$pid" -gt 0 && -d "/proc/${pid}" ]] || { echo down; return; }
+    [[ "$(_mirror_uptime)" -ge "$GUARD_GRACE" ]] || { echo starting; return; }
+    ino="$(stat -c %i "${SITE_PATH}/upload" 2>/dev/null)" || { echo nodir; return; }
+    # Строка наблюдения в fdinfo: «inotify wd:1 ino:186a4b85 sdev:fd00000 mask:…»
+    # (wd и inode — hex без ведущих нулей).
+    if grep -qs -m1 "^inotify wd:[0-9a-f]* ino:$(printf '%x' "$ino") " /proc/"$pid"/fdinfo/*; then
+        echo ok
+    else
+        echo stale
+    fi
+}
+
+# Сторож ставит configure(); на кластерах, поднятых до 1.0.35, — bcm_post_update.sh.
+_install_guard() {
+    printf '%s\n' \
+        "# BCM: сторож зеркала /upload — подменённый каталог upload (lsyncd_upload.sh)" \
+        "*/5 * * * * root /opt/bcm/bin/lib/lsyncd_upload.sh --assert >/dev/null 2>&1" \
+        > "$UPLOAD_GUARD" && chmod 644 "$UPLOAD_GUARD"
+}
+
+# Зеркало, оставшееся следить за подменённым каталогом, перезапускается тем же
+# путём, что ставит его: --configure (догон с пиров, затем рестарт).
+assert_mirror() {
+    [[ -f "$UPLOAD_UNIT" ]] || return 0
+    systemctl is-enabled --quiet "$UPLOAD_SVC" 2>/dev/null || return 0
+    [[ "$(_watch_state)" == "stale" ]] || return 0
+    local now last=0
+    now="$(date +%s)"
+    [[ -f "$UPLOAD_HEAL_MARK" ]] && last="$(cat "$UPLOAD_HEAL_MARK" 2>/dev/null)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= GUARD_COOLDOWN )) || return 0
+    echo "$now" > "$UPLOAD_HEAL_MARK"
+    log "Сторож: зеркало следит за подменённым каталогом ${SITE_PATH}/upload (наблюдения на старом inode) — перезапуск с догоном."
+    configure
 }
 
 status() {
@@ -239,17 +314,22 @@ status() {
     enab="$(systemctl is-enabled "$UPLOAD_SVC" 2>/dev/null || true)"
     local peers
     peers="$(_other_peers | tr '\n' ' ')"
-    printf 'node=%s active=%s enabled=%s conf=%s peers=%s\n' \
-        "$SELF_NODE" "${act:-нет}" "${enab:-нет}" \
+    printf 'node=%s active=%s enabled=%s watch=%s guard=%s conf=%s peers=%s\n' \
+        "$SELF_NODE" "${act:-нет}" "${enab:-нет}" "$(_watch_state)" \
+        "$([[ -f "$UPLOAD_GUARD" ]] && echo есть || echo нет)" \
         "$([[ -f "$UPLOAD_CONF" ]] && echo есть || echo нет)" "${peers:-—}"
 }
 
-case "${1:---status}" in
-    --configure) configure ;;
-    --disable)   disable_mirror ;;
-    --status)    status ;;
-    *)
-        echo "Использование: $0 --configure | --disable | --status" >&2
-        exit 1
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:---status}" in
+        --configure)     configure ;;
+        --disable)       disable_mirror ;;
+        --status)        status ;;
+        --assert)        assert_mirror ;;
+        --install-guard) [[ -f "$UPLOAD_UNIT" ]] && _install_guard; true ;;
+        *)
+            echo "Использование: $0 --configure | --disable | --status | --assert | --install-guard" >&2
+            exit 1
+            ;;
+    esac
+fi

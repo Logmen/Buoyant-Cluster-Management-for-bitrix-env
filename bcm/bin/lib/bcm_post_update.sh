@@ -24,7 +24,9 @@
 #   5. ProxySQL на web-узлах: устойчивость проверки здоровья Galera к долгому DDL
 #      и рабочий лог (bcm_proxysql_tune.sh; proxysql.cnf на живом кластере не читается);
 #   6. поиск портала (Manticore), если установлен: конфиг и контролёр на узлах, файлы
-#      модуля bcm.search, новые поля модуля поиска в таблице (bcm_search.sh).
+#      модуля bcm.search, новые поля модуля поиска в таблице (bcm_search.sh);
+#   7. зеркало /upload, где оно поднято: сторож подменённого каталога upload
+#      (lsyncd_upload.sh --install-guard) и текущее состояние слежения.
 # =============================================================================
 set -uo pipefail
 
@@ -118,6 +120,18 @@ if [[ "$(bcm_conf_get search installed 2>/dev/null)" == "yes" ]]; then
         "${SEARCH_TOOL}" --schema-sync --auto || fail=1
     fi
 fi
+
+# ──── 7. Зеркало /upload: сторож подменённого каталога ────────────────────────
+# Сторожа ставит --configure, а зеркала, поднятые до 1.0.35, его не имеют. Ставим и
+# показываем слежение; «stale» сторож вылечит сам в ближайшие 5 минут (--configure с
+# догоном), не задерживая обновление. eda.khc.kz: зеркало web01 молчало с 20.08 по
+# 24.11.2026 — каталог upload пересоздали при развёртывании портала.
+bcm_info "7. Зеркало /upload — сторож подменённого каталога:"
+for n in "${BCM_NODES_WEB[@]}"; do
+    ip="${BCM_NODE_IP[$n]:-}"; [[ -n "$ip" ]] || continue
+    out="$(bcm_ssh_exec_timeout "$ip" 30 "U=${BCM_LIB_DIR}/lsyncd_upload.sh; if [ -f /etc/systemd/system/lsyncd-upload.service ]; then \$U --install-guard && \$U --status; else echo 'зеркала нет'; fi" </dev/null 2>&1)" || fail=1
+    printf '  %-6s %s\n' "$n" "$(printf '%s' "${out:-нет ответа}" | tail -1)"
+done
 
 echo
 if [[ $fail -eq 0 ]]; then
